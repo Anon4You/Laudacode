@@ -248,8 +248,8 @@ pub enum WorkerEvent {
     Info(String),
     Error(String),
     /// Conversation was replaced (resume) — TUI must clear its transcript
-    /// and replay the restored messages.
-    Reload { text: String, entries: Vec<Entry> },
+    /// and replay the restored messages under the new session identity.
+    Reload { text: String, entries: Vec<Entry>, session_id: String },
     /// Final state sent right before the worker exits, so the shell
     /// goodbye can offer an exact `--resume <id>` command.
     SessionSummary { id: String, messages: usize },
@@ -657,7 +657,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 let real_id = id.split(" · ").next().unwrap_or(&id).to_string();
                 match resume_session(&mut app, &real_id) {
                     Ok((msg, entries)) => {
-                        let _ = ev_tx.send(WorkerEvent::Reload { text: msg, entries });
+                        let _ = ev_tx.send(WorkerEvent::Reload {
+                            text: msg,
+                            entries,
+                            session_id: app.session.id.clone(),
+                        });
                     }
                     Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
                 }
@@ -1045,6 +1049,13 @@ impl App {
         for e in std::mem::take(&mut self.pending_transcript) {
             tui.push(e);
         }
+        tui.dash.set_session(
+            &self.session.id,
+            &self.active.model,
+            &self.active.name,
+            &home_shortened(&self.cwd),
+            self.agent.messages.iter().filter(|m| m.role != "system").count(),
+        );
         // Seed the @-mention list from the project tree.
         {
             let mut files = Vec::new();
@@ -1177,6 +1188,7 @@ impl App {
                         // Queue the next prompt while the agent works — it runs
                         // automatically when the current turn finishes.
                         tui.push(Entry::User(format!("⏳ {text}")));
+                        tui.dash.messages += 1;
                         tui.set_status("queued");
                         let _ = ui_cmd.send(WorkerCmd::Submit(text));
                     } else {
@@ -1199,6 +1211,7 @@ impl App {
                             // Memory notes / shell passthrough run even while busy.
                         } else {
                             tui.push(Entry::User(text.clone()));
+                            tui.dash.messages += 1;
                         }
                         tui.set_status("thinking");
                         let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
@@ -1356,9 +1369,11 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         WorkerEvent::Ev(AgentEvent::Usage(u)) => {
             let total = tui.ctx_total;
             tui.set_usage(u.prompt_tokens, total);
+            tui.dash.record_usage(u.prompt_tokens, u.completion_tokens);
             tui.set_status(format!("ctx {} tok", u.prompt_tokens));
         }
         WorkerEvent::Ev(AgentEvent::Todo(todos)) => {
+            tui.dash.set_plan(&todos);
             let done = todos.iter().filter(|t| t.status == "completed").count();
             tui.set_status(format!("plan {}/{}", done, todos.len()));
         }
@@ -1375,12 +1390,15 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
         WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
-        WorkerEvent::Reload { text, entries } => {
+        WorkerEvent::Reload { text, entries, session_id } => {
+            let count = entries.len();
             tui.entries.clear();
             for e in entries {
                 tui.push(e);
             }
             tui.push(Entry::Info(text));
+            tui.dash.session_id = crate::tui::shorten_session_id(&session_id);
+            tui.dash.messages = count;
         }
         // Consumed by tui_main after the loop ends; never reaches the UI.
         WorkerEvent::SessionSummary { .. } => {}
@@ -1462,6 +1480,17 @@ fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
         ApprovalMode::Suggest => tuiapp::Mode::Plan,
         ApprovalMode::AutoEdit => tuiapp::Mode::Build,
         ApprovalMode::FullAuto => tuiapp::Mode::FullAuto,
+    }
+}
+
+/// Display helper: collapse $HOME to ~ for dashboard cwd rows.
+fn home_shortened(p: &std::path::Path) -> String {
+    match dirs::home_dir() {
+        Some(home) => p
+            .strip_prefix(&home)
+            .map(|rel| format!("~/{}", rel.display()))
+            .unwrap_or_else(|_| p.display().to_string()),
+        None => p.display().to_string(),
     }
 }
 

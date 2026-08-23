@@ -158,6 +158,8 @@ pub struct Tui {
     pub custom_cmds: Vec<(String, String)>,
     /// Full templates keyed by command name for submission rendering.
     pub custom_templates: std::collections::BTreeMap<String, String>,
+    /// Right-side dashboard state (visible on wide terminals).
+    pub dash: Dash,
     /// Highlighted row in the @-file popup.
     at_sel: usize,
     /// Ctrl+O output-expansion overlay (last tool results in full).
@@ -175,6 +177,60 @@ pub struct Tui {
     /// Per-processed-entry: (content length when wrapped, line count).
     entry_state: Vec<(usize, usize)>,
     last_tick: Instant,
+    /// Session start for the dashboard elapsed timer.
+    session_started: Instant,
+}
+
+/// Identity + counters rendered in the wide-terminal side dashboard.
+#[derive(Debug, Clone, Default)]
+pub struct Dash {
+    /// Short display form of the unique session id.
+    pub session_id: String,
+    pub model: String,
+    pub provider: String,
+    /// Working directory, home-shortened, for display.
+    pub cwd: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub requests: usize,
+    pub messages: usize,
+    pub plan_done: usize,
+    pub plan_total: usize,
+}
+
+impl Dash {
+    pub fn set_session(&mut self, id: &str, model: &str, provider: &str, cwd: &str, messages: usize) {
+        self.session_id = shorten_id(id);
+        self.model = model.to_string();
+        self.provider = provider.to_string();
+        self.cwd = cwd.to_string();
+        self.messages = messages;
+    }
+
+    pub fn record_usage(&mut self, prompt: u64, completion: u64) {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self.requests += 1;
+    }
+
+    pub fn set_plan(&mut self, todos: &[crate::tools::TodoItem]) {
+        self.plan_total = todos.len();
+        self.plan_done = todos.iter().filter(|t| t.status == "completed").count();
+    }
+}
+
+/// First 13 chars of a session id for tight displays.
+pub fn shorten_session_id(id: &str) -> String {
+    shorten_id(id)
+}
+
+fn shorten_id(id: &str) -> String {
+    let head: String = id.chars().take(13).collect();
+    if id.chars().count() > 13 {
+        format!("{head}…")
+    } else {
+        head.to_string()
+    }
 }
 
 /// Built-in slash commands surfaced by the composer autocomplete.
@@ -194,6 +250,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "revert file changes from the last turn"),
     ("/init", "create an AGENTS.md project brief"),
     ("/quit", "exit Laudacode"),
+    ("/exit", "exit Laudacode (alias of /quit)"),
 ];
 
 /// Indices into `SLASH_COMMANDS` whose name starts with `query`
@@ -232,6 +289,8 @@ impl Tui {
             files: vec![],
             custom_cmds: vec![],
             custom_templates: Default::default(),
+            dash: Dash::default(),
+            session_started: Instant::now(),
             at_sel: 0,
             overlay: false,
             overlay_scroll: 0,
@@ -632,6 +691,16 @@ impl Tui {
         }
     }
 
+    /// Dashboard panel width for a given terminal width (None = hidden).
+    /// Narrow/normal terminals keep today's single-column layout untouched.
+    pub fn dash_width(total: u16) -> Option<u16> {
+        if total >= 100 {
+            Some(Self::DASH_WIDTH)
+        } else {
+            None
+        }
+    }
+
     pub fn draw(&mut self, f: &mut Frame, subtitle: &str) {
         let area = f.area();
 
@@ -648,6 +717,20 @@ impl Tui {
             }
             return;
         }
+
+        // Wide terminals get a persistent side dashboard; normal sizes keep
+        // the classic single-column layout pixel-for-pixel.
+        let (area, dash_area) = match Self::dash_width(area.width) {
+            Some(dw) => {
+                let cols = Layout::horizontal([
+                    Constraint::Min(40),
+                    Constraint::Length(dw),
+                ])
+                .split(area);
+                (cols[0], Some(cols[1]))
+            }
+            None => (area, None),
+        };
 
         // Header (brand banner) is shown when there's room for it.
         let show_header = self.show_banner && area.height >= 23 && area.width >= 46;
@@ -835,7 +918,150 @@ impl Tui {
             Paragraph::new(Line::from(meter_spans)).alignment(ratatui::layout::Alignment::Right),
             cols[1],
         );
+
+        if let Some(dash_rect) = dash_area {
+            self.draw_dashboard(f, dash_rect);
+        }
     }
+
+    /// Persistent right-side panel: session identity + live counters.
+    fn draw_dashboard(&mut self, f: &mut Frame, rect: Rect) {
+        let lines = self.dashboard_lines(rect.width);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(70, 70, 95)))
+            .title(Span::styled(
+                " laudacode ",
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ));
+        f.render_widget(Paragraph::new(lines).block(block), rect);
+    }
+
+    /// Build the dashboard rows (pure — unit-tested without a terminal).
+    fn dashboard_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let w = width.saturating_sub(2) as usize; // border padding
+        let mut v: Vec<Line<'static>> = Vec::new();
+        let row = |label: &str, value: String, vcolor: Color| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(format!(" {:<9}", label), Style::default().fg(Color::DarkGray)),
+                Span::styled(Self::truncate_to(value, w.saturating_sub(10)), Style::default().fg(vcolor)),
+            ])
+        };
+        v.push(row("session", self.dash.session_id.clone(), Color::White));
+        v.push(row("model", self.dash.model.clone(), Color::Gray));
+        v.push(row("provider", self.dash.provider.clone(), Color::Gray));
+        v.push(Line::from(Span::styled(
+            format!(" {}", "─".repeat(w.saturating_sub(1))),
+            Style::default().fg(Color::Rgb(60, 60, 80)),
+        )));
+        v.push(row("mode", self.mode.label().to_string(), self.mode.color()));
+        v.push(Line::from(Span::raw(String::new())));
+
+        // Context usage block.
+        v.push(Line::from(Span::styled(
+            " context",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let pct = self
+            .ctx_used
+            .min(self.ctx_total)
+            .checked_mul(100)
+            .and_then(|n| n.checked_div(self.ctx_total))
+            .map(|p| p.min(100))
+            .unwrap_or(0);
+        const SLOTS: usize = 14;
+        let filled = pct as usize * SLOTS / 100;
+        let bar_color = if pct >= 85 {
+            Color::LightRed
+        } else if pct >= 60 {
+            Color::LightYellow
+        } else {
+            Color::Green
+        };
+        v.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("▕", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled("░".repeat(SLOTS - filled), Style::default().fg(Color::Rgb(60, 60, 80))),
+            Span::styled("▏", Style::default().fg(Color::DarkGray)),
+        ]));
+        v.push(Line::from(vec![
+            Span::styled(format!(" {:<9}", "in"), Style::default().fg(Color::DarkGray)),
+            Span::styled(Self::fmt_tokens(self.dash.prompt_tokens), Style::default().fg(Color::Gray)),
+            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
+        ]));
+        v.push(Line::from(vec![
+            Span::styled(format!(" {:<9}", "out"), Style::default().fg(Color::DarkGray)),
+            Span::styled(Self::fmt_tokens(self.dash.completion_tokens), Style::default().fg(Color::Gray)),
+            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        v.push(Line::from(Span::raw(String::new())));
+        v.push(row("requests", self.dash.requests.to_string(), Color::Gray));
+        v.push(row("messages", self.dash.messages.to_string(), Color::Gray));
+        if self.dash.plan_total > 0 {
+            v.push(row(
+                "plan",
+                format!("{}/{} done", self.dash.plan_done, self.dash.plan_total),
+                if self.dash.plan_done == self.dash.plan_total {
+                    Color::LightGreen
+                } else {
+                    Color::Gray
+                },
+            ));
+        }
+        v.push(row("cwd", self.dash.cwd.clone(), Color::DarkGray));
+        let secs = self.session_started.elapsed().as_secs();
+        v.push(row("elapsed", Self::fmt_elapsed(secs), Color::DarkGray));
+        v.push(Line::from(Span::raw(String::new())));
+        v.push(Line::from(Span::styled(
+            " esc interrupt · tab mode",
+            Style::default().fg(Color::Rgb(55, 55, 75)),
+        )));
+        v
+    }
+
+/// Clamp a display string to `w` cells (unicode-width aware-ish).
+fn truncate_to(s: String, w: usize) -> String {
+    if UnicodeWidthStr::width(s.as_str()) <= w {
+        return s;
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        if used + cw > w.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
+/// 45231 → "45.2k"; keeps dashboards tight.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 3725 → "1h02m", 59 → "0m59s".
+fn fmt_elapsed(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Fixed dashboard column width on wide terminals.
+const DASH_WIDTH: u16 = 28;
 
     /// Centered approval dialog: detail + y/a/n options.
     fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
@@ -1446,6 +1672,67 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn exit_alias_is_suggested() {
+        let mut tui = Tui::new();
+        tui.input = "/ex".into();
+        let matches = tui.slash_matches();
+        assert!(!matches.is_empty(), "/exit must appear in suggestions");
+        let entries = tui.slash_entries();
+        assert!(entries.iter().any(|e| e.cmd == "/exit"), "alias registered");
+        // Completing from '/ex' can land on /exit.
+        tui.complete_slash();
+        assert!(
+            tui.input.starts_with("/exit ") || tui.input.starts_with("/"),
+            "completion works: {}",
+            tui.input
+        );
+    }
+
+    #[test]
+    fn dashboard_appears_only_on_wide_terminals() {
+        assert_eq!(Tui::dash_width(79), None);
+        assert_eq!(Tui::dash_width(99), None, "normal terminal keeps old layout");
+        assert_eq!(Tui::dash_width(100), Some(28));
+        assert_eq!(Tui::dash_width(220), Some(28));
+    }
+
+    #[test]
+    fn dashboard_rows_show_identity_and_counters() {
+        use crate::tools::TodoItem;
+        let mut t = Tui::new();
+        t.dash.set_session(
+            "d1046d10-7df0-4db5-b005-13cc48433fde",
+            "stealth/ox-alpha",
+            "openrouter",
+            "~/Laudacode",
+            23,
+        );
+        t.dash.record_usage(45_000, 1_250);
+        t.dash.record_usage(46_000, 2_000);
+        // Context meter is fed separately by the usage event path.
+        t.set_usage(46_000, 128_000);
+        t.dash.set_plan(&[
+            TodoItem { content: "a".into(), status: "completed".into() },
+            TodoItem { content: "b".into(), status: "pending".into() },
+        ]);
+        let lines = t.dashboard_lines(28);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        let joined = text.join("\n");
+        assert!(joined.contains("d1046d10-7df0…"), "{joined}");
+        assert!(joined.contains("ox-alpha"));
+        assert!(joined.contains("BUILD"), "mode row present");
+        // Latest request wins.
+        assert!(joined.contains("46.0k"), "prompt tokens humanized: {joined}");
+        assert!(joined.contains("2.0k"), "completion tokens humanized: {joined}");
+        assert!(joined.contains("1/2 done"), "plan progress: {joined}");
+        assert!(joined.contains("requests"), "counter rows exist");
+        assert!(joined.contains("█"), "context bar drawn");
     }
 
     #[test]

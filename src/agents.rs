@@ -134,7 +134,7 @@ pub fn install_custom(agents: &std::collections::BTreeMap<String, crate::config:
     }
 }
 
-fn all_roles() -> Vec<Role> {
+pub fn all_roles() -> Vec<Role> {
     let mut out: Vec<Role> = TEAM.iter().map(Role::from_spec).collect();
     if let Some(lock) = CUSTOM_ROLES.get() {
         out.extend(lock.read().unwrap_or_else(|p| p.into_inner()).iter().cloned());

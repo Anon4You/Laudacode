@@ -175,12 +175,68 @@ impl Agent {
         }
     }
 
+    /// Authoritative, auto-generated description of everything this agent
+    /// can do — derived from the live tool registry and specialist roster so
+    /// ANY model knows its full toolkit without hand-maintained prose.
+    fn capabilities_block() -> String {
+        let mut s = String::from(
+            "Tools available this session (authoritative — never claim a tool exists that is not listed here):\n",
+        );
+        for td in tools::tool_defs() {
+            let desc_first = td
+                .function
+                .description
+                .split(". ")
+                .next()
+                .unwrap_or(td.function.description);
+            let params = td
+                .function
+                .parameters
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| {
+                    o.keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "- {}({}) — {}.\n",
+                td.function.name, params, desc_first
+            ));
+        }
+        s.push_str(
+            "\napply_patch format (multi-file edits):\n\
+             *** Begin Patch\n\
+             *** Add File: path\n\
+             +new lines\n\
+             *** Update File: path\n\
+             @@ unique context line from the file\n\
+             -old line\n\
+             +new line\n\
+             *** Delete File: path\n\
+             *** End Patch\n\
+             Context lines start with a space; '@@ <exact line>' anchors a chunk; \
+             '*** End of File' appends at EOF; '*** Move to: newPath' renames.\n",
+        );
+        s.push_str("\nSpecialists you can spawn with delegate(tasks:[{agent,task}]):\n");
+        for r in crate::agents::all_roles() {
+            let tag = if r.read_only { " [read-only]" } else { "" };
+            s.push_str(&format!(
+                "- {} — {}{}\n",
+                r.name, r.description, tag
+            ));
+        }
+        s
+    }
+
     fn build_system_prompt(cwd: &std::path::Path) -> String {
         let overview = tools::project_overview(cwd);
         let agents_md = load_agents_md(cwd);
         format!(
             r#"You are Laudacode, an expert AI coding agent running in the user's terminal.
-You help with software engineering: writing code, explaining, debugging, refactoring, fetching docs from the web, and running commands.
+You help with software engineering: writing code, explaining, debugging, refactoring, fetching docs from the web, running commands, and orchestrating specialist sub-agents.
 
 Environment:
 - Working directory (your workspace): {cwd}
@@ -189,26 +245,27 @@ Environment:
 
 Note: reads may touch any path, but writes/edits OUTSIDE the workspace require
 explicit user approval and should be avoided unless the user asks for them.
+Configured permission rules may deny or force approval for specific commands,
+paths or URLs — if an action is blocked, adapt instead of retrying identically.
 
 {overview}
 {agents_md}
-Rules:
-1. Use grep/glob/list_dir to inspect files BEFORE editing them. Never guess file contents. read_file returns numbered lines; use offset/limit to page through big files.
-2. Prefer apply_patch for code edits — it can add, update, rename and delete multiple files in one atomic call. Use edit_file only for one tiny single-file tweak. Always anchor Update File hunks with unique context lines (@@) or '*** End of File'.
-3. Use update_plan for any multi-step task: keep exactly one step in_progress while working.
-4. Use fetch_url when you need external docs or API references instead of guessing.
-5. Keep responses concise. Use short markdown. Code blocks must specify the language.
-6. When you finish a task, summarize what changed in 1-3 bullet points.
-7. If something fails, read the error output and iterate until fixed.
-8. Do not invent APIs or libraries that are not already used by the project.
+{capabilities}
 
-Team:
-You can delegate to specialist sub-agents with the delegate tool: planner, researcher, coder, reviewer, tester (see tool schema). Use it when work splits into independent chunks — e.g. research two areas at once, or have reviewer check your change while tester runs the suite. Give each task precise, self-contained instructions. Do NOT delegate trivial one-file tweaks — just do them directly."#,
+Working rules:
+1. Inspect BEFORE editing: grep/glob/list_dir/read_file first; read_file returns numbered lines and pages via offset/limit — never guess contents.
+2. Prefer apply_patch for code edits — atomic multi-file add/update/rename/delete. Use edit_file only for one tiny single-file tweak. Anchor Update hunks with unique '@@ context' lines or '*** End of File'.
+3. Use update_plan for any multi-step task: exactly one step in_progress at a time; replace the whole list each call.
+4. Use fetch_url for external docs/API references instead of guessing URLs or APIs. Do not invent libraries the project does not use.
+5. Delegate to specialists when work splits into independent chunks (research two areas in parallel, reviewer + tester after coding). Give each task precise, self-contained instructions; skip delegation for trivial single-file tweaks.
+6. If a tool errors, read the message, fix the cause, retry differently — never repeat the identical failing call.
+7. Keep replies concise markdown with language-tagged code blocks; finish with 1-3 bullets summarizing what changed."#,
             cwd = cwd.display(),
             os = std::env::consts::OS,
             date = chrono_today(),
             overview = overview,
             agents_md = agents_md,
+            capabilities = Self::capabilities_block(),
         )
     }
 
@@ -671,6 +728,47 @@ fn chrono_today() -> String {    let now = std::time::SystemTime::now()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_describes_every_tool_and_specialist() {
+        let prompt = Agent::build_system_prompt(std::path::Path::new("."));
+        // Every registered tool is documented with its parameters.
+        for td in tools::tool_defs() {
+            assert!(
+                prompt.contains(&format!("- {}(", td.function.name)),
+                "prompt must document tool '{}':\\n{prompt}",
+                td.function.name
+            );
+        }
+        // Every specialist role (built-in + custom) is listed.
+        for r in crate::agents::all_roles() {
+            assert!(
+                prompt.contains(&format!("- {}", r.name)),
+                "prompt must list specialist '{}'",
+                r.name
+            );
+        }
+        // Key operational knowledge stays in the prompt.
+        assert!(prompt.contains("*** Begin Patch"));
+        assert!(prompt.contains("update_plan"));
+        assert!(prompt.contains("PLAN mode is active") == false, "plan note is per-request only");
+    }
+
+    #[test]
+    fn capabilities_track_new_tools_automatically() {
+        let block = Agent::capabilities_block();
+        // A tool added to the registry tomorrow shows up without editing prose:
+        // the block enumerates exactly the registry, nothing stale.
+        let registry_names: Vec<&str> =
+            tools::tool_defs().iter().map(|t| t.function.name).collect();
+        for name in &registry_names {
+            assert!(block.contains(name));
+        }
+        assert_eq!(
+            block.matches("- ").count() >= registry_names.len(),
+            true
+        );
+    }
 
     #[test]
     fn today_is_valid_iso_date() {
