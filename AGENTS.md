@@ -31,18 +31,19 @@ laudacode exec "list the files in this directory"
 
 | File             | Responsibility                                                        |
 |------------------|-----------------------------------------------------------------------|
-| `src/main.rs`    | entry point, CLI dispatch, provider subcommand handling               |
-| `src/cli.rs`     | clap definitions                                                      |
-| `src/config.rs`  | config load/save (TOML or JSON), env precedence, provider resolution  |
+| `src/main.rs`    | entry point, CLI dispatch, profile merging, provider subcommand handling |
+| `src/cli.rs`     | clap definitions (`--profile`, `-i/--image`, `--json`)                |
+| `src/config.rs`  | config load/save (TOML or JSON), env precedence, profiles, provider resolution |
 | `src/provider`   | *(managed through `config.rs` + `repl.rs` helpers)*                   |
-| `src/api.rs`     | OpenAI-compatible chat client, SSE streaming, tool-call accumulation  |
+| `src/api.rs`     | OpenAI-compatible chat client, SSE streaming, tool-call accumulation, vision multipart messages |
 | `src/agent.rs`   | agent loop (LLM ↔ tools), approval modes, system prompt, /compact     |
-| `src/tools.rs`   | tool schemas + execution: list_dir, read_file, write_file, edit_file, run_command, fetch_url |
-| `src/session.rs` | conversation persistence (~/.local/share/laudacode/sessions)          |
+| `src/tools.rs`   | tool schemas + execution: list_dir, read_file, write_file, edit_file, apply_patch, run_command, fetch_url, grep, glob, update_plan |
+| `src/patch.rs`   | codex-style V4A patch parser/applier (`*** Begin Patch` format)       |
+| `src/session.rs` | conversation persistence (~/.local/share/laudacode/sessions), resume by unique id |
 | `src/repl.rs`    | interactive REPL, slash commands, streaming UI, provider flows        |
 
-Precedence rules (do not break): **CLI flags > env vars (`OPENAI_API_KEY`,
-`OPENAI_BASE_URL`, `OPENAI_MODEL`) > config file**.
+Precedence rules (do not break): **CLI flags > profile > env vars
+(`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`) > config file**.
 
 ## Conventions
 
@@ -51,4 +52,6 @@ Precedence rules (do not break): **CLI flags > env vars (`OPENAI_API_KEY`,
 - Never commit real API keys — the `.gitignore` excludes local config files.
 - Shell commands execute via `sh -c`; classify danger in
   `tools::is_dangerous_command` before touching approval logic.
+- Write containment is symlink-aware (`tools::contained_in_workspace*`);
+  keep it that way when touching path handling.
 - Tool outputs are truncated (`MAX_TOOL_OUTPUT`) — respect those limits.

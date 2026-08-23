@@ -1,0 +1,1623 @@
+use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    Frame,
+};
+use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
+
+/// Collaboration mode, cycled with Shift+Tab like Codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Read-only planning: model explores and produces a plan.
+    Plan,
+    /// Normal: edits auto-approved, shell commands require approval.
+    Build,
+    /// Everything auto-approved unless dangerous.
+    FullAuto,
+}
+
+impl Mode {
+    pub fn next(self) -> Self {
+        match self {
+            Mode::Plan => Mode::Build,
+            Mode::Build => Mode::FullAuto,
+            Mode::FullAuto => Mode::Plan,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Mode::Plan => "PLAN",
+            Mode::Build => "BUILD",
+            Mode::FullAuto => "FULL AUTO",
+        }
+    }
+    pub fn color(&self) -> Color {
+        match self {
+            Mode::Plan => Color::LightBlue,
+            Mode::Build => Color::LightGreen,
+            Mode::FullAuto => Color::Yellow,
+        }
+    }
+}
+
+/// Brand banner — must spell exactly "LaudaCode".
+pub const BANNER: &str = concat!(
+    "█                 █       ███         █     \n",
+    "█     ██  █  █    █  ██  █     ██     █  ██ \n",
+    "█    █  █ █  █  ███ █  █ █    █  █  ███ ████\n",
+    "█    █  █ █  █ █  █ █  █ █    █  █ █  █ █   \n",
+    "█    ████ █  █ █  █ ████ █    █  █ █  █ █   \n",
+    "████ █  █  ██   ███ █  █  ███  ██   ███  ██ ",
+);
+
+/// Banner renders as a vertical green → cyan → blue gradient, echoing the
+/// OpenAI/Codex palette.
+const BANNER_COLORS: &[Color] = &[
+    Color::LightGreen,
+    Color::Green,
+    Color::Cyan,
+    Color::LightCyan,
+    Color::LightBlue,
+    Color::Blue,
+];
+
+/// Total header height: 6 art rows + 1 tagline row.
+const HEADER_HEIGHT: u16 = 7;
+
+/// One entry in the transcript (the scrolling history above the composer).
+#[derive(Debug, Clone)]
+pub enum Entry {
+    User(String),
+    Assistant(String),
+    Reasoning(String),
+    ToolCall { name: String, summary: String },
+    ToolResult { name: String, ok: bool, preview: String },
+    Info(String),
+    Error(String),
+}
+
+/// What the app should do next after an event is processed.
+#[derive(Debug)]
+pub enum Action {
+    None,
+    Submit(String),
+    CycleMode,
+    Quit,
+    OpenSlash(String),
+    /// User answered a pending approval modal.
+    Approve(bool),
+    /// "Always allow" — approve and switch to FULL AUTO for the session.
+    ApproveAlways,
+    /// Esc pressed while the agent is busy — request interruption.
+    Interrupt,
+    /// Ctrl+B — show/hide the brand banner.
+    ToggleBanner,
+}
+
+/// A modal picker over a list of strings (models, providers, ...).
+struct Picker {
+    title: String,
+    items: Vec<String>,
+    selected: usize,
+    filter: String,
+}
+
+impl Picker {
+    fn filtered(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| f.is_empty() || s.to_lowercase().contains(&f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// The full-screen TUI application state.
+pub struct Tui {
+    pub input: String,
+    pub entries: Vec<Entry>,
+    pub mode: Mode,
+    pub status: Option<(String, Instant)>,
+    pub spinner_idx: usize,
+    /// Agent activity indicator (rendered in the footer, never in the transcript).
+    busy: bool,
+    busy_label: String,
+    /// When the current busy stretch started — drives the codex-style
+    /// "working (esc · Ns)" elapsed counter.
+    busy_since: Option<Instant>,
+    /// Last reported token usage + assumed window for the context meter.
+    pub ctx_used: u64,
+    pub ctx_total: u64,
+    scroll: usize,
+    picker: Option<Picker>,
+    pending_approval: Option<String>,
+    /// Highlighted row in the slash-command suggestion popup.
+    slash_sel: usize,
+    /// Project files for `@mention` completion (relative paths, sorted).
+    files: Vec<String>,
+    /// Highlighted row in the @-file popup.
+    at_sel: usize,
+    /// Ctrl+O output-expansion overlay (last tool results in full).
+    overlay: bool,
+    overlay_scroll: usize,
+    /// Double-press Ctrl+C to quit (first press warns instead of exiting).
+    last_ctrl_c: Option<Instant>,
+    /// Brand banner pinned above the transcript (Ctrl+B toggles).
+    show_banner: bool,
+    /// Render cache: wrapped lines for already-processed entries. Only the
+    /// growing tail (the streaming entry) is re-wrapped each frame.
+    cache_width: u16,
+    cached_lines: Vec<Line<'static>>,
+    processed_entries: usize,
+    /// Per-processed-entry: (content length when wrapped, line count).
+    entry_state: Vec<(usize, usize)>,
+    last_tick: Instant,
+}
+
+/// Built-in slash commands surfaced by the composer autocomplete.
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show all commands"),
+    ("/model", "pick a model from the live list"),
+    ("/approvals", "switch approval mode (plan/build/full-auto)"),
+    ("/provider", "manage providers (list|show|use <name>)"),
+    ("/compact", "summarize history to free context"),
+    ("/clear", "reset the conversation"),
+    ("/retry", "re-run the previous task"),
+    ("/export", "save transcript as markdown"),
+    ("/resume", "resume a previous session by id"),
+    ("/image", "attach an image to your next message"),
+    ("/status", "provider · model · session info"),
+    ("/diff", "show uncommitted git changes"),
+    ("/init", "create an AGENTS.md project brief"),
+    ("/quit", "exit Laudacode"),
+];
+
+/// Indices into `SLASH_COMMANDS` whose name starts with `query`
+/// (case-insensitive). Empty query returns everything.
+fn filter_slash_commands(query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, (cmd, _))| q.is_empty() || cmd.starts_with(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const TICK_MS: u64 = 100;
+
+impl Tui {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            entries: vec![],
+            mode: Mode::Build,
+            status: None,
+            spinner_idx: 0,
+            busy: false,
+            busy_label: "working".into(),
+            busy_since: None,
+            ctx_used: 0,
+            ctx_total: 128_000,
+            scroll: 0,
+            picker: None,
+            pending_approval: None,
+            slash_sel: 0,
+            files: vec![],
+            at_sel: 0,
+            overlay: false,
+            overlay_scroll: 0,
+            last_ctrl_c: None,
+            show_banner: true,
+            cache_width: 0,
+            cached_lines: Vec::new(),
+            processed_entries: 0,
+            entry_state: Vec::new(),
+            last_tick: Instant::now(),
+        }
+    }
+
+    pub fn push(&mut self, e: Entry) {
+        self.entries.push(e);
+        self.scroll = 0;
+    }
+
+    /// Set/clear the footer activity indicator.
+    pub fn set_busy(&mut self, busy: bool, label: impl Into<String>) {
+        self.busy = busy;
+        if busy {
+            self.busy_label = label.into();
+            if self.busy_since.is_none() {
+                self.busy_since = Some(Instant::now());
+            }
+        } else {
+            self.busy_since = None;
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// Feed the context-left meter (footer). `total` is the assumed window.
+    pub fn set_usage(&mut self, used: u64, total: u64) {
+        self.ctx_used = used;
+        if total > 0 {
+            self.ctx_total = total;
+        }
+    }
+
+    /// Refresh the @-mention file list (relative paths, sorted, capped).
+    pub fn set_files(&mut self, files: Vec<String>) {
+        let mut f = files;
+        f.sort_by_key(|p| p.to_lowercase());
+        self.files = f.into_iter().take(2000).collect();
+    }
+
+    /// Toggle the pinned brand banner (Ctrl+B).
+    pub fn toggle_banner(&mut self) {
+        self.show_banner = !self.show_banner;
+    }
+
+    pub fn banner_visible(&self) -> bool {
+        self.show_banner
+    }
+
+    // -----------------------------------------------------------------------
+    // @-file mention popup
+    // -----------------------------------------------------------------------
+
+    /// Active while the user is typing a path after an '@' (no whitespace yet
+    /// after the last '@', and the '@' begins the input or follows a space).
+    pub fn at_popup_active(&self) -> bool {
+        match self.input.rfind('@') {
+            None => false,
+            Some(i) => {
+                let at_start = i == 0 || self.input[..i].ends_with(char::is_whitespace);
+                let no_space_after = !self.input[i + 1..].contains(char::is_whitespace);
+                at_start && no_space_after && self.files.iter().any(|f| Self::at_matches(&self.files_query(), f))
+            }
+        }
+    }
+
+    fn files_query(&self) -> String {
+        match self.input.rfind('@') {
+            Some(i) => self.input[i + 1..].to_lowercase(),
+            None => String::new(),
+        }
+    }
+
+    fn at_matches(query: &str, path: &str) -> bool {
+        query.is_empty() || path.to_lowercase().contains(query)
+    }
+
+    /// Indices into `files` matching the current @-query (substring, then
+    /// prefix-first ordering for relevance).
+    pub fn at_matches_list(&self) -> Vec<usize> {
+        if !self.at_popup_active() && !self.at_token_present() {
+            return Vec::new();
+        }
+        let q = self.files_query();
+        let mut subs: Vec<(usize, usize)> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| Self::at_matches(&q, f))
+            .map(|(i, f)| {
+                let lower = f.to_lowercase();
+                let depth = f.matches('/').count();
+                // Rank: filename-prefix hits first, shallower paths next.
+                let rank = if lower.rsplit('/').next().unwrap_or("").starts_with(&q) && !q.is_empty() { 0 } else { 1 };
+                (rank * 10_000 + depth, i)
+            })
+            .collect();
+        subs.sort_by_key(|(rank, _)| *rank);
+        subs.into_iter().map(|(_, i)| i).collect()
+    }
+
+    fn at_token_present(&self) -> bool {
+        match self.input.rfind('@') {
+            Some(i) => i == 0 || self.input[..i].ends_with(char::is_whitespace),
+            None => false,
+        }
+    }
+
+    /// Replace the typed '@query' with the highlighted file (plus a space).
+    pub fn complete_at(&mut self) {
+        let matches = self.at_matches_list();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = matches[self.at_sel.min(matches.len() - 1)];
+        let path = &self.files[idx];
+        let start = self.input.rfind('@').unwrap_or(0);
+        self.input.truncate(start);
+        self.input.push('@');
+        self.input.push_str(path);
+        self.input.push(' ');
+        self.at_sel = 0;
+    }
+
+    fn move_at_sel(&mut self, delta: isize) {
+        let n = self.at_matches_list().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.at_sel.min(n - 1) as isize;
+        let next = ((cur + delta).rem_euclid(n as isize)) as usize;
+        self.at_sel = next;
+    }
+
+    /// Append streamed assistant text, merging into the last Assistant entry.
+    pub fn push_stream_text(&mut self, delta: &str) {
+        if let Some(Entry::Assistant(t)) = self.entries.last_mut() {
+            t.push_str(delta);
+            return;
+        }
+        self.entries.push(Entry::Assistant(delta.to_string()));
+    }
+
+    /// Append streamed reasoning text, merging into the last Reasoning entry.
+    pub fn push_reasoning_text(&mut self, delta: &str) {
+        if let Some(Entry::Reasoning(t)) = self.entries.last_mut() {
+            t.push_str(delta);
+            return;
+        }
+        self.entries.push(Entry::Reasoning(delta.to_string()));
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if m.is_empty() { self.status = None } else { self.status = Some((m, Instant::now())) }
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    pub fn open_picker(&mut self, title: impl Into<String>, items: Vec<String>) {
+        self.picker = Some(Picker { title: title.into(), items, selected: 0, filter: String::new() });
+    }
+
+    pub fn open_approval(&mut self, detail: String) {
+        self.push(Entry::Info(format!("Approval requested:\n{}", detail)));
+        self.pending_approval = Some(detail);
+    }
+
+    /// The suggestion popup is open while the user is still typing the
+    /// command name — i.e. input starts with '/' and has no whitespace yet.
+    pub fn slash_popup_active(&self) -> bool {
+        self.input.starts_with('/') && !self.input.chars().skip(1).any(char::is_whitespace)
+    }
+
+    /// Matching commands for the current input, as indices into `SLASH_COMMANDS`.
+    pub fn slash_matches(&self) -> Vec<usize> {
+        if !self.slash_popup_active() {
+            return Vec::new();
+        }
+        filter_slash_commands(&self.input)
+    }
+
+    /// Replace the typed token with the highlighted suggestion (plus a space).
+    pub fn complete_slash(&mut self) {
+        let matches = self.slash_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = matches[self.slash_sel.min(matches.len() - 1)];
+        let (cmd, _) = SLASH_COMMANDS[idx];
+        self.input = format!("{cmd} ");
+        self.slash_sel = 0;
+    }
+
+    fn move_slash_sel(&mut self, delta: isize) {
+        let n = self.slash_matches().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.slash_sel.min(n - 1) as isize;
+        let next = ((cur + delta).rem_euclid(n as isize)) as usize;
+        self.slash_sel = next;
+    }
+
+    /// Text content of an entry (used to detect growth of the streaming tail).
+    fn entry_len(e: &Entry) -> usize {
+        match e {
+            Entry::User(t)
+            | Entry::Assistant(t)
+            | Entry::Reasoning(t)
+            | Entry::Info(t)
+            | Entry::Error(t) => t.len(),
+            Entry::ToolCall { name, summary } => name.len() + summary.len(),
+            Entry::ToolResult { name, preview, .. } => name.len() + preview.len(),
+        }
+    }
+
+    /// Wrap one entry into display lines.
+    fn entry_lines(e: &Entry, width: u16) -> Vec<Line<'static>> {
+        match e {
+            Entry::User(t) => vec![Line::from(Span::styled(
+                format!("{} {}", "›", t),
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ))],
+            Entry::Assistant(t) => {
+                crate::markdown::render_markdown(t, width.saturating_sub(2) as usize)
+            }
+            Entry::Reasoning(t) => wrap_text(t, width.saturating_sub(4) as usize)
+                .into_iter()
+                .map(|l| {
+                    Line::from(Span::styled(
+                        l,
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ))
+                })
+                .collect(),
+            Entry::ToolCall { name, summary } => vec![Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
+            ])],
+            Entry::ToolResult { name, ok, preview } => {
+                let color = if *ok { Color::LightGreen } else { Color::LightRed };
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(if *ok { "✔ " } else { "✘ " }, Style::default().fg(color)),
+                    Span::styled(name.clone(), Style::default().fg(color)),
+                ])];
+                for l in preview.lines().take(4) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+                lines
+            }
+            Entry::Info(t) => t
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::LightBlue))))
+                .collect(),
+            Entry::Error(t) => wrap_text(t, width.saturating_sub(2) as usize)
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))))
+                .collect(),
+        }
+    }
+
+    /// Bring the render cache up to date.
+    ///
+    /// Only entries appended since the last frame — plus the growing
+    /// streaming tail — are (re)wrapped; everything else is cached. Per-frame
+    /// cost is O(new bytes), not O(transcript).
+    fn ensure_render_cache(&mut self, width: u16) {
+        if self.cache_width != width {
+            self.cache_width = width;
+            self.cached_lines.clear();
+            self.processed_entries = 0;
+            self.entry_state.clear();
+        }
+        // Transcript cleared/truncated (/clear).
+        while self.processed_entries > self.entries.len() {
+            self.processed_entries -= 1;
+            let (_, n) = self.entry_state.pop().unwrap_or((0, 0));
+            let keep = self.cached_lines.len().saturating_sub(n);
+            self.cached_lines.truncate(keep);
+        }
+        // The last processed entry may have grown (streaming appends to it):
+        // drop its cached lines so it gets re-wrapped below.
+        if self.processed_entries > 0 {
+            let idx = self.processed_entries - 1;
+            if Self::entry_len(&self.entries[idx]) != self.entry_state[idx].0 {
+                self.processed_entries -= 1;
+                let (_, n) = self.entry_state.pop().unwrap_or((0, 0));
+                let keep = self.cached_lines.len().saturating_sub(n);
+                self.cached_lines.truncate(keep);
+            }
+        }
+        // Wrap any newly appended entries.
+        while self.processed_entries < self.entries.len() {
+            let e = &self.entries[self.processed_entries];
+            let lines = Self::entry_lines(e, width);
+            let count = lines.len();
+            let len = Self::entry_len(e);
+            self.cached_lines.extend(lines);
+            self.entry_state.push((len, count));
+            self.processed_entries += 1;
+        }
+    }
+
+    pub fn draw(&mut self, f: &mut Frame, subtitle: &str) {
+        let area = f.area();
+
+        // Ctrl+O full-output overlay takes over the screen.
+        if self.overlay {
+            self.draw_overlay(f, area);
+            return;
+        }
+
+        if self.picker.is_some() {
+            if let Some(mut p) = self.picker.take() {
+                self.draw_picker(f, area, &mut p);
+                self.picker = Some(p);
+            }
+            return;
+        }
+
+        // Header (brand banner) is shown when there's room for it.
+        let show_header = self.show_banner && area.height >= 23 && area.width >= 46;
+        let chunks = if show_header {
+            Layout::vertical([
+                Constraint::Length(HEADER_HEIGHT), // banner
+                Constraint::Min(1),                // transcript
+                Constraint::Length(3),             // composer
+                Constraint::Length(1),             // hints
+                Constraint::Length(1),             // footer
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Min(1),      // transcript
+                Constraint::Length(3),   // composer
+                Constraint::Length(1),   // hints
+                Constraint::Length(1),   // footer
+            ])
+            .split(area)
+        };
+        let (header, transcript_area, composer_area, hints_area, footer_area) = if show_header {
+            (Some(chunks[0]), chunks[1], chunks[2], chunks[3], chunks[4])
+        } else {
+            (None, chunks[0], chunks[1], chunks[2], chunks[3])
+        };
+
+        if let Some(h) = header {
+            let mut banner_lines: Vec<Line> = BANNER
+                .lines()
+                .zip(BANNER_COLORS.iter())
+                .map(|(row, color)| {
+                    Line::from(Span::styled(
+                        row.to_string(),
+                        Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                    ))
+                })
+                .collect();
+            banner_lines.push(Line::from(vec![
+                Span::styled(" LaudaCode", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("— codex-class agent, pure Rust", Style::default().fg(Color::DarkGray)),
+            ]));
+            f.render_widget(Paragraph::new(banner_lines), h);
+        }
+
+        // Transcript
+        let width = transcript_area.width.max(20);
+        self.ensure_render_cache(width);
+        let lines = &self.cached_lines;
+        let total = lines.len() as u16;
+        let height = transcript_area.height;
+        let skip = self.scroll.min(total.saturating_sub(height) as usize);
+        let start = total.saturating_sub(height + skip as u16);
+        let shown: Vec<ListItem> = lines
+            .iter()
+            .skip(start as usize)
+            .map(|l| ListItem::new(l.clone()))
+            .collect();
+        let list = List::new(shown).block(Block::default().borders(Borders::NONE));
+        f.render_widget(list, transcript_area);
+
+        // Scroll hint
+        if self.scroll > 0 {
+            let hint = Span::styled(format!(" ↑ {} lines (Esc to release) ", self.scroll), Style::default().fg(Color::DarkGray));
+            let r = Rect::new(transcript_area.x, transcript_area.y, transcript_area.width, 1);
+            let p = Paragraph::new(Line::from(hint)).alignment(ratatui::layout::Alignment::Right);
+            f.render_widget(p, r);
+        }
+
+        // Composer — border glows in the active mode color while working.
+        let comp_style = if self.busy {
+            Style::default().fg(self.mode.color())
+        } else {
+            Style::default().fg(Color::Rgb(110, 110, 135))
+        };
+        let placeholder =
+            "ask laudacode anything — @ to mention files, # to remember, / for commands";
+        let cursor_ok = self.pending_approval.is_none();
+        let text = if self.input.is_empty() && !cursor_ok {
+            Line::from(Span::styled("waiting for approval — y / a / n", Style::default().fg(Color::DarkGray)))
+        } else if self.input.is_empty() {
+            Line::from(Span::styled(placeholder, Style::default().fg(Color::DarkGray)))
+        } else {
+            Line::from(Span::raw(self.input.clone()))
+        };
+        let composer = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).style(comp_style))
+            .wrap(Wrap { trim: false });
+        f.render_widget(composer, composer_area);
+        if cursor_ok {
+            let x = composer_area.x
+                + 1
+                + UnicodeWidthStr::width(self.input.rsplit('\n').next().unwrap_or("")) as u16;
+            let row = composer_area.y + 1;
+            if x < composer_area.x + composer_area.width - 1 {
+                f.set_cursor_position((x.min(composer_area.x + composer_area.width - 2), row));
+            }
+        }
+
+        // Slash-command + @-file suggestion popups, floating above the composer.
+        if self.pending_approval.is_none() {
+            self.draw_slash_popup(f, area, composer_area);
+            self.draw_at_popup(f, area, composer_area);
+        }
+
+        // Codex-style hints strip under the composer.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " enter send · esc interrupt · tab mode · ctrl+o expand · ! shell · ctrl+c quit ",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            hints_area,
+        );
+
+        // Approval modal floats over everything else.
+        if let Some(detail) = self.pending_approval.clone() {
+            self.draw_approval_modal(f, area, &detail);
+        }
+
+        // Footer: brand + mode chip + activity on the left; context meter +
+        // subtitle right-aligned in a second column.
+        let cols = Layout::horizontal([
+            Constraint::Percentage(55),
+            Constraint::Percentage(45),
+        ])
+        .split(footer_area);
+        let mut spans = vec![
+            Span::styled(" LaudaCode ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} ", self.mode.label()),
+                Style::default().bg(self.mode.color()).fg(Color::Black).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if self.busy {
+            let glyph = SPINNER[self.spinner_idx % SPINNER.len()];
+            let secs = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            spans.push(Span::styled(
+                format!(" {glyph} {} (esc · {secs}s)", self.busy_label),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some((msg, at)) = &self.status {
+            let secs = at.elapsed().as_secs();
+            spans.push(Span::styled(
+                format!("  ·  {msg} ({secs}s)"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
+
+        // Context-left meter, codex-style: ▕██████░░░░░░▏ 38%
+        let pct = self
+            .ctx_used
+            .min(self.ctx_total)
+            .checked_mul(100)
+            .and_then(|n| n.checked_div(self.ctx_total))
+            .map(|p| p.min(100))
+            .unwrap_or(0);
+        const BAR_SLOTS: usize = 10;
+        let filled = pct as usize * BAR_SLOTS / 100;
+        let bar_color = if pct >= 85 {
+            Color::LightRed
+        } else if pct >= 60 {
+            Color::LightYellow
+        } else {
+            Color::DarkGray
+        };
+        let meter_spans = vec![
+            Span::styled(subtitle.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
+            Span::styled("▕", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled("░".repeat(BAR_SLOTS - filled), Style::default().fg(Color::DarkGray)),
+            Span::styled("▏", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(" {:>3}% ", 100 - pct),
+                Style::default().fg(if 100 - pct <= 15 { Color::LightRed } else { Color::Gray }),
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(Line::from(meter_spans)).alignment(ratatui::layout::Alignment::Right),
+            cols[1],
+        );
+    }
+
+    /// Centered approval dialog, codex-style: detail + y/a/n options.
+    fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
+        let width = area.width.clamp(40, 64);
+        let wrapped = wrap_text(detail, width.saturating_sub(4) as usize);
+        let height = (wrapped.len() as u16 + 5).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 3,
+            width,
+            height,
+        };
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+            "Allow this action?",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))];
+        for l in wrapped {
+            lines.push(Line::from(Span::styled(l, Style::default().fg(Color::Gray))));
+        }
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(vec![
+            Span::styled("y", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::raw(" yes   "),
+            Span::styled("a", Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" always (full-auto)   "),
+            Span::styled("n", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+            Span::raw(" no   "),
+            Span::styled("esc", Style::default().fg(Color::Gray)),
+            Span::raw(" cancel"),
+        ]));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(" approval ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            rect,
+        );
+    }
+
+    /// Ctrl+O overlay: recent tool activity expanded in full, scrollable.
+    fn draw_overlay(&mut self, f: &mut Frame, area: Rect) {
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " tool output — esc/ctrl+o to close ",
+                Style::default().fg(Color::Cyan),
+            ))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner_w = area.width.saturating_sub(2);
+        // Collect the last tool entries, newest last.
+        let mut lines: Vec<Line> = Vec::new();
+        for e in &self.entries {
+            match e {
+                Entry::ToolCall { name, summary } => {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("● {name}"), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+                Entry::ToolResult { name, ok, preview } => {
+                    let color = if *ok { Color::LightGreen } else { Color::LightRed };
+                    lines.push(Line::from(Span::styled(
+                        format!("{} {}", if *ok { "✔" } else { "✘" }, name),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )));
+                    for l in wrap_text(preview, inner_w.max(20) as usize) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {l}"),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                    lines.push(Line::from(Span::raw(String::new())));
+                }
+                _ => {}
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no tool output yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let total_lines = lines.len();
+        let visible = area.height.saturating_sub(2) as usize;
+        let max_scroll = total_lines.saturating_sub(visible);
+        let skip = self.overlay_scroll.min(max_scroll);
+        let start = total_lines.saturating_sub(visible + skip);
+        let shown = &lines[start..start + visible.min(total_lines - start)];
+        f.render_widget(Paragraph::new(shown.to_vec()).block(block), area);
+    }
+
+    /// Floating suggestion list above the composer while typing a command.
+    fn draw_slash_popup(&mut self, f: &mut Frame, area: Rect, composer: Rect) {
+        let matches = self.slash_matches();
+        if matches.is_empty() {
+            return;
+        }
+        const MAX_VISIBLE: usize = 6;
+        let visible = matches.len().min(MAX_VISIBLE);
+        let height = visible as u16 + 2; // borders
+        let width = area.width.clamp(28, 52);
+        let y = composer.y.saturating_sub(height);
+        if y < area.y {
+            return; // not enough room above the composer
+        }
+        let rect = Rect { x: area.x, y, width, height };
+
+        let sel = self.slash_sel.min(matches.len() - 1);
+        // Keep the highlighted row inside a sliding window.
+        let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
+        let items: Vec<ListItem> = matches[start..start + visible]
+            .iter()
+            .map(|&i| {
+                let (cmd, desc) = SLASH_COMMANDS[i];
+                let selected = i == matches[sel];
+                let style = if selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{cmd:<12}"), style.fg(if selected { Color::White } else { Color::Cyan }).add_modifier(Modifier::BOLD)),
+                    Span::styled(desc.to_string(), if selected { style } else { Style::default().fg(Color::DarkGray) }),
+                ]))
+            })
+            .collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(Clear, rect);
+        f.render_widget(List::new(items).block(block), rect);
+    }
+
+    /// Floating file list above the composer while typing an '@path'.
+    fn draw_at_popup(&mut self, f: &mut Frame, area: Rect, composer: Rect) {
+        let matches = self.at_matches_list();
+        if matches.is_empty() || self.pending_approval.is_some() {
+            return;
+        }
+        const MAX_VISIBLE: usize = 6;
+        let visible = matches.len().min(MAX_VISIBLE);
+        let height = visible as u16 + 2;
+        let width = area.width.clamp(30, 56);
+        // Stack above the slash popup when both would collide.
+        let slash_h = if self.slash_popup_active() { 8 } else { 0 };
+        let y = composer.y.saturating_sub(height + slash_h);
+        if y < area.y {
+            return;
+        }
+        let rect = Rect { x: area.x, y, width, height };
+        let sel = self.at_sel.min(matches.len() - 1);
+        let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
+        let items: Vec<ListItem> = matches[start..start + visible]
+            .iter()
+            .map(|&i| {
+                let selected = i == matches[sel];
+                let path = &self.files[i];
+                let style = if selected {
+                    Style::default().bg(Color::Rgb(50, 70, 60)).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                ListItem::new(Line::from(Span::styled(format!("@{path}"), style)))
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" files ", Style::default().fg(Color::Green)))
+            .border_style(Style::default().fg(Color::Green));
+        f.render_widget(Clear, rect);
+        f.render_widget(List::new(items).block(block), rect);
+    }
+
+    fn draw_picker(&mut self, f: &mut Frame, area: Rect, p: &mut Picker) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(format!(" {} ", p.title), Style::default().fg(Color::Cyan)))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(p.filter.clone()),
+            ])),
+            rows[0],
+        );
+
+        let idxs = p.filtered();
+        let max = rows[1].height as usize;
+        let sel_pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
+        let start = sel_pos.saturating_sub(max / 2);
+        let items: Vec<ListItem> = idxs
+            .iter()
+            .skip(start)
+            .take(max)
+            .map(|i| {
+                let style = if *i == p.selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(p.items[*i].clone(), style)))
+            })
+            .collect();
+        f.render_widget(List::new(items), rows[1]);
+
+        let count = idxs.len();
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{count} items · ↑/↓ move · enter select · esc cancel"),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[2],
+        );
+    }
+
+    /// Handle one terminal event. Returns the action the host should take.
+    pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // Ctrl+O output overlay takes over all keys.
+        if self.overlay {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('o') => {
+                    if key.code == KeyCode::Char('o') && !key.modifiers.contains(KeyModifiers::CONTROL) && !self.input.is_empty() {
+                        Action::None
+                    } else {
+                        self.overlay = false;
+                        self.overlay_scroll = 0;
+                        Action::None
+                    }
+                }
+                KeyCode::Up => {
+                    self.overlay_scroll += 5;
+                    Action::None
+                }
+                KeyCode::Down => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(5);
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+
+        // Modal approval takes over all keys.
+        if self.pending_approval.is_some() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.pending_approval = None;
+                    Action::Approve(true)
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.pending_approval = None;
+                    Action::ApproveAlways
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_approval = None;
+                    Action::Approve(false)
+                }
+                _ => Action::None,
+            };
+        }
+
+        if self.picker.is_some() {
+            return self.on_picker_key(key);
+        }
+
+        // @-file mention autocomplete takes over navigation keys while open.
+        if self.at_popup_active() {
+            let matches = self.at_matches_list();
+            if !matches.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        self.move_at_sel(-1);
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        self.move_at_sel(1);
+                        return Action::None;
+                    }
+                    KeyCode::Tab => {
+                        self.complete_at();
+                        return Action::None;
+                    }
+                    KeyCode::Enter
+                        if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            && self.input.trim_end() != self.files[matches[self.at_sel.min(matches.len() - 1)]] =>
+                    {
+                        self.complete_at();
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Slash-command autocomplete takes over navigation keys while open.
+        if self.slash_popup_active() {
+            let matches = self.slash_matches();
+            if !matches.is_empty() {
+                let idx = matches[self.slash_sel.min(matches.len() - 1)];
+                let (cmd, _) = SLASH_COMMANDS[idx];
+                match key.code {
+                    KeyCode::Up => {
+                        self.move_slash_sel(-1);
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        self.move_slash_sel(1);
+                        return Action::None;
+                    }
+                    KeyCode::Tab => {
+                        self.complete_slash();
+                        return Action::None;
+                    }
+                    // Enter completes unless the input already IS the
+                    // highlighted command — then fall through and submit.
+                    KeyCode::Enter
+                        if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            && self.input.trim_end() != cmd =>
+                    {
+                        self.complete_slash();
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Enter
+                if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                let input = self.input.trim().to_string();
+                self.input.clear();
+                if input.is_empty() { Action::None } else { Action::Submit(input) }
+            }
+            // Shift+Enter / Alt+Enter insert a newline instead of submitting.
+            KeyCode::Enter => {
+                self.input.push('\n');
+                Action::None
+            }
+            KeyCode::BackTab => Action::CycleMode,
+            // Tab cycles PLAN → BUILD → FULL AUTO (when the slash popup
+            // isn't open — there it completes the highlighted command).
+            KeyCode::Tab => Action::CycleMode,
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match c {
+                        'c' | 'd' => {
+                            // Codex-style double-press: first press clears the
+                            // composer (or warns), second within 2s quits.
+                            let now = Instant::now();
+                            let again = self
+                                .last_ctrl_c
+                                .map(|t| now.duration_since(t) < Duration::from_secs(2))
+                                .unwrap_or(false);
+                            if again || self.input.is_empty() && self.scroll == 0 {
+                                return Action::Quit;
+                            }
+                            if !self.input.is_empty() {
+                                self.input.clear();
+                                self.last_ctrl_c = None;
+                                return Action::None;
+                            }
+                            self.last_ctrl_c = Some(now);
+                            self.set_status("press ctrl+c again to quit");
+                            Action::None
+                        }
+                        'b' => Action::ToggleBanner,
+                        'o' => {
+                            self.overlay = true;
+                            self.overlay_scroll = 0;
+                            Action::None
+                        }
+                        _ => Action::None,
+                    }
+                } else {
+                    self.input.push(c);
+                    self.slash_sel = 0;
+                    self.at_sel = 0;
+                    Action::None
+                }
+            }
+            KeyCode::Backspace => {
+                if self.input.pop().is_some() {
+                    self.slash_sel = 0;
+                    self.at_sel = 0;
+                }
+                Action::None
+            }
+            KeyCode::Esc => {
+                // Close an open @-token first, then release scroll, then
+                // clear the input — and always signal interrupt.
+                if self.at_token_present() {
+                    if let Some(i) = self.input.rfind('@') {
+                        self.input.truncate(i);
+                        self.at_sel = 0;
+                    }
+                } else if self.scroll > 0 {
+                    self.scroll = 0;
+                } else {
+                    self.input.clear();
+                }
+                Action::Interrupt
+            }
+            KeyCode::Up if self.scrollable() => { self.scroll += 3; Action::None }
+            KeyCode::Down => { self.scroll = self.scroll.saturating_sub(3); Action::None }
+            KeyCode::PageUp if self.scrollable() => { self.scroll += 20; Action::None }
+            KeyCode::PageDown => { self.scroll = self.scroll.saturating_sub(20); Action::None }
+            _ => Action::None,
+        }
+    }
+
+    fn scrollable(&self) -> bool {
+        true
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) -> Action {
+        let mut action = Action::None;
+        {
+            let p = match &mut self.picker {
+                Some(p) => p,
+                None => return Action::None,
+            };
+            let idxs = p.filtered();
+            let pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
+            match key.code {
+                KeyCode::Esc => { self.picker = None; }
+                KeyCode::Up => {
+                    if pos > 0 { p.selected = idxs[pos - 1]; }
+                    else if let Some(last) = idxs.last() { p.selected = *last; }
+                }
+                KeyCode::Down => {
+                    if pos + 1 < idxs.len() { p.selected = idxs[pos + 1]; }
+                    else if let Some(first) = idxs.first() { p.selected = *first; }
+                }
+                KeyCode::Backspace => { p.filter.pop(); }
+                KeyCode::Char(c) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        if c == 'c' { self.picker = None; }
+                    } else {
+                        p.filter.push(c);
+                        if let Some(first) = p.filtered().first() { p.selected = *first; }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(i) = idxs.get(pos) {
+                        let chosen = p.items[*i].clone();
+                        let title = p.title.clone().to_lowercase();
+                        self.picker = None;
+                        action = Action::OpenSlash(format!("{title}:{chosen}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        action
+    }
+
+    /// True when enough time passed to advance the spinner.
+    pub fn tick_due(&mut self) -> bool {
+        if self.last_tick.elapsed() >= Duration::from_millis(TICK_MS) {
+            self.last_tick = Instant::now();
+            self.spinner_idx = self.spinner_idx.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Enter the alternate screen and raw mode. Call before `run_tui`.
+pub fn enter_tui() -> std::io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    Ok(())
+}
+
+/// Restore terminal state on any exit path.
+pub fn leave_tui() {
+    let _ = disable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+}
+
+/// Run the TUI event loop until the user quits.
+///
+/// `on_action` receives each action produced by key presses; it may push
+/// entries / open pickers via the shared `Tui` handle. Returns when an
+/// `Action::Quit` is produced or `on_action` requests shutdown through the
+/// returned boolean (`false` = stop).
+pub fn run_tui<F>(tui: &mut Tui, subtitle: String, mut on_action: F) -> anyhow::Result<()>
+where
+    F: FnMut(&mut Tui, Action) -> bool,
+{
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+        .map_err(|e| anyhow::anyhow!("terminal init failed: {e}"))?;
+
+    loop {
+        terminal
+            .draw(|f| tui.draw(f, &subtitle))
+            .map_err(|e| anyhow::anyhow!("draw failed: {e}"))?;
+
+        // Poll with a short timeout so the spinner can tick while idle.
+        if !event::poll(Duration::from_millis(TICK_MS))
+            .map_err(|e| anyhow::anyhow!("poll failed: {e}"))?
+        {
+            // Give the host a chance to drain background worker events even
+            // with no key activity — this is what makes streamed output,
+            // spinner animation and interrupts work without key presses.
+            if tui.tick_due() {
+                let _ = on_action(tui, Action::None);
+            }
+            continue;
+        }
+
+        match event::read().map_err(|e| anyhow::anyhow!("read failed: {e}"))? {
+            crossterm::event::Event::Key(key) => {
+                // Termux sends both Press and Release; only act on Press.
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let action = tui.on_key(key);
+                match action {
+                    Action::None => {}
+                    other => {
+                        if !on_action(tui, other) {
+                            break;
+                        }
+                    }
+                }
+            }
+            crossterm::event::Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Naive greedy word-wrap that respects existing newlines.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let w = width.max(10);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            let mut word = word.to_string();
+            if UnicodeWidthStr::width(line.as_str()) + UnicodeWidthStr::width(word.as_str()) + 1 > w {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                // Very long words get hard-split.
+                while UnicodeWidthStr::width(word.as_str()) > w {
+                    let split_at = word
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .take_while(|i| UnicodeWidthStr::width(&word[..*i]) <= w)
+                        .last()
+                        .unwrap_or(w.min(word.len()));
+                    let tail = word.split_off(split_at);
+                    out.push(std::mem::replace(&mut word, tail));
+                }
+                line.push_str(&word);
+            } else {
+                if !line.is_empty() { line.push(' '); }
+                line.push_str(&word);
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn slash_filter_matches_prefixes_case_insensitively() {
+        assert_eq!(filter_slash_commands("/").len(), SLASH_COMMANDS.len());
+        assert_eq!(filter_slash_commands("").len(), SLASH_COMMANDS.len());
+        assert_eq!(filter_slash_commands("/pro"), vec![3]); // /provider
+        assert_eq!(filter_slash_commands("/appro"), vec![2]); // /approvals
+        assert_eq!(filter_slash_commands("/resum"), vec![8]); // /resume
+        assert_eq!(filter_slash_commands("/imag"), vec![9]); // /image
+        assert_eq!(filter_slash_commands("/RETRY"), vec![6]);
+        assert_eq!(filter_slash_commands("/quit"), vec![13]);
+        // New codex-style commands are discoverable too.
+        assert_eq!(filter_slash_commands("/status"), vec![10]);
+        assert_eq!(filter_slash_commands("/diff"), vec![11]);
+        assert!(filter_slash_commands("/zzz").is_empty());
+    }
+
+    #[test]
+    fn popup_only_while_typing_command_name() {
+        let mut t = Tui::new();
+        assert!(!t.slash_popup_active());
+        t.input = "/".into();
+        assert!(t.slash_popup_active());
+        t.input = "/comp".into();
+        assert!(t.slash_popup_active());
+        // Space (args) closes the popup.
+        t.input = "/provider use x".into();
+        assert!(!t.slash_popup_active());
+        // Non-slash input never opens it.
+        t.input = "hello".into();
+        assert!(!t.slash_popup_active());
+    }
+
+    #[test]
+    fn tab_completes_highlighted_command() {
+        let mut t = Tui::new();
+        t.input = "/mod".into();
+        assert_eq!(t.slash_matches(), vec![1]); // /model
+        t.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(t.input, "/model ");
+        // Popup closed after completion (trailing space).
+        assert!(!t.slash_popup_active());
+    }
+
+    #[test]
+    fn enter_completes_partial_but_submits_exact() {
+        let mut t = Tui::new();
+        t.input = "/clea".into();
+        match t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::None => {}
+            other => panic!("enter should complete, got {other:?}"),
+        }
+        assert_eq!(t.input, "/clear ");
+        // Now the input exactly equals a command: Enter must submit it.
+        t.input = "/clear".into();
+        match t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(s) => assert_eq!(s, "/clear"),
+            other => panic!("expected submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrows_navigate_popup_instead_of_scrolling() {
+        let mut t = Tui::new();
+        t.input = "/".into();
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(t.slash_sel, 1);
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        // Wrapped backwards from 0 to last.
+        assert_eq!(t.slash_sel, SLASH_COMMANDS.len() - 1);
+        assert_eq!(t.scroll, 0, "transcript must not scroll while popup is open");
+    }
+
+    #[test]
+    fn selection_resets_when_input_changes() {
+        let mut t = Tui::new();
+        t.input = "/c".into();
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // sel=1
+        t.on_key(key(KeyCode::Char('l'), KeyModifiers::NONE)); // "/cl"
+        assert_eq!(t.slash_sel, 0);
+        // Matches for "/cl": /clear only.
+        assert_eq!(t.slash_matches(), vec![5]);
+    }
+
+    #[test]
+    fn at_mention_popup_completes_files() {
+        let mut t = Tui::new();
+        t.set_files(vec![
+            "src/main.rs".into(),
+            "src/tools.rs".into(),
+            "README.md".into(),
+        ]);
+        assert!(!t.at_popup_active());
+        t.input = "@".into();
+        assert!(t.at_popup_active(), "bare @ opens the list");
+        t.input = "@too".into();
+        assert!(t.at_popup_active());
+        assert_eq!(t.at_matches_list().len(), 1, "only tools.rs matches");
+        match t.on_key(key(KeyCode::Tab, KeyModifiers::NONE)) {
+            Action::None => {}
+            other => panic!("tab should complete @token, got {other:?}"),
+        }
+        assert_eq!(t.input, "@src/tools.rs ");
+        // Space ends the token — popup closes.
+        assert!(!t.at_popup_active());
+        // '@' mid-word does not open the popup.
+        t.input = "email user@host.com".into();
+        assert!(!t.at_popup_active() && t.at_matches_list().is_empty());
+    }
+
+    #[test]
+    fn ctrl_o_opens_output_overlay() {
+        let mut t = Tui::new();
+        t.push(Entry::ToolResult {
+            name: "run_command".into(),
+            ok: true,
+            preview: "[exit: 0]\nall good".into(),
+        });
+        match t.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL)) {
+            Action::None => {}
+            other => panic!("ctrl+o should toggle silently, got {other:?}"),
+        }
+        assert!(t.overlay);
+        match t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)) {
+            Action::None => {}
+            other => panic!("esc closes overlay, got {other:?}"),
+        }
+        assert!(!t.overlay);
+    }
+
+    #[test]
+    fn approval_modal_supports_always() {
+        let mut t = Tui::new();
+        t.open_approval("write /etc/hosts [DANGEROUS]".into());
+        match t.on_key(key(KeyCode::Char('a'), KeyModifiers::NONE)) {
+            Action::ApproveAlways => {}
+            other => panic!("'a' should approve always, got {other:?}"),
+        }
+        assert!(t.pending_approval.is_none());
+        t.open_approval("x".into());
+        assert!(matches!(t.on_key(key(KeyCode::Char('y'), KeyModifiers::NONE)), Action::Approve(true)));
+    }
+
+    #[test]
+    fn context_meter_tracks_usage() {
+        let mut t = Tui::new();
+        t.set_usage(32_000, 128_000);
+        assert_eq!(t.ctx_used, 32_000);
+        assert_eq!(t.ctx_total, 128_000);
+        // Zero total is ignored (keeps default).
+        t.set_usage(1_000, 0);
+        assert_eq!(t.ctx_total, 128_000);
+    }
+
+    #[test]
+    fn plain_typing_still_works_with_popup_logic() {
+        let mut t = Tui::new();
+        t.input = "fix the bug".into();
+        assert!(matches!(t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
+    }
+    fn line_texts(t: &Tui, width: u16) -> Vec<String> {
+        let mut probe = clone_shallow(t);
+        probe.ensure_render_cache(width);
+        probe
+            .cached_lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect()
+    }
+
+    fn clone_shallow(t: &Tui) -> Tui {
+        Tui {
+            input: t.input.clone(),
+            entries: t.entries.clone(),
+            ..Tui::new()
+        }
+    }
+
+    #[test]
+    fn incremental_cache_matches_full_rebuild() {
+        let width = 40;
+        let mut t = Tui::new();
+        t.push(Entry::User("hello world".into()));
+        // Simulate streaming growth of the assistant entry.
+        for tail in ["The ", "quick brown fox ", "jumps over the lazy dog."] {
+            if t.entries.len() < 2 {
+                t.push(Entry::Assistant(tail.to_string()));
+            } else if let Some(Entry::Assistant(a)) = t.entries.last_mut() {
+                a.push_str(tail);
+            }
+            let _ = line_texts(&t, width);
+        }
+        let incremental = line_texts(&t, width);
+        let mut fresh = clone_shallow(&t);
+        fresh.ensure_render_cache(width);
+        let expected: Vec<String> = fresh
+            .cached_lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        assert_eq!(incremental, expected);
+    }
+
+    #[test]
+    fn clear_resets_render_cache() {
+        let mut t = Tui::new();
+        t.push(Entry::Info("one".into()));
+        t.ensure_render_cache(40);
+        assert!(!t.cached_lines.is_empty());
+        t.entries.clear();
+        t.ensure_render_cache(40);
+        assert!(t.cached_lines.is_empty());
+    }
+
+    #[test]
+    fn banner_spells_laudacode_shape() {
+        let lines: Vec<&str> = BANNER.lines().collect();
+        assert_eq!(lines.len(), 6);
+        let widths: std::collections::HashSet<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        assert_eq!(widths.len(), 1, "all rows must align");
+        let w = *widths.iter().next().unwrap();
+        assert!(w <= 50, "must fit phone screens: {w}");
+        for line in &lines {
+            assert!(
+                line.chars().all(|c| c == '█' || c == ' '),
+                "banner may only contain block glyphs and spaces"
+            );
+        }
+    }
+
+    #[test]
+    fn banner_toggle_roundtrip() {
+        let mut t = Tui::new();
+        assert!(t.banner_visible());
+        t.toggle_banner();
+        assert!(!t.banner_visible());
+        t.toggle_banner();
+        assert!(t.banner_visible());
+    }
+
+    #[test]
+    fn tab_cycles_mode_when_popup_closed() {
+        let mut t = Tui::new();
+        assert_eq!(t.mode, Mode::Build);
+        match t.on_key(key(KeyCode::Tab, KeyModifiers::NONE)) {
+            Action::CycleMode => {}
+            other => panic!("tab should cycle mode, got {other:?}"),
+        }
+        // The repl closure performs `tui.mode = tui.mode.next()` on this
+        // action; on_key only reports the intent.
+        // But with the slash popup open, Tab completes instead.
+        t.input = "/mod".into();
+        match t.on_key(key(KeyCode::Tab, KeyModifiers::NONE)) {
+            Action::None => {}
+            other => panic!("popup tab should complete silently, got {other:?}"),
+        }
+        assert_eq!(t.input, "/model ");
+    }
+
+    #[test]
+    fn banner_colors_match_rows_and_are_bright() {
+        assert_eq!(BANNER_COLORS.len(), BANNER.lines().count());
+        for c in BANNER_COLORS {
+            assert!(!matches!(c, Color::Magenta | Color::LightMagenta | Color::DarkGray), "no pinks/dulls allowed");
+        }
+    }
+
+    #[test]
+    fn busy_indicator_is_footer_only() {
+        let mut t = Tui::new();
+        t.set_busy(true, "working");
+        assert!(t.is_busy());
+        assert!(t.entries.is_empty(), "activity must not create transcript entries");
+        t.set_busy(false, "working");
+        assert!(!t.is_busy());
+    }
+}

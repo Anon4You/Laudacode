@@ -4,15 +4,19 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
-use crate::agent::{Agent, ApprovalMode, UiSink};
+use crate::agent::{Agent, AgentEvent, ApprovalMode, UiSink};
 use crate::api::{ChatClient, Message};
 use crate::config::{sanitize_name, ActiveProvider, Config, Provider};
 use crate::session::Session;
+use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
 use crate::tools::{self, Action};
 
 // ---------------------------------------------------------------------------
-// Terminal UI sink
+// Plain terminal UI sink (used by `exec` mode)
 // ---------------------------------------------------------------------------
 
 pub struct TermUi {
@@ -20,12 +24,19 @@ pub struct TermUi {
     approve_all: bool,
     in_reasoning: bool,
     reasoning_bytes: usize,
+    /// `--json`: emit machine-readable event lines instead of prose.
+    pub json_out: bool,
 }
 
 impl TermUi {
     pub fn new() -> Result<Self> {
         let rl = DefaultEditor::new()?;
-        Ok(Self { rl, approve_all: false, in_reasoning: false, reasoning_bytes: 0 })
+        Ok(Self { rl, approve_all: false, in_reasoning: false, reasoning_bytes: 0, json_out: false })
+    }
+
+    fn emit_json(kind: &str, data: &str) {
+        let obj = serde_json::json!({ "type": kind, "data": data });
+        println!("{obj}");
     }
 
     pub fn begin_turn(&mut self) {
@@ -39,34 +50,75 @@ impl TermUi {
 }
 
 impl UiSink for TermUi {
-    fn on_content(&mut self, delta: &str) {
-        let mut sep = String::new();
-        if self.in_reasoning {
-            sep.push_str("\n");
-            self.in_reasoning = false;
+    fn on_event(&mut self, ev: AgentEvent) {
+        if self.json_out {
+            match ev {
+                AgentEvent::Content(d) => Self::emit_json("content", &d),
+                AgentEvent::Reasoning(d) => Self::emit_json("reasoning", &d),
+                AgentEvent::ToolStart { name, summary } => {
+                    let obj = serde_json::json!({ "type": "tool_start", "tool": name, "detail": summary });
+                    println!("{obj}");
+                }
+                AgentEvent::ToolDone { name, ok, preview } => {
+                    let obj = serde_json::json!({ "type": "tool_done", "tool": name, "ok": ok, "preview": preview });
+                    println!("{obj}");
+                }
+                AgentEvent::Usage(u) => {
+                    let obj = serde_json::json!({
+                        "type": "usage",
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens,
+                    });
+                    println!("{obj}");
+                }
+                AgentEvent::Todo(todos) => {
+                    let obj = serde_json::json!({ "type": "plan", "steps": todos });
+                    println!("{obj}");
+                }
+            }
+            return;
         }
-        print!("{sep}{delta}");
-        let _ = std::io::stdout().flush();
+        match ev {
+            AgentEvent::Content(delta) => {
+                let mut sep = String::new();
+                if self.in_reasoning {
+                    sep.push('\n');
+                    self.in_reasoning = false;
+                }
+                print!("{sep}{delta}");
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::Reasoning(delta) => {
+                if !self.in_reasoning {
+                    print!("{}", "· thinking".dark_grey());
+                    self.in_reasoning = true;
+                    self.reasoning_bytes = 0;
+                }
+                self.reasoning_bytes += delta.len();
+                if self.reasoning_bytes / 600 > (self.reasoning_bytes - delta.len()) / 600 {
+                    print!("{}", ".".dark_grey());
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            AgentEvent::ToolStart { name, summary } => {
+                println!("{}", format!("· {name}: {summary}").dark_grey());
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::ToolDone { ok: false, .. } => {
+                println!("{}", "✗ failed".red().bold());
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::ToolDone { ok: true, .. } => {}
+            _ => {}
+        }
     }
 
-    fn on_reasoning(&mut self, delta: &str) {
-        if !self.in_reasoning {
-            print!("{}", "· thinking".dark_grey());
-            self.in_reasoning = true;
-            self.reasoning_bytes = 0;
-        }
-        self.reasoning_bytes += delta.len();
-        if self.reasoning_bytes / 600 > (self.reasoning_bytes - delta.len()) / 600 {
-            print!("{}", ".".dark_grey());
-            let _ = std::io::stdout().flush();
-        }
-    }
-
-    fn approve(&mut self, action: &Action) -> bool {
-        if self.approve_all {
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        if self.approve_all && danger != tools::Danger::High {
             return true;
         }
-        let desc = if action.danger() == tools::Danger::High {
+        let desc = if danger == tools::Danger::High {
             format!("{}{}", action.describe(), " [DANGEROUS]".red().bold())
         } else {
             action.describe()
@@ -97,12 +149,536 @@ impl UiSink for TermUi {
             }
         }
     }
+}
 
-    fn on_tool_done(&mut self, action: &Action, ok: bool) {
-        let mark = if ok { "✓".green().bold() } else { "✗".red().bold() };
-        let desc: String = action.describe().chars().take(80).collect();
-        println!("{mark} {desc}");
+// ---------------------------------------------------------------------------
+// Agent worker thread (codex-style: UI never blocks on the agent)
+// ---------------------------------------------------------------------------
+
+/// Events flowing from the worker thread to the TUI.
+pub enum WorkerEvent {
+    Ev(AgentEvent),
+    /// Modal approval request; worker blocks until an answer arrives.
+    NeedApproval(String),
+    /// Worker started/stopped processing a command.
+    Busy(bool),
+    Info(String),
+    Error(String),
+    /// Conversation was replaced (resume) — TUI must clear its transcript.
+    Reload(String),
+    /// Generic picker: model lists, resume lists, approval modes…
+    Pick { title: String, items: Vec<String> },
+}
+
+/// Commands flowing from the TUI to the worker thread.
+pub enum WorkerCmd {
+    Submit(String),
+    Retry,
+    Compact,
+    Clear,
+    ListModels,
+    SetModel(String),
+    UseProvider(String),
+    SetApprovalMode(ApprovalMode),
+    Export,
+    InitAgentsMd,
+    ListProviders,
+    ShowProvider,
+    Status,
+    Diff,
+    /// Open the /resume picker with recent sessions.
+    ListSessions,
+    /// Replace the live conversation with a stored session id.
+    ResumeSession(String),
+    /// Attach a local image to the next submitted prompt.
+    QueueImage(String),
+    Quit,
+}
+
+#[derive(Clone)]
+struct WorkerBridge {
+    tx: Sender<WorkerEvent>,
+    approve_rx: Arc<std::sync::Mutex<Receiver<bool>>>,
+    #[allow(dead_code)]
+    cancel: Arc<AtomicBool>,
+}
+
+impl UiSink for WorkerBridge {
+    fn on_event(&mut self, ev: AgentEvent) {
+        let _ = self.tx.send(WorkerEvent::Ev(ev));
     }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        let mut desc = action.describe();
+        if danger == tools::Danger::High {
+            desc.push_str("  [DANGEROUS]");
+        }
+        let _ = self.tx.send(WorkerEvent::NeedApproval(desc));
+        matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
+    }
+}
+
+pub struct WorkerHandle {
+    pub cmd: Sender<WorkerCmd>,
+    pub approve: Sender<bool>,
+    pub events: Receiver<WorkerEvent>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Move `App` onto a dedicated thread that owns the agent and answers
+/// commands from the TUI. Keeps the UI responsive during streaming and lets
+/// Esc interrupt a running turn.
+pub fn spawn_worker(app: App) -> WorkerHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+    let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
+    let (approve_tx, approve_rx) = mpsc::channel::<bool>();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    std::thread::Builder::new()
+        .name("laudacode-agent".into())
+        .spawn(move || worker_main(app, ev_tx, cmd_rx, approve_rx))
+        .expect("spawning agent worker thread");
+
+    WorkerHandle { cmd: cmd_tx, approve: approve_tx, events: ev_rx, cancel }
+}
+
+fn worker_main(
+    mut app: App,
+    ev_tx: Sender<WorkerEvent>,
+    cmd_rx: Receiver<WorkerCmd>,
+    approve_rx: Receiver<bool>,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ev_tx.send(WorkerEvent::Error(format!("building runtime: {e}")));
+            return;
+        }
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let approve_rx = Arc::new(std::sync::Mutex::new(approve_rx));
+    let mut last_task: Option<String> = None;
+    // Images queued via /image or the -i flag — consumed by the next Submit.
+    let mut pending_images: Vec<String> = std::mem::take(&mut app.pending_images);
+
+    for cmd in cmd_rx {
+        match cmd {
+            WorkerCmd::Quit => break,
+            WorkerCmd::Submit(text) => {
+                if let Some(memory) = text.strip_prefix('#') {
+                    match add_memory(&app.cwd, memory) {
+                        Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Info(msg)); }
+                        Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+                    }
+                    continue;
+                }
+                if let Some(shell_cmd) = text.strip_prefix('!') {
+                    run_passthrough_shell(&app, &rt, &ev_tx, shell_cmd);
+                    continue;
+                }
+                last_task = Some(text.clone());
+                let images = std::mem::take(&mut pending_images);
+                run_agent_turn(&mut app, &rt, &ev_tx, &approve_rx, &cancel, &text, &images);
+            }
+            WorkerCmd::Retry => match last_task.clone() {
+                Some(task) => {
+                    run_agent_turn(&mut app, &rt, &ev_tx, &approve_rx, &cancel, &task, &[]);
+                }
+                None => {
+                    let _ = ev_tx.send(WorkerEvent::Info("nothing to retry yet".into()));
+                }
+            },
+            WorkerCmd::Compact => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                match rt.block_on(app.agent.compact()) {
+                    Ok(s) => {
+                        app.persist();
+                        let preview: String = s.chars().take(400).collect();
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "context compacted:\n{preview}"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(e.to_string()));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::Clear => {
+                let system = app.agent.messages.first().and_then(|m| m.content.clone());
+                app.agent.messages.clear();
+                if let Some(sys) = system {
+                    app.agent.messages.push(Message::system(sys));
+                }
+                app.agent.todos.clear();
+                app.session.messages.clear();
+                let _ = ev_tx.send(WorkerEvent::Info("conversation cleared".into()));
+            }
+            WorkerCmd::ListModels => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                match rt.block_on(app.agent.client.list_models()) {
+                    Ok(models) => {
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "model".into(),
+                            items: models,
+                        });
+                    }
+                    Err(e) => {
+                        let _ =
+                            ev_tx.send(WorkerEvent::Error(format!("listing models: {e:#}")));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::SetModel(model) => {
+                app.agent.model = model.clone();
+                let _ = ev_tx.send(WorkerEvent::Info(format!("model set to {model}")));
+            }
+            WorkerCmd::SetApprovalMode(mode) => {
+                app.agent.mode = mode;
+            }
+            WorkerCmd::UseProvider(name) => match switch_to(
+                &mut app.config,
+                &mut app.agent,
+                &name,
+                &app.cwd,
+            ) {
+                Ok(()) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "switched to '{name}' — model {}",
+                        app.agent.model
+                    )));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+            WorkerCmd::ListProviders => {
+                let mut lines = String::new();
+                for (n, p) in &app.config.providers {
+                    let star = if Some(n.as_str()) == app.config.active_provider.as_deref() {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    lines.push_str(&format!("{star} {n} — {} ({})\n", p.base_url, p.model));
+                }
+                if lines.is_empty() {
+                    lines = "no providers configured yet".into();
+                }
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::ShowProvider => {
+                let a = &app.active;
+                let src = |f: &str| {
+                    a.sources.get(f).map(String::as_str).unwrap_or("none")
+                };
+                let mut lines = format!(
+                    "provider : {}\nbase_url : {} (from: {})\nmodel    : {} (from: {})\napi_key  : set (from: {})\nconfig   : {}\n",
+                    a.name,
+                    a.base_url,
+                    src("base_url"),
+                    a.model,
+                    src("model"),
+                    src("api_key"),
+                    Config::toml_path().display(),
+                );
+                if !a.api_key.is_empty() && placeholder_key(&a.api_key) {
+                    lines.push_str("warning  : key looks like a placeholder — fix the config file or unset OPENAI_API_KEY\n");
+                }
+                if !a.headers.is_empty() {
+                    let names: Vec<&str> = a.headers.keys().map(|k| k.as_str()).collect();
+                    lines.push_str(&format!("headers  : {}\n", names.join(", ")));
+                }
+                lines.push_str("precedence: command line > environment > config file");
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::Export => match export_transcript(&app) {
+                Ok(path) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!("transcript saved to {}", path.display())));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("export failed: {e:#}")));
+                }
+            },
+            WorkerCmd::InitAgentsMd => match init_agents_md(&app.cwd) {
+                Ok(msg) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(msg));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+            WorkerCmd::Status => {
+                let a = &app.agent;
+                let mode = match a.mode {
+                    ApprovalMode::Suggest => "PLAN (read-only)",
+                    ApprovalMode::AutoEdit => "BUILD (edits auto-approved)",
+                    ApprovalMode::FullAuto => "FULL AUTO",
+                };
+                let src = |f: &str| {
+                    app.active.sources.get(f).map(String::as_str).unwrap_or("none")
+                };
+                let usage = match a.last_usage {
+                    Some(u) => format!("ctx {} tok · out {} tok", u.prompt_tokens, u.completion_tokens),
+                    None => "no requests yet".to_string(),
+                };
+                let lines = format!(
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nsession  : {} · {} messages\nusage    : {}\ncwd      : {}\nconfig   : {}",
+                    app.active.name,
+                    app.active.base_url,
+                    a.model,
+                    src("api_key"),
+                    mode,
+                    app.session.id,
+                    a.messages.len(),
+                    usage,
+                    app.cwd.display(),
+                    Config::toml_path().display(),
+                );
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::Diff => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                let out = rt.block_on(tools::run_shell(
+                    "git --no-pager diff --stat HEAD 2>&1 | tail -15; \
+                     echo; git --no-pager diff -U1 HEAD 2>&1 | head -c 2500",
+                    &app.cwd,
+                ));
+                match out {
+                    Ok(o) if o.contains("[exit: 0]") && o.lines().count() > 1 => {
+                        let body = o.split_once('\n').map(|(_, r)| r).unwrap_or(&o);
+                        let _ = ev_tx.send(WorkerEvent::Info(format!("git diff:\n{}", body.trim_end())));
+                    }
+                    Ok(_) => {
+                        let _ = ev_tx.send(WorkerEvent::Info("no uncommitted changes".into()));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::ListSessions => {
+                let recent = Session::list_recent(12);
+                if recent.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info("no saved sessions yet".into()));
+                } else {
+                    let items = recent
+                        .into_iter()
+                        .map(|(id, created, preview)| {
+                            format!("{id} · {} · {preview}", fmt_unix_date(created))
+                        })
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "resume".into(),
+                        items,
+                    });
+                }
+            }
+            WorkerCmd::ResumeSession(id) => {
+                // The picker sends "id · date · preview" — take the id part.
+                let real_id = id.split(" · ").next().unwrap_or(&id).to_string();
+                match resume_session(&mut app, &real_id) {
+                    Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Reload(msg)); }
+                    Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+                }
+            }
+            WorkerCmd::QueueImage(path) => match load_image_data_uri(&app.cwd, &path) {
+                Ok(uri) => {
+                    pending_images.push(uri);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "image attached ({} queued) — it will ride along with your next message",
+                        pending_images.len()
+                    )));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+        }
+    }
+    app.persist();
+}
+
+fn run_agent_turn(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    ev_tx: &Sender<WorkerEvent>,
+    approve_rx: &Arc<std::sync::Mutex<Receiver<bool>>>,
+    cancel: &Arc<AtomicBool>,
+    text: &str,
+    images: &[String],
+) {
+    cancel.store(false, Ordering::Relaxed);
+    let _ = ev_tx.send(WorkerEvent::Busy(true));
+    let mut bridge = WorkerBridge {
+        tx: ev_tx.clone(),
+        approve_rx: approve_rx.clone(),
+        cancel: cancel.clone(),
+    };
+    let res = rt.block_on(app.agent.run_turn(text, images, &mut bridge, Some(cancel)));
+    if let Err(e) = res {
+        let msg = format!("{e:#}");
+        let _ = ev_tx.send(if msg.contains("interrupted") {
+            WorkerEvent::Info("interrupted".into())
+        } else {
+            WorkerEvent::Error(msg)
+        });
+    }
+    app.persist();
+    let _ = ev_tx.send(WorkerEvent::Busy(false));
+}
+
+/// Append a `# memory` bullet to AGENTS.md in the project root.
+fn add_memory(cwd: &std::path::Path, note: &str) -> Result<String> {
+    let note = note.trim();
+    if note.is_empty() {
+        bail!("empty memory — usage: #<fact to remember about this project>");
+    }
+    let path = cwd.join("AGENTS.md");
+    let mut body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => "# AGENTS.md — instructions for AI coding agents\n".to_string(),
+    };
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("- {note}\n"));
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(format!("remembered: {note}"))
+}
+
+/// Load + base64-encode an image file into a data URI (vision input).
+pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
+    const ALLOWED: &[(&str, &str)] = &[
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("webp", "image/webp"),
+        ("gif", "image/gif"),
+    ];
+    let p = PathBuf::from(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let mime = ALLOWED
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, m)| *m)
+        .with_context(|| format!(
+            "unsupported image type '.{ext}' — use png/jpg/jpeg/webp/gif"
+        ))?;
+    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        bail!("image too large ({} bytes, limit 8 MiB)", bytes.len());
+    }
+    Ok(format!("data:{mime};base64,{}", crate::api::base64_encode(&bytes)))
+}
+
+/// Replace the live conversation with a stored session.
+fn resume_session(app: &mut App, id: &str) -> Result<String> {
+    let sess = Session::load(id)?;
+    let kept: Vec<Message> = sess
+        .restore()
+        .into_iter()
+        .filter(|m| m.role != "system")
+        .collect();
+    anyhow::ensure!(
+        !kept.is_empty(),
+        "session '{id}' has no messages to restore"
+    );
+    app.agent.messages.truncate(1); // keep the fresh system prompt
+    app.agent.messages.extend(kept);
+    app.agent.messages.push(Message::user(
+        "[Resuming previous session above. Continue where it left off.]".to_string(),
+    ));
+    app.agent.todos.clear();
+    app.session = sess;
+    app.persist();
+    Ok(format!("resumed session {id}"))
+}
+
+/// `1760000000` → `2025-10-09` without pulling chrono.
+fn fmt_unix_date(secs: u64) -> String {
+    let days = secs / 86_400;
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}-{m:02}-{d:02}")
+}
+
+fn run_passthrough_shell(
+    app: &App,
+    rt: &tokio::runtime::Runtime,
+    ev_tx: &Sender<WorkerEvent>,
+    shell_cmd: &str,
+) {
+    let trimmed = shell_cmd.trim();
+    if trimmed.is_empty() {
+        let _ = ev_tx.send(WorkerEvent::Error("usage: !<command>".into()));
+        return;
+    }
+    let _ = ev_tx.send(WorkerEvent::Busy(true));
+    match rt.block_on(tools::run_shell(trimmed, &app.cwd)) {
+        Ok(out) => {
+            let _ = ev_tx.send(WorkerEvent::Info(out.trim_end().to_string()));
+        }
+        Err(e) => {
+            let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+        }
+    }
+    let _ = ev_tx.send(WorkerEvent::Busy(false));
+}
+
+fn export_transcript(app: &App) -> Result<PathBuf> {
+    let mut out = String::from("# Laudacode session\n\n");
+    for msg in &app.agent.messages {
+        let role = match msg.role.as_str() {
+            "system" => continue,
+            r => r,
+        };
+        let body = msg.content.clone().unwrap_or_default();
+        if body.is_empty() && !msg.tool_calls.is_empty() {
+            out.push_str("## assistant (tool calls)\n");
+            for tc in &msg.tool_calls {
+                out.push_str(&format!("- `{}` {}\n", tc.function.name, tc.function.arguments));
+            }
+            out.push('\n');
+        } else {
+            out.push_str(&format!("## {role}\n\n{body}\n\n"));
+        }
+    }
+    let dir = app.cwd.join(".laudacode");
+    std::fs::create_dir_all(&dir).context("creating .laudacode export dir")?;
+    let path = dir.join(format!("session-{}.md", app.session.id));
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn init_agents_md(cwd: &std::path::Path) -> Result<String> {
+    let path = cwd.join("AGENTS.md");
+    if path.exists() {
+        return Ok("AGENTS.md already exists here".into());
+    }
+    let stub = "# AGENTS.md — instructions for AI coding agents\n\n\
+        - Describe build/test commands here.\n\
+        - Describe code conventions the agent must follow.\n\
+        - Keep it short; it is loaded into the system prompt.\n";
+    std::fs::write(&path, stub).with_context(|| format!("writing {}", path.display()))?;
+    Ok("created AGENTS.md — edit it to give the agent project instructions".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -116,19 +692,166 @@ pub struct App {
     pub session: Session,
     pub ui: TermUi,
     pub cwd: PathBuf,
+    /// Assumed context-window size (tokens) for the TUI meter.
+    pub ctx_window: u64,
+    /// Data-URI images queued for the first prompt (`-i` flag).
+    pub pending_images: Vec<String>,
 }
 
 impl App {
+    /// True when no provider is usable yet (fresh install, no config).
+    pub fn needs_onboarding(&self) -> bool {
+        self.active.api_key.is_empty()
+            || self.active.base_url.is_empty()
+            || self.config.providers.is_empty() && self.active.name == "default"
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-screen TUI mode
+    // -----------------------------------------------------------------------
+
+    /// Run the interactive full-screen TUI until the user quits.
+    ///
+    /// Sync on purpose: the TUI event loop owns the terminal, and all agent
+    /// work happens on the worker thread (`spawn_worker`).
+    pub fn run_tui(self) -> Result<()> {
+        tuiapp::enter_tui()?;
+        let res = self.tui_main();
+        tuiapp::leave_tui();
+        res
+    }
+
+    fn tui_main(self) -> Result<()> {
+        let mut tui = Tui::new();
+        tui.set_usage(0, self.ctx_window);
+        // Seed the @-mention list from the project tree.
+        {
+            let mut files = Vec::new();
+            tools::walk_files(&self.cwd, &mut |p| {
+                if files.len() < 2000 {
+                    if let Ok(rel) = p.strip_prefix(&self.cwd) {
+                        files.push(rel.display().to_string());
+                    }
+                    return true;
+                }
+                false
+            });
+            tui.set_files(files);
+        }
+        let config_note = if placeholder_key(&self.active.api_key) {
+            format!(
+                "\n⚠ API key looks like a placeholder — fix {} or unset OPENAI_API_KEY",
+                Config::toml_path().display()
+            )
+        } else if self.active.sources.get("api_key").map(String::as_str) == Some("environment") {
+            format!(
+                "\n· API key is coming from $OPENAI_API_KEY (overrides {})",
+                Config::toml_path().display()
+            )
+        } else {
+            String::new()
+        };
+        tui.push(Entry::Info(format!(
+            "LaudaCode ready — model {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
+            self.active.model, config_note
+        )));
+        let subtitle = format!("· {}", self.active.name);
+
+        let worker = spawn_worker(self);
+
+        let keep_going = tuiapp::run_tui(&mut tui, subtitle, move |tui, action| {
+            // Drain everything the worker produced since the last tick.
+            while let Ok(ev) = worker.events.try_recv() {
+                apply_worker_event(tui, ev);
+            }
+
+            match action {
+                KeyAction::Quit => {
+                    let _ = worker.approve.send(false); // unblock a pending approval
+                    let _ = worker.cmd.send(WorkerCmd::Quit);
+                    return false;
+                }
+                KeyAction::CycleMode => cycle_mode(tui, &worker),
+                KeyAction::ToggleBanner => {
+                    tui.toggle_banner();
+                    let state = if tui.banner_visible() { "shown" } else { "hidden" };
+                    tui.set_status(format!("banner {state} — Ctrl+B to toggle"));
+                }
+                KeyAction::Approve(answer) => {
+                    let _ = worker.approve.send(answer);
+                }
+                KeyAction::ApproveAlways => {
+                    // Codex "always allow": approve now + flip to FULL AUTO.
+                    tui.mode = tuiapp::Mode::FullAuto;
+                    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::FullAuto));
+                    tui.push(Entry::Info(
+                        "approved — approval mode set to FULL AUTO for this session".into(),
+                    ));
+                    let _ = worker.approve.send(true);
+                }
+                KeyAction::Interrupt => {
+                    if tui.is_busy() {
+                        worker.cancel.store(true, Ordering::Relaxed);
+                        tui.set_status("interrupting…");
+                    }
+                }
+                KeyAction::OpenSlash(sel) => {
+                    // Picker selections arrive as "title:value".
+                    if let Some(model) = sel.strip_prefix("model:") {
+                        tui.set_status("switching model");
+                        let _ = worker.cmd.send(WorkerCmd::SetModel(model.to_string()));
+                    } else if let Some(resume_id) = sel.strip_prefix("resume:") {
+                        let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
+                        tui.set_status("restoring session");
+                        let _ = worker.cmd.send(WorkerCmd::ResumeSession(real));
+                    } else if let Some(image) = sel.strip_prefix("image:") {
+                        let _ = worker.cmd.send(WorkerCmd::QueueImage(image.to_string()));
+                    } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
+                        apply_mode_by_label(tui, &worker, mode_label);
+                    }
+                }
+                KeyAction::Submit(text) => {
+                    if text.starts_with('/') {
+                        if !handle_slash(tui, &worker, &text) {
+                            let _ = worker.approve.send(false); // unblock pending approval
+                            let _ = worker.cmd.send(WorkerCmd::Quit);
+                            return false;
+                        }
+                    } else if tui.is_busy() && !text.starts_with('#') && !text.starts_with('!') {
+                        tui.push(Entry::Error(
+                            "agent is busy — press Esc to interrupt first".into(),
+                        ));
+                    } else {
+                        if text.starts_with('#') || text.starts_with('!') {
+                            // Memory notes / shell passthrough run even while busy.
+                        } else {
+                            tui.push(Entry::User(text.clone()));
+                        }
+                        tui.set_status("thinking");
+                        let _ = worker.cmd.send(WorkerCmd::Submit(text));
+                    }
+                }
+                KeyAction::None => {}
+            }
+            true
+        });
+
+        if keep_going.is_err() {
+            return Err(anyhow::anyhow!("tui loop failed"));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn build(
+    pub fn build_with_config(
         cwd: PathBuf,
+        config: Config,
         cli_provider: Option<&str>,
         cli_base_url: Option<&str>,
         cli_api_key: Option<&str>,
         cli_model: Option<&str>,
         mode_override: Option<ApprovalMode>,
     ) -> Result<Self> {
-        let config = Config::load()?;
         let active =
             config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
         let mode = mode_override
@@ -144,13 +867,35 @@ impl App {
             &active.api_key,
             &active.headers,
             active.name == "openrouter" || active.base_url.contains("openrouter"),
+            active.reasoning_effort.clone(),
         )?;
         let agent = Agent::new(client, active.model.clone(), cwd.clone(), mode);
 
-        // Resume latest session if requested by caller via Config trick — handled outside.
         let session = Session::new();
         let ui = TermUi::new()?;
-        Ok(Self { config, active, agent, session, ui, cwd })
+        let ctx_window = config.context_window.unwrap_or(128_000);
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![] })
+    }
+
+    /// Bare App with a placeholder provider — used when config resolution
+    /// fails on a fresh install so the interactive wizard can still run.
+    pub fn build_unconfigured(cwd: PathBuf) -> Result<Self> {
+        let config = Config::load().unwrap_or_default();
+        let active = ActiveProvider {
+            name: "unconfigured".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            headers: Default::default(),
+            sources: Default::default(),
+            reasoning_effort: None,
+        };
+        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, false, None)?;
+        let agent = Agent::new(client, String::new(), cwd.clone(), ApprovalMode::Suggest);
+        let session = Session::new();
+        let ui = TermUi::new()?;
+        let ctx_window = 128_000;
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![] })
     }
 
     pub fn restore_session(&mut self, sess: Session) {
@@ -160,23 +905,13 @@ impl App {
             .filter(|m| m.role != "system")
             .collect();
         if !kept.is_empty() {
-            self.agent.messages.push(Message::user(
-                "[Resuming previous session. Context below.]".to_string(),
-            ));
             self.agent.messages.extend(kept);
+            self.agent.messages.push(Message::user(
+                "[Resuming previous session above. Continue where it left off.]".to_string(),
+            ));
         }
         self.session = sess;
         println!("{}", "· resumed previous session".dark_grey());
-    }
-
-    /// Run one user line through the agent (streams to terminal).
-    pub async fn chat_turn(&mut self, input: &str) -> Result<()> {
-        self.ui.begin_turn();
-        let res = self.agent.run_turn(input, &mut self.ui).await;
-        self.ui.end_turn();
-        res?;
-        self.persist();
-        Ok(())
     }
 
     fn persist(&mut self) {
@@ -186,231 +921,300 @@ impl App {
         }
     }
 
-    pub fn save_history(&mut self) {
-        if let Some(dir) = dirs::data_dir() {
-            let p = dir.join("laudacode").join("history");
-            let _ = self.ui.rl.save_history(&p);
-        }
-    }
-
-    pub fn load_history(&mut self) {
-        if let Some(dir) = dirs::data_dir() {
-            let p = dir.join("laudacode").join("history");
-            let _ = self.ui.rl.load_history(&p);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // REPL
-    // -----------------------------------------------------------------------
-
-    pub async fn run_repl(mut self) -> Result<()> {
-        self.load_history();
-        banner(&self.active, self.agent.mode);
-
-        loop {
-            let short: String = self.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "~".into());
-            let prompt = format!("{short} » ");
-            match self.ui.rl.readline(&prompt) {
-                Ok(raw) => {
-                    let line = raw.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let _ = self.ui.rl.add_history_entry(line);
-                    if line.starts_with('/') {
-                        match self.slash(line).await {
-                            Ok(SlashResult::Continue) => {}
-                            Ok(SlashResult::Exit) => break,
-                            Err(e) => err_line(&e),
-                        }
-                    } else if let Err(e) = self.chat_turn(line).await {
-                        err_line(&e);
-                    }
-                }
-                Err(ReadlineError::Interrupted) => {
-                    println!("{}", "(^C again or /exit to quit)".dark_grey());
-                }
-                Err(ReadlineError::Eof) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        self.save_history();
-        println!("{}", "bye 👋".dark_grey());
-        Ok(())
-    }
-
-    /// One-shot non-interactive task (exec mode).
-    pub async fn run_once(mut self, task: &str) -> Result<()> {
-        self.chat_turn(task).await?;
-        self.save_history();
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Slash commands
-    // -----------------------------------------------------------------------
-
-    async fn slash(&mut self, line: &str) -> Result<SlashResult> {
-        let mut parts = line[1..].split_whitespace();
-        let cmd = parts.next().unwrap_or("");
-        let rest: Vec<&str> = parts.collect();
-
-        match cmd {
-            "help" => {
-                help();
-            }
-            "exit" | "quit" | "q" => return Ok(SlashResult::Exit),
-            "clear" => {
-                let agent = Agent::new(
-                    rebuild_client(&self.active)?,
-                    self.active.model.clone(),
-                    self.cwd.clone(),
-                    self.agent.mode,
-                );
-                self.agent = agent;
-                self.session = Session::new();
-                clear_screen();
-                println!("{}", "· conversation cleared".dark_grey());
-            }
-            "status" => status(self),
-            "model" => {
-                if rest.is_empty() {
-                    println!("current model: {}", self.agent.model.clone().cyan());
-                    println!("usage: /model <model-name>");
-                } else {
-                    let m = rest.join(" ");
-                    self.agent.model = m.clone();
-                    println!("· model set to {} (session only)", m.cyan());
-                }
-            }
-            "mode" => {
-                if rest.is_empty() {
-                    println!("approval mode: {}", self.agent.mode.as_str().cyan());
-                    println!("usage: /mode <suggest|auto-edit|full-auto>");
-                } else {
-                    match ApprovalMode::parse(rest[0]) {
-                        Some(m) => {
-                            self.agent.mode = m;
-                            self.config.approval_mode = Some(m.as_str().to_string());
-                            let _ = self.config.save();
-                            println!("· approval mode: {}", m.as_str().cyan());
-                        }
-                        None => bail!("unknown mode '{}'. Options: suggest, auto-edit, full-auto", rest[0]),
-                    }
-                }
-            }
-            "diff" => {
-                let out = tools::run_shell("git --no-pager diff --stat && git --no-pager diff", &self.cwd).await?;
-                println!("{}", out.trim_end());
-            }
-            "context" => {
-                if rest.is_empty() {
-                    println!("{}", tools::project_overview(&self.cwd));
-                } else {
-                    for p in rest {
-                        match std::fs::read_to_string(p) {
-                            Ok(content) => {
-                                self.agent.messages.push(Message::user(format!(
-                                    "[User attached file: {p}]\n```\n{content}\n```"
-                                )));
-                                println!("· attached {p}");
-                            }
-                            Err(e) => bail!("{p}: {e}"),
-                        }
-                    }
-                }
-            }
-            "compact" => {
-                print!("{}", "compacting… ".dark_grey());
-                let _ = std::io::stdout().flush();
-                match self.agent.compact().await {
-                    Ok(summary) => {
-                        println!("{}", "done".dark_grey());
-                        println!("{}", summary.dark_grey());
-                        self.persist();
-                    }
-                    Err(e) => println!("\n{}", format!("✗ {e}").red()),
-                }
-            }
-            "save" => {
-                self.persist();
-                println!("· saved session {}", self.session.id.clone().cyan());
-            }
-            "init" => {
-                self.chat_turn(
-                    "Create an AGENTS.md file for this project. Inspect the repo first \
-                     (list_dir/read_file), then write a concise AGENTS.md covering: project \
-                     overview, build/test commands, code style conventions, and any gotchas. \
-                     If AGENTS.md already exists, improve it.",
-                )
-                .await?;
-            }
-            "provider" => {
-                self.provider_cmd(&rest)?;
-            }
-            other => bail!(
-                "unknown command '/{other}' — try /help"
-            ),
-        }
-        Ok(SlashResult::Continue)
-    }
-
-    fn provider_cmd(&mut self, rest: &[&str]) -> Result<()> {
-        match rest.first().copied().unwrap_or("list") {
-            "add" => {
-                let name = add_provider_flow(&mut self.config, rest.get(1).copied())?;
-                switch_to(&mut self.config, &mut self.agent, &name, &self.cwd)?;
-                println!("· switched to '{name}'");
-            }
-            "list" => list_providers(&self.config),
-            "ls" => list_providers(&self.config),
-            "use" => {
-                let name = rest.get(1).copied().context("usage: /provider use <name>")?;
-                switch_to(&mut self.config, &mut self.agent, name, &self.cwd)?;
-                println!("· switched to '{name}'");
-            }
-            "edit" => {
-                let name = rest.get(1).copied().context("usage: /provider edit <name>")?;
-                edit_provider_flow(&mut self.config, name)?;
-                if self.active.name == name {
-                    switch_to(&mut self.config, &mut self.agent, name, &self.cwd)?;
-                    println!("· reloaded active provider '{name}'");
-                }
-            }
-            "rm" | "remove" | "delete" => {
-                let name = rest.get(1).copied().context("usage: /provider rm <name>")?;
-                if self.config.providers.remove(name).is_none() {
-                    bail!("provider '{name}' not found");
-                }
-                self.config.save()?;
-                println!("· removed '{name}'");
-            }
-            "show" => {
-                let fallback = self.active.name.clone();
-                let name = rest.get(1).copied().unwrap_or(fallback.as_str());
-                match self.config.providers.get(name) {
-                    Some(p) => {
-                        println!("name:     {}", name.cyan());
-                        println!("base_url: {}", p.base_url);
-                        println!("model:    {}", p.model);
-                        println!("api_key:  {}", mask_key(&p.api_key));
-                        if !p.headers.is_empty() {
-                            println!("headers:  {:?}", p.headers.keys());
-                        }
-                    }
-                    None => bail!("provider '{name}' not found"),
-                }
-            }
-            other => bail!("unknown provider command '{other}' — try add|list|use|edit|rm|show"),
-        }
+    /// One-shot non-interactive task (exec mode). `images` are data URIs.
+    pub async fn run_once(mut self, task: &str, images: &[String]) -> Result<()> {
+        print_banner();
+        self.ui.begin_turn();
+        let res = self.agent.run_turn(task, images, &mut self.ui, None).await;
+        self.ui.end_turn();
+        res?;
+        self.persist();
         Ok(())
     }
 }
 
-enum SlashResult {
-    Continue,
-    Exit,
+/// Apply one worker event to the transcript.
+fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
+    match ev {
+        WorkerEvent::Ev(AgentEvent::Content(d)) => tui.push_stream_text(&d),
+        WorkerEvent::Ev(AgentEvent::Reasoning(d)) => tui.push_reasoning_text(&d),
+        WorkerEvent::Ev(AgentEvent::ToolStart { name, summary }) => {
+            tui.clear_status();
+            tui.push(Entry::ToolCall { name, summary });
+        }
+        WorkerEvent::Ev(AgentEvent::ToolDone { name, ok, preview }) => {
+            tui.push(Entry::ToolResult { name, ok, preview });
+        }
+        WorkerEvent::Ev(AgentEvent::Usage(u)) => {
+            let total = tui.ctx_total;
+            tui.set_usage(u.prompt_tokens, total);
+            tui.set_status(format!("ctx {} tok", u.prompt_tokens));
+        }
+        WorkerEvent::Ev(AgentEvent::Todo(todos)) => {
+            let done = todos.iter().filter(|t| t.status == "completed").count();
+            tui.set_status(format!("plan {}/{}", done, todos.len()));
+        }
+        WorkerEvent::NeedApproval(desc) => {
+            tui.open_approval(desc);
+        }
+        WorkerEvent::Busy(b) => {
+            if b {
+                tui.set_busy(true, "working");
+            } else {
+                tui.set_busy(false, "working");
+                tui.clear_status();
+            }
+        }
+        WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
+        WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
+        WorkerEvent::Reload(s) => {
+            tui.entries.clear();
+            tui.push(Entry::Info(s));
+        }
+        WorkerEvent::Pick { title, items } => tui.open_picker(title, items),
+    }
+}
+
+/// Cycle PLAN → BUILD → FULL AUTO and inform the worker.
+fn cycle_mode(tui: &mut Tui, worker: &WorkerHandle) {
+    tui.mode = tui.mode.next();
+    let label = match tui.mode {
+        tuiapp::Mode::Plan => "PLAN — read-only exploration, no edits",
+        tuiapp::Mode::Build => "BUILD — edits auto-approved",
+        tuiapp::Mode::FullAuto => "FULL AUTO — everything approved",
+    };
+    tui.set_status(label);
+    tui.push(Entry::Info(format!("switched to {}", tui.mode.label())));
+    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(tui.mode)));
+}
+
+/// Apply a mode chosen from the /approvals picker.
+fn apply_mode_by_label(tui: &mut Tui, worker: &WorkerHandle, label: &str) {
+    let mode = match label.to_lowercase().as_str() {
+        "plan (read-only)" | "plan" => tuiapp::Mode::Plan,
+        "build (auto-edit)" | "build" => tuiapp::Mode::Build,
+        "full auto" | "full-auto" | "fullauto" => tuiapp::Mode::FullAuto,
+        _ => return,
+    };
+    tui.mode = mode;
+    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(mode)));
+    tui.push(Entry::Info(format!("approval mode set to {}", mode.label())));
+}
+
+/// Slash-command dispatch inside the TUI — forwards to the worker./// Returns false when the loop should quit.
+fn handle_slash(tui: &mut Tui, worker: &WorkerHandle, line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let cmd = parts.next().unwrap_or("").trim_start_matches('/').to_lowercase();
+    let arg: Vec<&str> = parts.collect();
+    match cmd.as_str() {
+        "help" => {
+            tui.push(Entry::Info(
+                "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
+                 /model        pick a model from the provider's live list\n\
+                 /approvals    switch approval mode via picker (or Tab)\n\
+                 /provider     manage providers (list|show|use <name>)\n\
+                 /compact      summarize history to free context\n\
+                 /clear        reset conversation\n\
+                 /retry        re-run the previous task\n\
+                 /resume       restore a previous session by id\n\
+                 /image <path> attach an image to your next message\n\
+                 /export       save the transcript as markdown\n\
+                 /status       provider · model · session info\n\
+                 /diff         show uncommitted git changes\n\
+                 /init         create an AGENTS.md project brief\n\
+                 @file         mention a file in your prompt\n\
+                 #note         save a memory into AGENTS.md\n\
+                 !<command>    run a shell command locally (no agent)\n\
+                 ctrl+o        expand recent tool output\n\
+                 /quit         exit Laudacode\n\
+                 Esc           interrupt the agent / release scroll"
+                    .into(),
+            ));
+        }
+        "approvals" | "mode" => {
+            // Static picker opened directly on the UI thread; selection
+            // arrives back as OpenSlash("approvals:<label>").
+            tui.open_picker(
+                "approvals",
+                vec![
+                    "plan (read-only)".into(),
+                    "build (auto-edit)".into(),
+                    "full auto".into(),
+                ],
+            );
+        }
+        "compact" => {
+            tui.set_status("compacting");
+            let _ = worker.cmd.send(WorkerCmd::Compact);
+        }
+        "clear" | "new" => {
+            let _ = worker.cmd.send(WorkerCmd::Clear);
+            tui.entries.clear();
+            tui.push(Entry::Info("conversation cleared".into()));
+        }
+        "quit" | "exit" => {
+            tui.push(Entry::Info("goodbye".into()));
+            return false;
+        }
+        "provider" => match arg.first().copied().unwrap_or("list") {
+            "list" | "ls" => {
+                let _ = worker.cmd.send(WorkerCmd::ListProviders);
+            }
+            "show" | "status" => {
+                let _ = worker.cmd.send(WorkerCmd::ShowProvider);
+            }
+            "use" => match arg.get(1) {
+                Some(name) => {
+                    let _ = worker.cmd.send(WorkerCmd::UseProvider((*name).to_string()));
+                }
+                None => tui.push(Entry::Error("usage: /provider use <name>".into())),
+            },
+            other => {
+                tui.push(Entry::Error(format!(
+                    "provider '{other}' not supported in the TUI — use list|use, \
+                     or run `laudacode provider add` outside the TUI"
+                )));
+            }
+        },
+        "model" => {
+            tui.set_status("fetching models");
+            let _ = worker.cmd.send(WorkerCmd::ListModels);
+        }
+        "retry" => {
+            tui.set_status("retrying");
+            let _ = worker.cmd.send(WorkerCmd::Retry);
+        }
+        "resume" | "continue" => {
+            tui.set_status("loading sessions");
+            let _ = worker.cmd.send(WorkerCmd::ListSessions);
+        }
+        "image" => match arg.first() {
+            Some(path) => {
+                let _ = worker.cmd.send(WorkerCmd::QueueImage((*path).to_string()));
+            }
+            None => tui.push(Entry::Error("usage: /image <path/to/file.png>".into())),
+        },
+        "export" => {
+            let _ = worker.cmd.send(WorkerCmd::Export);
+        }
+        "init" => {
+            let _ = worker.cmd.send(WorkerCmd::InitAgentsMd);
+        }
+        "status" => {
+            tui.set_status("gathering status");
+            let _ = worker.cmd.send(WorkerCmd::Status);
+        }
+        "diff" => {
+            tui.set_status("computing diff");
+            let _ = worker.cmd.send(WorkerCmd::Diff);
+        }
+        other => {
+            tui.push(Entry::Error(format!("unknown command '/{other}' — try /help")));
+        }
+    }
+    true
+}
+
+/// Keys that are obviously placeholders — warn instead of failing opaquely.
+fn placeholder_key(key: &str) -> bool {
+    let k = key.trim().to_lowercase();
+    if k.is_empty() {
+        return true;
+    }
+    const PLACEHOLDERS: &[&str] = &[
+        "<key>", "your-key", "your_key", "yourkey", "changeme", "change-me",
+        "xxx", "placeholder", "sk-test", "sk-xxx", "sk-...", "none", "null",
+    ];
+    PLACEHOLDERS.iter().any(|p| k == *p || (k.starts_with("sk-") && p.starts_with("sk-") && k.contains(&p[3..])))
+}
+
+/// Print the brand banner to a plain terminal (exec mode, wizard).
+pub fn print_banner() {
+    use crossterm::style::Color as CT;
+    // Same green→cyan→blue gradient as the TUI banner.
+    const GRADIENT: &[CT] = &[
+        CT::Green,
+        CT::DarkGreen,
+        CT::Cyan,
+        CT::DarkCyan,
+        CT::Blue,
+        CT::DarkBlue,
+    ];
+    for (i, line) in crate::tui::BANNER.lines().enumerate() {
+        let color = GRADIENT.get(i).copied().unwrap_or(CT::Green);
+        println!("{}", line.with(color).bold());
+    }
+    println!(
+        "{}",
+        format!(
+            " LaudaCode v{} — codex-class AI agent, pure Rust",
+            env!("CARGO_PKG_VERSION")
+        )
+        .dark_grey()
+    );
+    println!();
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding wizard (runs before the TUI when no provider is configured)
+// ---------------------------------------------------------------------------
+
+/// First-run wizard: never exits unconfigured. Builds a provider, verifies the
+/// key with a models fetch when possible, then returns the rebuilt App state
+/// via `switch_to`.
+pub fn onboarding_wizard(cfg: &mut Config) -> Result<String> {
+    print_banner();
+    println!("{}", "Welcome to Laudacode — let's connect you to a model provider.".bold());
+    println!("{}", "You can re-run this anytime with /provider add.".dark_grey());
+
+    loop {
+        let name = add_provider_flow(cfg, None)?;
+        let p = cfg.providers.get(&name).context("provider vanished")?;
+        // Verify connectivity unless it's a local server.
+        if !p.base_url.contains("localhost") && !p.base_url.contains("127.0.0.1") {
+            print!("· checking connection… ");
+            std::io::stdout().flush().ok();
+            match verify_provider(p) {
+                Ok(n) => println!("{}", format!("ok ({n} models)").green()),
+                Err(e) => {
+                    println!("{}", "failed".red().bold());
+                    println!("{}", format!("  {e:#}").dark_grey());
+                    println!("{}", "Check the key/URL, or press Enter to retry, 's' to save anyway:".dark_grey());
+                    let ans = prompt_line("", "")?;
+                    if !ans.trim().eq_ignore_ascii_case("s") {
+                        cfg.providers.remove(&name);
+                        continue;
+                    }
+                }
+            }
+        }
+        cfg.active_provider = Some(name.clone());
+        cfg.save()?;
+        return Ok(name);
+    }
+}
+
+/// Run a future on a throwaway current-thread runtime.
+pub fn block_current<F: std::future::Future>(fut: F) -> Result<F::Output> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(rt.block_on(fut))
+}
+
+/// Cheap liveness check: GET /models and count entries.
+fn verify_provider(p: &Provider) -> Result<usize> {
+    let client = rebuild_client(&ActiveProvider {
+        name: "verify".into(),
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        model: p.model.clone(),
+        headers: p.headers.clone(),
+        sources: Default::default(),
+        reasoning_effort: p.reasoning_effort.clone(),
+    })?;
+    let models = block_current(client.list_models())??;
+    Ok(models.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +1227,7 @@ pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
         &active.api_key,
         &active.headers,
         active.base_url.contains("openrouter"),
+        active.reasoning_effort.clone(),
     )
 }
 
@@ -453,14 +1258,6 @@ pub fn list_providers(cfg: &Config) {
             p.base_url.clone().dark_grey(),
             p.model.clone().green()
         );
-    }
-}
-
-pub fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        "****".into()
-    } else {
-        format!("{}…{}", &key[..4], &key[key.len() - 4..])
     }
 }
 
@@ -510,7 +1307,7 @@ pub fn add_provider_flow(
     let headers = prompt_line("extra headers (Key: Value, …)", "")?;
     let header_map = parse_headers(&headers);
 
-    let p = Provider { base_url, api_key, model, headers: header_map };
+    let p = Provider { base_url, api_key, model, headers: header_map, reasoning_effort: None };
     cfg.providers.insert(name.clone(), p);
     cfg.save()?;
     println!("· saved provider '{}'", name.clone().green());
@@ -526,8 +1323,7 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
     println!("{}", format!("── editing '{name}' (enter = keep current) ──").bold());
     let base_url = prompt_line("base_url", &p.base_url)?;
     let model = prompt_line("model", &p.model)?;
-    let key_shown = mask_key(&p.api_key);
-    let api_key_in = prompt_line(&format!("api_key [{key_shown}]"), &p.api_key)?;
+    let api_key_in = prompt_line("api_key (enter = keep stored key)", "")?;
     let headers = prompt_line(
         "extra headers",
         &p.headers
@@ -541,10 +1337,11 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
         model,
         api_key: if api_key_in.is_empty() { p.api_key.clone() } else { api_key_in },
         headers: parse_headers(&headers),
+        reasoning_effort: p.reasoning_effort.clone(),
     };
     cfg.providers.insert(name.to_string(), updated);
     cfg.save()?;
-    println!("· updated '{name}'");
+    println!("· updated '{name}' (key stays in {})", Config::toml_path().display());
     Ok(())
 }
 
@@ -568,17 +1365,15 @@ fn prompt_line(label: &str, default: &str) -> Result<String> {
     } else {
         format!("{label} [{}]: ", default)
     };
-    loop {
-        match DefaultEditor::new()?.readline(&shown) {
-            Ok(l) => {
-                let t = l.trim().to_string();
-                return Ok(if t.is_empty() { default.to_string() } else { t });
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                bail!("cancelled")
-            }
-            Err(e) => return Err(e.into()),
+    match DefaultEditor::new()?.readline(&shown) {
+        Ok(l) => {
+            let t = l.trim().to_string();
+            Ok(if t.is_empty() { default.to_string() } else { t })
         }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            bail!("cancelled")
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -622,74 +1417,26 @@ fn prompt_hidden(label: &str) -> Result<String> {
     res
 }
 
-// ---------------------------------------------------------------------------
-// Misc UI
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn status(app: &App) {
-    println!(
-        "provider: {}   model: {}   mode: {}",
-        app.active.name.clone().cyan(),
-        app.agent.model.clone().green(),
-        app.agent.mode.as_str().yellow()
-    );
-    println!("base_url: {}", app.active.base_url.clone().dark_grey());
-    println!(
-        "session:  {}   messages: {}   dir: {}",
-        app.session.id.clone().dark_grey(),
-        app.agent.messages.len(),
-        app.cwd.display()
-    );
-}
+    #[test]
+    fn header_parsing() {
+        let m = parse_headers("X-A: 1 , , X-B: two words ");
+        assert_eq!(m.get("X-A").map(String::as_str), Some("1"));
+        assert_eq!(m.get("X-B").map(String::as_str), Some("two words"));
+        assert_eq!(m.len(), 2);
+        assert!(parse_headers("").is_empty());
+        assert!(parse_headers("no-colon-here").is_empty());
+    }
 
-fn help() {
-    println!("{}", "commands".bold());
-    println!("  /help                 show this help");
-    println!("  /provider add|list|use|edit|rm|show [name]");
-    println!("                        manage API providers (multi-provider support)");
-    println!("  /model <name>         switch model (session)");
-    println!("  /mode <suggest|auto-edit|full-auto>");
-    println!("                        approval policy for edits & commands");
-    println!("  /status               current configuration overview");
-    println!("  /context [path…]      attach file(s) to the conversation");
-    println!("  /diff                 show git diff of the working tree");
-    println!("  /init                 generate AGENTS.md for this project");
-    println!("  /compact              summarize history to free context space");
-    println!("  /clear                start a fresh conversation");
-    println!("  /save                 persist session");
-    println!("  /exit                 quit");
-    println!();
-    println!("{}", "tools the agent can use".bold());
-    println!("  list_dir · read_file · write_file · edit_file · run_command · fetch_url");
-}
-
-pub fn banner(active: &ActiveProvider, mode: ApprovalMode) {
-    let logo = r#"
-    _             _            _
-   | |    __ _ __| | ____ _ __| | ___
-   | |   / _` / _| |/ / _` / _` |/ _ \
-   | |__| (_| \__ \   (_| (_| |  __/
-   |_____\__,_|___/_|\_\__,_|\__,_|\___|
-"#;
-    println!("{}", logo.cyan());
-    println!(
-        "  v{} · {} · {} · mode={}   (type /help)",
-        env!("CARGO_PKG_VERSION"),
-        active.name.clone().cyan(),
-        active.model.clone().green(),
-        mode.as_str().yellow()
-    );
-    println!();
-}
-
-pub fn clear_screen() {
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        crossterm::cursor::MoveTo(0, 0)
-    );
-}
-
-pub fn err_line(e: &anyhow::Error) {
-    println!("{} {e:#}", "✗".red().bold());
+    #[test]
+    fn placeholder_keys_are_flagged() {
+        for k in ["", "<key>", "sk-test-invalid", "changeme", "YOUR-KEY"] {
+            assert!(placeholder_key(k), "should flag: {k}");
+        }
+        // A real-looking OpenRouter key must not be flagged.
+        assert!(!placeholder_key("sk-or-v1-abc123def4567890"));
+    }
 }

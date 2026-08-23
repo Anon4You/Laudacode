@@ -36,9 +36,21 @@ pub struct Cli {
     #[arg(short = 'c', long, global = true)]
     pub continue_last: bool,
 
+    /// Activate a named profile from your config ([profiles.<name>])
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
+
+    /// Attach an image (png/jpg/jpeg/webp/gif) to the prompt — repeatable
+    #[arg(short = 'i', long, global = true)]
+    pub image: Vec<String>,
+
     /// One-shot prompt: run non-interactively and exit
     #[arg(trailing_var_arg = true)]
     pub prompt: Vec<String>,
+
+    /// Emit JSON event lines instead of prose (non-interactive runs)
+    #[arg(long, global = true)]
+    pub json: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,

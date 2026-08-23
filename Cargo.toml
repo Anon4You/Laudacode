@@ -27,6 +27,8 @@ toml = "0.8"
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 crossterm = "0.28"
 dirs = "5"
+ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+unicode-width = "0.1"
 
 [profile.release]
 opt-level = 3

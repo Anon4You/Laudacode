@@ -22,14 +22,17 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 
 - ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, perfect for Android/Termux
 - 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
-- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `run_command`, `fetch_url`
+- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `grep`, `glob`, `update_plan`
 - 🌐 **Web fetch built in** — the agent can pull documentation from the internet
 - 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
+- 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
 - 📡 **Streaming responses** with reasoning-model support (dimmed "thinking" indicator)
-- 💬 **Slash commands** — `/provider add|list|use|edit|rm|show`, `/model`, `/mode`, `/diff`, `/compact`, `/init`, `/context`, `/status`, `/clear`
+- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`… plus `@file` mentions, `#note` memories and `!<cmd>` shell passthrough
 - 📄 **AGENTS.md support** — project instructions auto-loaded into context (`/init` generates one)
-- 💾 **Session persistence** — autosaved; resume with `--continue`
+- 👤 **Profiles** — named presets in `[profiles.<name>]`, activated with `--profile`
+- 💾 **Session persistence** — autosaved; resume with `--continue` or `/resume`
 - 🖥️ **One-shot mode** — `laudacode exec "fix the failing test"`
+- 📦 **JSON output** — `--json` emits machine-readable event lines for scripting
 
 ## Install
 
@@ -82,7 +85,7 @@ laudacode exec "add input validation to src/main.rs" --mode full-auto
 
 ## Configuration
 
-Precedence: **CLI flags > environment variables > config file**.
+Precedence: **CLI flags > profile (`--profile`) > environment variables > config file**.
 
 Environment variables:
 
@@ -107,6 +110,10 @@ model    = "stealth/ox-alpha"
 [providers.openrouter.headers]        # optional custom headers
 "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"
 "X-Title"      = "Laudacode"
+
+[profiles.fast]                       # optional presets → laudacode --profile fast
+provider = "groq"
+model    = "llama-3.3-70b-versatile"
 ```
 
 See [`config.example.toml`](config.example.toml) for presets (OpenAI,
@@ -114,14 +121,14 @@ OpenRouter, Groq, DeepSeek, Ollama, LM Studio).
 
 ## Approval modes
 
-| Mode         | File edits    | Shell commands | Dangerous commands |
-|--------------|---------------|----------------|--------------------|
-| `suggest`    | ask           | ask            | ask                |
-| `auto-edit`  | ✅ auto       | ask            | ask                |
-| `full-auto`  | ✅ auto       | ✅ auto        | ask (always)       |
+| `--mode` value          | TUI label  | File edits | Shell commands | Dangerous commands |
+|--------------------------|------------|------------|----------------|--------------------|
+| `suggest` (alias `ask`)  | PLAN       | ask        | ask            | ask                |
+| `auto-edit`              | BUILD      | ✅ auto    | ask            | ask                |
+| `full-auto` (alias `yolo`)| FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
 
 You can also answer `[a]always` on any prompt to auto-approve the rest of the
-session.
+session. In the TUI, switch modes any time with the `/approvals` picker or **Tab**.
 
 ## CLI reference
 
@@ -129,9 +136,13 @@ session.
 laudacode                          # interactive session
 laudacode "quick question"         # one-shot prompt
 laudacode exec "<task>"            # same as above
+laudacode exec "<task>" --json     # emit JSON event lines instead of prose
 laudacode -P groq -m llama-3.3-70b-versatile
+laudacode --profile fast           # activate [profiles.fast] from your config
+laudacode -i screenshot.png "what's wrong with this UI?"
 laudacode --base-url http://localhost:11434/v1 --api-key ollama --model qwen2.5-coder:7b
 laudacode -c                       # continue last session
+laudacode -y                       # shorthand for --mode full-auto
 laudacode provider add|list|use|edit|remove <name>
 ```
 
@@ -140,17 +151,30 @@ laudacode provider add|list|use|edit|remove <name>
 | Command              | Description                                  |
 |----------------------|----------------------------------------------|
 | `/help`              | command overview                             |
-| `/provider …`        | manage providers (`add list use edit rm show`)|
-| `/model <name>`      | switch model                                 |
-| `/mode <m>`          | suggest / auto-edit / full-auto              |
+| `/model`             | pick a model from the provider's live list   |
+| `/approvals`         | switch approval mode (plan/build/full-auto)  |
+| `/provider …`        | manage providers (`list` `show` `use <name>`)|
 | `/status`            | current provider/model/session               |
-| `/context [file…]`   | attach file(s), or print project tree        |
 | `/diff`              | git diff of working tree                     |
 | `/init`              | generate AGENTS.md for this project          |
 | `/compact`           | summarize history to free context window     |
 | `/clear`             | fresh conversation                           |
-| `/save`              | persist session                              |
-| `/exit`              | quit                                         |
+| `/retry`             | re-run the previous task                     |
+| `/resume`            | restore a previous session by id             |
+| `/image <path>`      | attach an image to your next message         |
+| `/export`            | save transcript as markdown                  |
+| `/quit`              | exit                                         |
+
+Input prefixes:
+
+| Prefix      | Effect                                        |
+|-------------|-----------------------------------------------|
+| `@file`     | mention a file in your prompt                 |
+| `#note`     | save a memory into AGENTS.md                  |
+| `!<command>`| run a shell command locally (no agent)        |
+
+Keys: type `/` for autocomplete, `↑/↓` + `Tab`/`Enter` to complete,
+`Ctrl+O` expands recent tool output, `Esc` interrupts the agent.
 
 ## Why Rust?
 
