@@ -5,7 +5,7 @@
 #
 # Env overrides: REPO, LAUDACODE_VERSION (default: latest release), PREFIX, TMPDIR
 
-set -e
+set -eu
 
 if [ -n "${TERMUX_VERSION:-}" ]; then
     PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
@@ -52,14 +52,26 @@ fi
 # --- download --------------------------------------------------------------------
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
+trap 'rm -rf "$BUILD_DIR"' EXIT INT TERM
 
 echo "==> downloading ${REPO}@${VERSION}"
-curl -L -o "laudacode-${VERSION}.tar.gz" \
+# -f so HTTP errors (missing tag, rate limit) fail instead of saving an HTML page.
+curl -fL -o "$BUILD_DIR/laudacode.tar.gz" \
     "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"
 
-tar -xzf "laudacode-${VERSION}.tar.gz"
-cd "Laudacode-${VERSION}"
+# Sanity-check the archive before extracting for a clearer failure message.
+tar -tzf "$BUILD_DIR/laudacode.tar.gz" >/dev/null || {
+    echo "✗ downloaded file is not a valid tar.gz — check the tag name" >&2
+    exit 1
+}
+
+cd "$BUILD_DIR"
+tar -xzf laudacode.tar.gz
+
+# GitHub names the root dir "<Repo>-<tag-without-leading-v>", but don't trust it.
+SRC_DIR="$(find . -maxdepth 1 -type d -name 'Laudacode-*' | head -n 1)"
+[ -n "$SRC_DIR" ] || { echo "✗ unexpected archive layout — no Laudacode-* directory" >&2; exit 1; }
+cd "$SRC_DIR"
 
 # --- build -------------------------------------------------------------------------
 echo "==> building (this can take several minutes)"
@@ -69,11 +81,13 @@ CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-off}" \
 [ -f target/release/laudacode ] || { echo "✗ build finished but binary is missing" >&2; exit 1; }
 
 # --- install ------------------------------------------------------------------------
-mkdir -p "${PREFIX%/}/bin"
-$SUDO install -m 755 target/release/laudacode "${PREFIX%/}/bin/laudacode"
-
-cd /
-rm -rf "$BUILD_DIR"
+if [ -n "$SUDO" ]; then
+    $SUDO mkdir -p "${PREFIX%/}/bin"
+    $SUDO install -m 755 target/release/laudacode "${PREFIX%/}/bin/laudacode"
+else
+    mkdir -p "${PREFIX%/}/bin"
+    install -m 755 target/release/laudacode "${PREFIX%/}/bin/laudacode"
+fi
 
 echo "==> installed: ${PREFIX%/}/bin/laudacode"
-exit 0
+"${PREFIX%/}/bin/laudacode" --version 2>/dev/null || true
