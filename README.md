@@ -36,7 +36,25 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 
 ## Install
 
-### Termux / Android
+### One-liner (Termux / Linux / macOS)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
+```
+
+Always installs the **latest GitHub release** (auto-detected), builds it
+on-device and installs `laudacode` into `$PREFIX/bin` — no sudo inside Termux,
+works the same on Linux and macOS. Prerequisites: `curl`, `tar`, `rust`
+(Termux: `pkg install curl tar rust`).
+
+Environment overrides (e.g. pin an older release):
+
+```sh
+LAUDACODE_VERSION=v0.2.0 PREFIX=$PREFIX \
+    curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
+```
+
+### Termux / Android (manual)
 
 ```sh
 pkg update && pkg install rust git -y
