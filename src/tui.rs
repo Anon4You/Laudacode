@@ -1,7 +1,6 @@
 use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -339,6 +338,34 @@ impl Tui {
         let mut f = files;
         f.sort_by_key(|p| p.to_lowercase());
         self.files = f.into_iter().take(2000).collect();
+    }
+
+    /// Insert bracketed-paste content verbatim (newlines included).
+    /// Never triggers submission — the user sends with Enter afterwards.
+    pub fn insert_paste(&mut self, text: &str) {
+        if self.pending_approval.is_some() || self.picker.is_some() || self.overlay {
+            return; // modals take over all input
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.push_str(&normalized);
+        self.slash_sel = 0;
+        self.at_sel = 0;
+    }
+
+    /// Composer height for the current input: grows line-by-line as the
+    /// prompt gets longer, capped so the transcript never starves.
+    pub fn composer_height(&self, area_width: u16, area_height: u16) -> u16 {
+        const MIN_H: u16 = 3;
+        const MAX_H: u16 = 14;
+        let inner_w = area_width.saturating_sub(2).max(10);
+        let text_rows = if self.input.is_empty() {
+            1
+        } else {
+            wrap_composer(&self.input, inner_w as usize).len() as u16
+        };
+        let desired = text_rows + 2; // borders
+        let cap = area_height.saturating_sub(6).clamp(MIN_H, MAX_H).max(MIN_H);
+        desired.clamp(MIN_H, cap)
     }
 
     /// Toggle the pinned brand banner (Ctrl+B).
@@ -732,13 +759,16 @@ impl Tui {
             None => (area, None),
         };
 
+        // The composer grows with the draft instead of clipping long prompts.
+        let comp_h = self.composer_height(area.width, area.height);
+
         // Header (brand banner) is shown when there's room for it.
         let show_header = self.show_banner && area.height >= 23 && area.width >= 46;
         let chunks = if show_header {
             Layout::vertical([
                 Constraint::Length(HEADER_HEIGHT), // banner
                 Constraint::Min(1),                // transcript
-                Constraint::Length(3),             // composer
+                Constraint::Length(comp_h),        // composer (auto-expands)
                 Constraint::Length(1),             // hints
                 Constraint::Length(1),             // footer
             ])
@@ -746,7 +776,7 @@ impl Tui {
         } else {
             Layout::vertical([
                 Constraint::Min(1),      // transcript
-                Constraint::Length(3),   // composer
+                Constraint::Length(comp_h),
                 Constraint::Length(1),   // hints
                 Constraint::Length(1),   // footer
             ])
@@ -810,28 +840,43 @@ impl Tui {
         } else {
             Style::default().fg(Color::Rgb(110, 110, 135))
         };
-        let placeholder =
+        const PLACEHOLDER: &str =
             "ask laudacode anything — @ to mention files, # to remember, / for commands";
         let cursor_ok = self.pending_approval.is_none();
-        let text = if self.input.is_empty() && !cursor_ok {
-            Line::from(Span::styled("waiting for approval — y / a / n", Style::default().fg(Color::DarkGray)))
+        let comp_inner_w = composer_area.width.saturating_sub(2).max(10) as usize;
+        let text: Vec<Line> = if self.input.is_empty() && !cursor_ok {
+            vec![Line::from(Span::styled(
+                "waiting for approval — y / a / n",
+                Style::default().fg(Color::DarkGray),
+            ))]
         } else if self.input.is_empty() {
-            Line::from(Span::styled(placeholder, Style::default().fg(Color::DarkGray)))
+            vec![Line::from(Span::styled(
+                PLACEHOLDER,
+                Style::default().fg(Color::DarkGray),
+            ))]
         } else {
-            Line::from(Span::raw(self.input.clone()))
+            // Rendered from the exact same wrapped rows used for height and
+            // cursor math — spaces can never disappear again.
+            wrap_composer(&self.input, comp_inner_w)
+                .into_iter()
+                .map(Line::from)
+                .collect()
         };
         let composer = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).style(comp_style))
-            .wrap(Wrap { trim: false });
+            .block(Block::default().borders(Borders::ALL).style(comp_style));
         f.render_widget(composer, composer_area);
-        if cursor_ok {
-            let x = composer_area.x
+        if cursor_ok && !self.input.is_empty() {
+            // No cursor navigation exists — the caret is always at the end,
+            // i.e. after the last visual row of the wrapped draft.
+            let inner_w = composer_area.width.saturating_sub(2).max(10) as usize;
+            let segs = wrap_composer(&self.input, inner_w);
+            let last = segs.last().map(String::as_str).unwrap_or("");
+            let col = UnicodeWidthStr::width(last) as u16;
+            let row = composer_area.y
                 + 1
-                + UnicodeWidthStr::width(self.input.rsplit('\n').next().unwrap_or("")) as u16;
-            let row = composer_area.y + 1;
-            if x < composer_area.x + composer_area.width - 1 {
-                f.set_cursor_position((x.min(composer_area.x + composer_area.width - 2), row));
-            }
+                + ((segs.len().saturating_sub(1)) as u16).min(composer_area.height.saturating_sub(2));
+            let x = composer_area.x + 1 + col.min(composer_area.width.saturating_sub(2));
+            f.set_cursor_position((x, row));
         }
 
         // Slash-command + @-file suggestion popups, floating above the composer.
@@ -1563,14 +1608,25 @@ const DASH_WIDTH: u16 = 28;
 pub fn enter_tui() -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste makes terminals deliver multi-line clipboard content as
+    // ONE paste event instead of a stream of Enter presses — without it,
+    // pasting anything multi-line instantly submitted the composer.
+    crossterm::execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
     Ok(())
 }
 
 /// Restore terminal state on any exit path.
 pub fn leave_tui() {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
 }
 
 /// Run the TUI event loop until the user quits.
@@ -1620,12 +1676,85 @@ where
                     }
                 }
             }
+            crossterm::event::Event::Paste(text) => {
+                // Multi-line clipboard content arrives as one event thanks to
+                // bracketed paste — insert it verbatim, never auto-submit.
+                tui.insert_paste(&text);
+                let _ = on_action(tui, Action::None);
+            }
             crossterm::event::Event::Resize(_, _) => {}
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Greedy word-wrap for the composer that PRESERVES whitespace exactly
+/// (trailing spaces, double spaces, blank rows). The old collapsing wrapper
+/// desynced the caret from the rendered text — typing a space appeared to do
+/// nothing until the next character landed. Height, rendering and cursor
+/// placement all share this function so they can never disagree again.
+pub fn wrap_composer(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(4);
+    let mut out: Vec<String> = Vec::new();
+    for src in text.split('\n') {
+        let cs: Vec<char> = src.chars().collect();
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        let mut i = 0usize;
+        while i < cs.len() {
+            // Chunk = maximal run of spaces or maximal run of non-spaces.
+            let start = i;
+            let is_space = cs[i] == ' ';
+            while i < cs.len() && (cs[i] == ' ') == is_space {
+                i += 1;
+            }
+            let chunk: String = cs[start..i].iter().collect();
+            let chunk_w: usize = chunk
+                .chars()
+                .map(|c| UnicodeWidthStr::width(c.to_string().as_str()))
+                .sum();
+
+            let last_chunk_of_line = i >= cs.len();
+            let break_here = cur_w + chunk_w > w && !cur.is_empty()
+                // Never push the freshly-typed trailing space to a hidden row.
+                && !(is_space && last_chunk_of_line);
+            if break_here {
+                out.push(cur.trim_end().to_string());
+                cur = String::new();
+                cur_w = 0;
+                // Standard wrap: the spaces that caused the break vanish;
+                // only END-OF-LINE trailing spaces are ever kept.
+                if is_space {
+                    continue;
+                }
+            }
+            cur.push_str(&chunk);
+            cur_w += chunk_w;
+            // Hard-split chunks wider than the box.
+            while UnicodeWidthStr::width(cur.as_str()) > w {
+                let mut split_at = 0usize;
+                let mut acc = 0usize;
+                for (idx, c) in cur.char_indices() {
+                    let cwid = UnicodeWidthStr::width(c.to_string().as_str());
+                    if acc + cwid > w {
+                        break;
+                    }
+                    acc += cwid;
+                    split_at = idx + c.len_utf8();
+                }
+                let tail = cur.split_off(split_at);
+                out.push(std::mem::take(&mut cur));
+                cur = tail;
+                cur_w = UnicodeWidthStr::width(cur.as_str());
+            }
+        }
+        // Every source line yields at least one row (blank rows included),
+        // and trailing spaces stay visible in the row where they were typed.
+        out.push(cur);
+    }
+    out
 }
 
 /// Naive greedy word-wrap that respects existing newlines.
@@ -1689,6 +1818,71 @@ mod tests {
             "completion works: {}",
             tui.input
         );
+    }
+
+    #[test]
+    fn wrap_composer_preserves_spaces_exactly() {
+        // Trailing space stays in its row (the reported bug).
+        assert_eq!(wrap_composer("word ", 40), vec!["word "]);
+        // Double spaces are not collapsed.
+        assert_eq!(wrap_composer("a  b", 40), vec!["a  b"]);
+        // Word wrap on overflow, no space loss; greedy fill packs the row.
+        assert_eq!(wrap_composer("aaa bbb ccc", 7), vec!["aaa bbb", "ccc"]);
+        // Blank rows survive.
+        assert_eq!(wrap_composer("l1\n\nl2", 10), vec!["l1", "", "l2"]);
+        // Oversized single token hard-splits without dropping chars.
+        let rows = wrap_composer(&"x".repeat(25), 10);
+        let joined: String = rows.concat();
+        assert_eq!(joined, "x".repeat(25));
+        assert!(rows.iter().all(|r| UnicodeWidthStr::width(r.as_str()) <= 10));
+    }
+
+    #[test]
+    fn composer_height_counts_preserved_spaces() {
+        let mut t = Tui::new();
+        // 11-char word hits the 10-cell inner-width clamp → wraps onto a
+        // second row; the collapsing wrapper undercounted rows like this.
+        t.input = format!("{} b", "a".repeat(10));
+        assert_eq!(t.composer_height(12, 30), 4, "2 wrapped rows + borders");
+        // And the rendered rows match the height math exactly.
+        assert_eq!(wrap_composer(&t.input, 10), vec!["aaaaaaaaaa", "b"]);
+    }
+
+    #[test]
+    fn composer_grows_with_long_prompts_and_caps() {
+        let mut t = Tui::new();
+        // Empty → minimum 3 rows (border + 1 line + border).
+        assert_eq!(t.composer_height(80, 30), 3);
+        // One wrapped line of text still fits in the base box.
+        t.input = "hello world".into();
+        assert_eq!(t.composer_height(80, 30), 3);
+        // Explicit lines expand the box line-by-line; the trailing newline
+        // adds a final empty row for the cursor.
+        t.input = "l1\nl2\nl3\nl4\n".into();
+        assert_eq!(t.composer_height(80, 30), 7, "4 lines + trailing blank + borders");
+        // Long single token wraps and counts as multiple rows.
+        t.input = "x".repeat(200);
+        let h = t.composer_height(40, 30);
+        assert!(h > 3, "wrapped long line must grow the box: {h}");
+        // Cap: never eats the whole screen.
+        t.input = "y\n".repeat(100);
+        assert_eq!(t.composer_height(80, 30), 14, "hard cap");
+        // Tiny terminal keeps at least the minimum.
+        assert_eq!(t.composer_height(80, 8), 3);
+    }
+
+    #[test]
+    fn paste_inserts_verbatim_without_submitting() {
+        let mut t = Tui::new();
+        t.insert_paste("line one\r\nline two\nline three\r");
+        assert_eq!(t.input, "line one\nline two\nline three\n");
+        // No submission side effects: busy untouched, entries untouched.
+        assert!(!t.is_busy());
+        assert!(t.entries.is_empty());
+        // Paste while a modal is open is ignored entirely.
+        t.open_approval("allow?".into());
+        t.insert_paste("should not land");
+        assert!(!t.input.contains("should not land"));
     }
 
     #[test]
