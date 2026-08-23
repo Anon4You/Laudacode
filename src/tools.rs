@@ -19,7 +19,7 @@ pub enum Action {
     ApplyPatch { patch: String },
     RunCommand { command: String },
     FetchUrl { url: String },
-    Grep { pattern: String, path: Option<String>, ignore_case: bool },
+    Grep { pattern: String, path: Option<String>, ignore_case: bool, context: Option<u32> },
     Glob { pattern: String, path: Option<String> },
     UpdatePlan { todos: Vec<TodoItem> },
 }
@@ -89,6 +89,8 @@ struct GrepArgs {
     path: Option<String>,
     #[serde(default)]
     ignore_case: bool,
+    #[serde(default)]
+    context: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -154,7 +156,7 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
             }
             "grep" => {
                 let a: GrepArgs = serde_json::from_value(v)?;
-                Ok(Action::Grep { pattern: a.pattern, path: a.path, ignore_case: a.ignore_case })
+                Ok(Action::Grep { pattern: a.pattern, path: a.path, ignore_case: a.ignore_case, context: a.context })
             }
             "glob" => {
                 let a: GlobArgs = serde_json::from_value(v)?;
@@ -216,9 +218,15 @@ impl Action {
             },
             Action::RunCommand { command } => format!("$ {command}"),
             Action::FetchUrl { url } => format!("fetch {url}"),
-            Action::Grep { pattern, path, ignore_case } => {
+            Action::Grep { pattern, path, ignore_case, context } => {
                 let where_ = path.as_deref().unwrap_or(".");
-                let flags = if *ignore_case { " (i)" } else { "" };
+                let mut flags = String::new();
+                if *ignore_case {
+                    flags.push_str(" (i)");
+                }
+                if let Some(c) = context {
+                    flags.push_str(&format!(" ±{c}"));
+                }
                 format!("grep '{pattern}'{flags} in {where_}")
             }
             Action::Glob { pattern, path } => {
@@ -445,9 +453,9 @@ impl Action {
             }
             Action::RunCommand { command } => run_shell(command, cwd).await,
             Action::FetchUrl { url } => fetch_url(url).await,
-            Action::Grep { pattern, path, ignore_case } => {
+            Action::Grep { pattern, path, ignore_case, context } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
-                run_grep(&root, pattern, *ignore_case)
+                run_grep(&root, pattern, *ignore_case, context.unwrap_or(0))
             }
             Action::Glob { pattern, path } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
@@ -472,13 +480,18 @@ impl Action {
 }
 
 /// Recursive grep over text files, skipping binaries and junk dirs.
-fn run_grep(root: &Path, pattern: &str, ignore_case: bool) -> Result<String> {
+/// `context` > 0 includes that many surrounding lines per hit, groups
+/// separated by `--` (grep -C style).
+fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Result<String> {
+    const MAX_HITS: usize = 200;
+    const MAX_OUTPUT_LINES: usize = 400;
     let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
-    let mut matches: Vec<String> = Vec::new();
+    // (relative path, 1-based line no, line text) for each hit.
+    let mut hits: Vec<(String, usize, String)> = Vec::new();
     let mut files_searched = 0usize;
     let mut stop = false;
     walk_files(root, &mut |p| {
-        if stop || matches.len() >= 200 {
+        if stop || hits.len() >= MAX_HITS {
             stop = true;
             return false; // halt the whole walk
         }
@@ -488,6 +501,7 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool) -> Result<String> {
         }
         let text = String::from_utf8_lossy(&raw);
         files_searched += 1;
+        let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
         for (i, line) in text.lines().enumerate() {
             let hit = if ignore_case {
                 line.to_lowercase().contains(&needle)
@@ -495,9 +509,8 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool) -> Result<String> {
                 line.contains(&needle)
             };
             if hit {
-                let rel = p.strip_prefix(root).unwrap_or(p).display();
-                matches.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
-                if matches.len() >= 200 {
+                hits.push((rel.clone(), i + 1, line.trim_end().to_string()));
+                if hits.len() >= MAX_HITS {
                     stop = true;
                     break;
                 }
@@ -505,7 +518,8 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool) -> Result<String> {
         }
         true
     });
-    if matches.is_empty() {
+
+    if hits.is_empty() {
         let hint = if pattern.contains(['.', '*', '+', '?', '(', '[', '|', '^', '$']) {
             "\nnote: this tool searches for literal text — regex metachars are matched as-is"
         } else {
@@ -515,8 +529,70 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool) -> Result<String> {
             "no matches for '{pattern}' ({files_searched} files searched){hint}"
         ));
     }
-    let truncated = if matches.len() >= 200 { "\n[results truncated at 200]" } else { "" };
-    Ok(format!("{}\n{} matches{}", matches.join("\n"), matches.len(), truncated))
+
+    let truncated_hits = hits.len() >= MAX_HITS;
+    let mut out = String::new();
+    let mut out_lines = 0usize;
+    if context == 0 {
+        for (rel, n, line) in &hits {
+            if out_lines >= MAX_OUTPUT_LINES {
+                out.push_str("[output truncated]\n");
+                break;
+            }
+            out.push_str(&format!("{rel}:{n}: {line}\n"));
+            out_lines += 1;
+        }
+    } else {
+        // Group hits per file, merging windows that overlap.
+        let ctx = context as usize;
+        let mut by_file: std::collections::BTreeMap<String, Vec<(usize, String)>> =
+            std::collections::BTreeMap::new();
+        for (rel, n, line) in &hits {
+            by_file.entry(rel.clone()).or_default().push((*n, line.clone()));
+        }
+        'files: for (rel, mut lines) in by_file {
+            lines.sort_by_key(|(n, _)| *n);
+            lines.dedup_by_key(|(n, _)| *n);
+            let total = std::fs::read(root.join(&rel))
+                .map(|b| String::from_utf8_lossy(&b).lines().count())
+                .unwrap_or(0);
+            let mut prev_end = 0usize; // last emitted line of previous window
+            for &(hit_line, _) in &lines {
+                let start = hit_line.saturating_sub(ctx).max(1);
+                let end = (hit_line + ctx).min(total.max(hit_line));
+                if out_lines >= MAX_OUTPUT_LINES {
+                    out.push_str("[output truncated]\n");
+                    break 'files;
+                }
+                if prev_end != 0 && start > prev_end + 1 {
+                    out.push_str("--\n");
+                    out_lines += 1;
+                } else if prev_end != 0 {
+                    // contiguous — no separator
+                }
+                let src = root.join(&rel);
+                let Ok(content) = std::fs::read_to_string(&src) else { continue };
+                for ln in start..=end {
+                    if out_lines >= MAX_OUTPUT_LINES {
+                        break 'files;
+                    }
+                    let text = content.lines().nth(ln - 1).unwrap_or("").trim_end();
+                    let is_hit = lines.iter().any(|(n, _)| *n == ln);
+                    let prefix = if is_hit { ":" } else { "-" };
+                    out.push_str(&format!("{rel}{prefix}{ln}{prefix}{text}\n"));
+                    out_lines += 1;
+                    prev_end = ln;
+                }
+            }
+        }
+    }
+
+    let mut footer = format!("\n{} matches", hits.len());
+    if truncated_hits {
+        footer.push_str(&format!(" [results truncated at {MAX_HITS}]"));
+    }
+    out.push_str(&footer);
+    Ok(out)
 }
 
 /// Glob-style file search supporting `*`, `**`, and `?` via simple matching.
@@ -590,6 +666,12 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     }
 
     match_segs(&pat_segs, &path_segs)
+}
+
+/// Public wrapper so other modules (undo snapshots) can resolve paths the
+/// same way tool execution does.
+pub fn resolve_path_in(cwd: &Path, path: &str) -> Result<PathBuf> {
+    resolve_in(cwd, path)
 }
 
 fn resolve_in(cwd: &Path, path: &str) -> Result<PathBuf> {
@@ -1074,7 +1156,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
                     "properties": {
                         "pattern": {"type": "string", "description": "Literal text to search for"},
                         "path": {"type": "string", "description": "Directory or file to search, relative to cwd. Optional."},
-                        "ignore_case": {"type": "boolean", "description": "Case-insensitive search"}
+                        "ignore_case": {"type": "boolean", "description": "Case-insensitive search"},
+                        "context": {"type": "integer", "description": "Lines of context around each match (grep -C)"}
                     },
                     "required": ["pattern"]
                 }),

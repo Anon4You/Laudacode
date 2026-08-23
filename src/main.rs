@@ -6,6 +6,7 @@ mod config;
 mod diff;
 mod markdown;
 mod patch;
+mod permissions;
 mod repl;
 mod session;
 mod tools;

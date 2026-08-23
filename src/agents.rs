@@ -75,15 +75,89 @@ pub fn get(name: &str) -> Option<&'static AgentSpec> {
     TEAM.iter().find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+// ---------------------------------------------------------------------------
+// Config-defined roles ([agents.<name>] in config.toml)
+// ---------------------------------------------------------------------------
+
+/// Runtime role: built-in specs converted to owned form, plus user agents.
+#[derive(Debug, Clone)]
+pub struct Role {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub allowed: Vec<String>,
+    pub read_only: bool,
+}
+
+impl Role {
+    fn from_spec(s: &AgentSpec) -> Self {
+        Self {
+            name: s.name.to_string(),
+            description: s.description.to_string(),
+            prompt: s.prompt.to_string(),
+            allowed: s.allowed.iter().map(|s| s.to_string()).collect(),
+            read_only: s.read_only,
+        }
+    }
+}
+
+static CUSTOM_ROLES: std::sync::OnceLock<std::sync::RwLock<Vec<Role>>> = std::sync::OnceLock::new();
+
+/// Install user-defined specialists (called once at startup from App build).
+/// Names collide with built-ins are ignored.
+pub fn install_custom(agents: &std::collections::BTreeMap<String, crate::config::CustomAgent>) {
+    let lock = CUSTOM_ROLES.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut list = lock.write().unwrap_or_else(|p| p.into_inner());
+    list.clear();
+    for (name, cfg) in agents {
+        if get(name).is_some() {
+            continue; // built-ins win
+        }
+        let sanitized = match crate::config::sanitize_name(name) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let allowed: Vec<String> = if cfg.tools.is_empty() {
+            // Sensible default for user roles: read-only exploration.
+            ["list_dir", "read_file", "grep", "glob"]
+                .iter().map(|s| s.to_string()).collect()
+        } else {
+            cfg.tools.clone()
+        };
+        list.push(Role {
+            name: sanitized,
+            description: if cfg.description.is_empty() { "custom agent".into() } else { cfg.description.clone() },
+            prompt: cfg.prompt.clone(),
+            allowed,
+            read_only: cfg.read_only || cfg.tools.is_empty(),
+        });
+    }
+}
+
+fn all_roles() -> Vec<Role> {
+    let mut out: Vec<Role> = TEAM.iter().map(Role::from_spec).collect();
+    if let Some(lock) = CUSTOM_ROLES.get() {
+        out.extend(lock.read().unwrap_or_else(|p| p.into_inner()).iter().cloned());
+    }
+    out
+}
+
+/// Case-insensitive lookup across built-ins and custom roles.
+pub fn find_role(name: &str) -> Option<Role> {
+    all_roles()
+        .into_iter()
+        .find(|r| r.name.eq_ignore_ascii_case(name))
+}
+
 /// `/agents` listing for the TUI.
 pub fn describe_team() -> String {
     let mut out = String::from("Specialist agents available via the delegate tool:\n");
-    for s in TEAM {
+    for r in all_roles() {
         out.push_str(&format!(
             "  {:<11} {}{}\n",
-            s.name,
-            s.description,
-            if s.read_only { "  (read-only)" } else { "" }
+            r.name,
+            r.description,
+            if r.read_only { "  (read-only)" } else { "" }
         ));
     }
     out.push_str("\nThe orchestrator decides when to delegate; ask it to \"plan X\", \
@@ -99,10 +173,10 @@ pub fn describe_team() -> String {
 /// specialists that run concurrently.
 pub fn delegate_tool_def(plan_mode: bool) -> ToolDef {
     // In Plan mode only read-only specialists are offered.
-    let names: Vec<&str> = TEAM
-        .iter()
-        .filter(|s| !plan_mode || s.read_only)
-        .map(|s| s.name)
+    let names: Vec<String> = all_roles()
+        .into_iter()
+        .filter(|r| !plan_mode || r.read_only)
+        .map(|r| r.name)
         .collect();
     ToolDef {
         r#type: "function",
@@ -164,12 +238,12 @@ pub fn parse_delegate_args(arguments: &str) -> anyhow::Result<Vec<(String, Strin
         parsed.tasks.len() <= 4,
         "at most 4 concurrent delegates supported"
     );
+    let known: Vec<String> = all_roles().into_iter().map(|r| r.name).collect();
     let mut out = Vec::with_capacity(parsed.tasks.len());
     for t in parsed.tasks {
-        let spec = get(&t.agent)
-            .map(|s| s.name.to_string())
+        let spec = find_role(&t.agent)
+            .map(|r| r.name)
             .ok_or_else(|| {
-                let known: Vec<&str> = TEAM.iter().map(|s| s.name).collect();
                 anyhow::anyhow!(
                     "unknown agent '{}' — available: {}",
                     t.agent,
@@ -183,10 +257,10 @@ pub fn parse_delegate_args(arguments: &str) -> anyhow::Result<Vec<(String, Strin
 }
 
 /// Filter the standard toolset down to what a role may touch.
-pub fn toolset_for(spec: &AgentSpec) -> Vec<ToolDef> {
+pub fn toolset_for(spec: &Role) -> Vec<ToolDef> {
     crate::tools::tool_defs()
         .into_iter()
-        .filter(|t| spec.allowed.contains(&t.function.name))
+        .filter(|t| spec.allowed.iter().any(|a| a == t.function.name))
         .collect()
 }
 
@@ -200,7 +274,7 @@ use crate::api::{ChatClient, Message, StreamEvent};
 /// Specialists get fewer rounds than the orchestrator.
 pub const MAX_SUB_ROUNDS: usize = 10;
 
-fn sub_system_prompt(cwd: &std::path::Path, spec: &AgentSpec) -> String {
+fn sub_system_prompt(cwd: &std::path::Path, spec: &Role) -> String {
     format!(
         "You are the '{}' specialist of the Laudacode coding team.\n\
          Working directory: {cwd}\nOS: {os}\n\n{}\n\nRules: stay strictly within your \
@@ -224,14 +298,14 @@ pub async fn run_sub_agent(
     task: &str,
     mut ui: Box<dyn UiSink>,
 ) -> String {
-    let Some(spec) = get(spec_name) else {
+    let Some(spec) = find_role(spec_name) else {
         return format!("error: unknown agent '{spec_name}'");
     };
     let messages = vec![
-        Message::system(sub_system_prompt(cwd, spec)),
+        Message::system(sub_system_prompt(cwd, &spec)),
         Message::user(task.to_string()),
     ];
-    match run_loop(client, model, cwd, mode, spec, messages, &mut ui).await {
+    match run_loop(client, model, cwd, mode, &spec, messages, &mut ui).await {
         Ok(report) => report,
         Err(e) => format!("[{spec_name} failed] {e:#}"),
     }
@@ -242,7 +316,7 @@ async fn run_loop(
     model: &str,
     cwd: &std::path::Path,
     mode: ApprovalMode,
-    spec: &AgentSpec,
+    spec: &Role,
     mut messages: Vec<Message>,
     ui: &mut Box<dyn UiSink>,
 ) -> anyhow::Result<String> {
@@ -267,7 +341,7 @@ async fn run_loop(
         ));
         for tc in turn.tool_calls {
             // Toolset restriction is enforced again at execution time.
-            if !spec.allowed.contains(&tc.function.name.as_str()) {
+            if !spec.allowed.iter().any(|a| a == &tc.function.name) {
                 messages.push(Message::tool_result(
                     &tc.id,
                     format!("blocked: '{}' is outside the {} role", tc.function.name, spec.name),
@@ -365,15 +439,15 @@ mod tests {
 
     #[test]
     fn toolsets_are_scoped_to_role() {
-        let coder = get("coder").unwrap();
-        let set = toolset_for(coder);
+        let coder = find_role("coder").unwrap();
+        let set = toolset_for(&coder);
         let names: Vec<&str> = set.iter().map(|t| t.function.name).collect();
         assert!(names.contains(&"apply_patch"));
         assert!(!names.contains(&"run_command"), "coder must not run commands");
 
-        let reviewer = get("reviewer").unwrap();
+        let reviewer = find_role("reviewer").unwrap();
         let names: Vec<&str> =
-            toolset_for(reviewer).iter().map(|t| t.function.name).collect();
+            toolset_for(&reviewer).iter().map(|t| t.function.name).collect();
         assert!(names.contains(&"grep"));
         assert!(!names.contains(&"write_file"), "reviewer is read-only");
 

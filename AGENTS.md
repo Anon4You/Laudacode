@@ -34,6 +34,7 @@ laudacode exec "list the files in this directory"
 | `src/main.rs`    | entry point, CLI dispatch, profile merging, provider subcommand handling |
 | `src/cli.rs`     | clap definitions (`--profile`, `-i/--image`, `--json`)                |
 | `src/config.rs`  | config load/save (TOML or JSON), env precedence, profiles, provider resolution |
+| `src/permissions.rs` | allow/ask/deny rule engine (wildcards per tool) gating tool execution |
 | `src/provider`   | *(managed through `config.rs` + `repl.rs` helpers)*                   |
 | `src/api.rs`     | OpenAI-compatible chat client, SSE streaming, tool-call accumulation, vision multipart messages |
 | `src/agent.rs`   | agent loop (LLM ↔ tools), approval modes, system prompt, /compact     |

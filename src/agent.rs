@@ -74,12 +74,24 @@ pub struct Agent {
     pub mode: ApprovalMode,
     pub messages: Vec<Message>,
     pub last_usage: Option<Usage>,
-    /// Authoritative todo list mirrored from todo_write calls.
+    /// Authoritative todo list mirrored from update_plan calls.
     pub todos: Vec<tools::TodoItem>,
+    /// Per-tool allow/ask/deny rules from config.
+    pub permissions: crate::permissions::Permissions,
+    /// File snapshots for /undo: (turn_seq, path, previous content).
+    pub(crate) undo_stack: Vec<(u64, PathBuf, Option<String>)>,
+    turn_seq: u64,
+    last_undone: Option<u64>,
 }
 
 impl Agent {
-    pub fn new(client: ChatClient, model: String, cwd: PathBuf, mode: ApprovalMode) -> Self {
+    pub fn new(
+        client: ChatClient,
+        model: String,
+        cwd: PathBuf,
+        mode: ApprovalMode,
+        permissions: crate::permissions::Permissions,
+    ) -> Self {
         let system = Self::build_system_prompt(&cwd);
         Self {
             client,
@@ -89,6 +101,77 @@ impl Agent {
             messages: vec![Message::system(system)],
             last_usage: None,
             todos: vec![],
+            permissions,
+            undo_stack: vec![],
+            turn_seq: 0,
+            last_undone: None,
+        }
+    }
+
+    /// Revert every file touched during the most recent agent turn.
+    /// Safe to call once per turn; a second call reports already-undone.
+    pub fn undo_last_turn(&mut self) -> Result<String> {
+        let seq = self
+            .undo_stack
+            .last()
+            .map(|(s, _, _)| *s)
+            .context("nothing to undo — no file changes recorded yet")?;
+        anyhow::ensure!(
+            self.last_undone != Some(seq),
+            "that turn was already reverted"
+        );
+        let mut restored = 0usize;
+        while let Some((s, path, prev)) = self.undo_stack.pop() {
+            if s != seq {
+                self.undo_stack.push((s, path, prev));
+                break;
+            }
+            match prev {
+                Some(content) => {
+                    std::fs::write(&path, content.as_bytes())
+                        .with_context(|| format!("restoring {}", path.display()))?;
+                }
+                None => {
+                    // File did not exist before — remove what the agent added.
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            restored += 1;
+        }
+        self.last_undone = Some(seq);
+        Ok(format!("reverted {restored} file(s) from turn #{seq}"))
+    }
+
+    /// Record the pre-image of every path an action is about to touch.
+    fn snapshot_for_undo(&mut self, action: &tools::Action) {
+        use tools::Action;
+        let paths: Vec<PathBuf> = match action {
+            Action::ListDir { .. }
+            | Action::ReadFile { .. }
+            | Action::FetchUrl { .. }
+            | Action::Grep { .. }
+            | Action::Glob { .. }
+            | Action::RunCommand { .. }
+            | Action::UpdatePlan { .. } => return,
+            Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
+                match tools::resolve_path_in(&self.cwd, path) {
+                    Ok(p) => vec![p],
+                    Err(_) => return,
+                }
+            }
+            Action::ApplyPatch { patch } => {
+                let Ok(hunks) = crate::patch::parse_patch(patch) else { return };
+                hunks
+                    .iter()
+                    .filter_map(|h| {
+                        tools::resolve_path_in(&self.cwd, &h.classify_path().to_string_lossy()).ok()
+                    })
+                    .collect()
+            }
+        };
+        for p in paths {
+            let prev = std::fs::read_to_string(&p).ok();
+            self.undo_stack.push((self.turn_seq, p, prev));
         }
     }
 
@@ -254,11 +337,16 @@ You can delegate to specialist sub-agents with the delegate tool: planner, resea
         if is_cancelled(cancel) {
             anyhow::bail!("interrupted");
         }
+        self.turn_seq += 1;
         if images.is_empty() {
             self.messages.push(Message::user(input));
         } else {
             self.messages.push(Message::user_with_images(input, images.to_vec()));
         }
+
+        // Identical-call ring for the doom-loop guard: the same tool with
+        // byte-identical arguments three times in a row is a stuck model.
+        let mut recent_calls: Vec<(String, String)> = Vec::new();
 
         for _round in 0..MAX_TOOL_ROUNDS {
             // Per-request (not persisted) mode note: in PLAN the write tools
@@ -315,6 +403,32 @@ You can delegate to specialist sub-agents with the delegate tool: planner, resea
                     self.messages.push(Message::tool_result(&tc.id, "[interrupted by user]"));
                     anyhow::bail!("interrupted by user");
                 }
+                // Doom-loop guard: 3 identical calls in a row → refuse and
+                // tell the model to change strategy instead of burning
+                // rounds (and tokens) on the same failing action.
+                let key = (
+                    tc.function.name.clone(),
+                    tc.function.arguments.clone(),
+                );
+                recent_calls.push(key);
+                let n = recent_calls.len();
+                if n >= 3
+                    && recent_calls[n - 1] == recent_calls[n - 2]
+                    && recent_calls[n - 2] == recent_calls[n - 3]
+                {
+                    ui.on_event(AgentEvent::ToolDone {
+                        name: tc.function.name.clone(),
+                        ok: false,
+                        preview: "doom-loop blocked".into(),
+                    });
+                    self.messages.push(Message::tool_result(
+                        &tc.id,
+                        "[doom-loop blocked] you have made this exact call three times \
+                         with identical arguments. Stop repeating it — inspect the state, \
+                         change your approach, or ask the user for help.",
+                    ));
+                    continue;
+                }
                 let result = self.execute_call(&tc, ui).await;
                 self.messages.push(Message::tool_result(&tc.id, result));
             }
@@ -351,25 +465,69 @@ You can delegate to specialist sub-agents with the delegate tool: planner, resea
         }
 
         let name = tc.function.name.clone();
+        // Permission rules (config [permission.*]) override the danger
+        // heuristics: deny short-circuits, ask forces the modal even for
+        // safe reads, allow auto-approves the matched input.
+        let mut forced_ask = false;
+        let mut rule_allows = false;
+        let inputs = permission_inputs(&action);
+        for (tool, input) in &inputs {
+            match self.permissions.resolve(tool, input) {
+                Some(crate::permissions::Rule::Deny) => {
+                    ui.on_event(AgentEvent::ToolDone {
+                        name: name.clone(),
+                        ok: false,
+                        preview: "denied by permission rule".into(),
+                    });
+                    return format!(
+                        "Blocked by permission rule: {tool} '{input}' is denied in config."
+                    );
+                }
+                Some(crate::permissions::Rule::Ask) => forced_ask = true,
+                Some(crate::permissions::Rule::Allow) => rule_allows = true,
+                None => {}
+            }
+        }
+        // Secret guard: .env-style files are denied unless explicitly allowed.
+        let read_input = inputs.iter().find(|(t, _)| *t == "read").map(|(_, i)| i.as_str());
+        let secret_hit = read_input.and_then(|p| {
+            (self.permissions.resolve("read", p).is_none()
+                && crate::permissions::Permissions::secret_guard(p)
+                    == Some(crate::permissions::Rule::Deny))
+            .then_some(p)
+        });
+        if let Some(path_input) = secret_hit {
+            return format!(
+                "Blocked: '{path_input}' looks like a secrets file (.env*). \
+                 Allow it explicitly in [permission.read] if you really mean it."
+            );
+        }
+
+        let name = tc.function.name.clone();
         let summary = action.describe();
         ui.on_event(AgentEvent::ToolStart { name: name.clone(), summary });
 
-        // Approval gate. Writes outside the workspace are classified High by
-        // danger(), so they prompt even in FULL AUTO.
+        // Approval gate. Permission rules take precedence; otherwise writes
+        // outside the workspace stay High and prompt even in FULL AUTO.
         let danger = action.danger(&self.cwd);
-        let approved = match danger {
-            tools::Danger::Safe => true,
-            tools::Danger::High => ui.approve(&action, danger),
-            tools::Danger::Moderate => match self.mode {
-                ApprovalMode::FullAuto => true,
-                ApprovalMode::AutoEdit => true, // edits auto-approved in Build mode
-                ApprovalMode::Suggest => true,  // unreachable: plan blocks earlier
-            },
+        let approved = if forced_ask {
+            ui.approve(&action, danger)
+        } else if rule_allows {
+            true
+        } else {
+            match danger {
+                tools::Danger::Safe => true,
+                tools::Danger::High => ui.approve(&action, danger),
+                tools::Danger::Moderate => true,
+            }
         };
         if !approved {
             return "User DECLINED this action. Ask what to do differently or proceed another way."
                 .to_string();
         }
+
+        // Snapshot pre-images so /undo can revert this turn's file changes.
+        self.snapshot_for_undo(&action);
 
         // Surface plan updates to the host for live display.
         if let tools::Action::UpdatePlan { todos } = &action {
@@ -405,6 +563,37 @@ You can delegate to specialist sub-agents with the delegate tool: planner, resea
                 format!("Command failed: {msg}")
             }
         }
+    }
+}
+
+/// (tool-key, raw-input) pairs a given action should be permission-checked
+/// against. Tool keys mirror config section names.
+fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
+    use tools::Action;
+    match action {
+        Action::ListDir { path } | Action::ReadFile { path, .. } => {
+            vec![("read", path.clone())]
+        }
+        Action::Grep { pattern, .. } => vec![("read", pattern.clone())],
+        Action::Glob { pattern, .. } => vec![("read", pattern.clone())],
+        Action::FetchUrl { url } => vec![("webfetch", url.clone())],
+        Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
+            vec![("edit", path.clone())]
+        }
+        Action::ApplyPatch { patch } => {
+            let mut out = Vec::new();
+            if let Ok(hunks) = crate::patch::parse_patch(patch) {
+                for h in hunks {
+                    out.push((
+                        "edit",
+                        h.classify_path().to_string_lossy().into_owned(),
+                    ));
+                }
+            }
+            out
+        }
+        Action::RunCommand { command } => vec![("bash", command.clone())],
+        Action::UpdatePlan { .. } => vec![],
     }
 }
 
@@ -513,5 +702,79 @@ mod tests {
         // May pick up global config AGENTS.md if present, but never panics.
         let _ = out;
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn undo_restores_files_added_modified_and_deleted() {
+        use crate::api::ChatClient;
+        let dir = std::env::temp_dir().join(format!("lc-undo-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/exists.rs"), "original\n").unwrap();
+        std::fs::write(dir.join("src/doomed.rs"), "bye\n").unwrap();
+
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None)
+            .expect("client");
+        let mut agent = Agent::new(
+            client,
+            String::new(),
+            dir.clone(),
+            ApprovalMode::FullAuto,
+            crate::permissions::Permissions::default(),
+        );
+
+        // Turn 1: modify existing + add new + delete one. Snapshots are
+        // taken automatically by the same gate production code uses.
+        agent.turn_seq += 1;
+        assert!(
+            agent.perform_action_sync(&tools::Action::EditFile {
+                path: "src/exists.rs".into(),
+                old: "original".into(),
+                new: "changed".into(),
+            }),
+            "edit should apply"
+        );
+        assert!(agent.perform_action_sync(&tools::Action::WriteFile {
+            path: "src/new_file.rs".into(),
+            content: "added".into(),
+        }));
+        assert!(
+            agent.perform_action_sync(&tools::Action::ApplyPatch {
+                patch: "*** Begin Patch\n*** Delete File: src/doomed.rs\n*** End Patch".into(),
+            }),
+            "delete should apply"
+        );
+
+        assert_eq!(std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(), "changed\n");
+        assert!(dir.join("src/new_file.rs").exists());
+        assert!(!dir.join("src/doomed.rs").exists());
+
+        // Undo reverts all three.
+        let msg = agent.undo_last_turn().unwrap();
+        assert!(msg.contains("reverted 3 file(s)"), "{msg}");
+        assert_eq!(std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(), "original\n");
+        assert!(!dir.join("src/new_file.rs").exists(), "created file removed");
+        assert_eq!(std::fs::read_to_string(dir.join("src/doomed.rs")).unwrap(), "bye\n");
+
+        // Second undo of the same turn is refused.
+        assert!(agent.undo_last_turn().is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    impl Agent {
+        /// Sync helper for tests — runs the action ignoring diffs.
+        fn perform_with_diff_blocking(&mut self, action: &tools::Action) -> anyhow::Result<String> {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async { self.perform(action).await })
+        }
+
+        async fn perform(&mut self, action: &tools::Action) -> anyhow::Result<String> {
+            let (out, _) = action.perform_with_diff(&self.cwd).await?;
+            Ok(out)
+        }
+
+        fn perform_action_sync(&mut self, action: &tools::Action) -> bool {
+            self.snapshot_for_undo(action);
+            self.perform_with_diff_blocking(action).is_ok()
+        }
     }
 }

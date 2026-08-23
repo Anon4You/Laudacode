@@ -111,6 +111,14 @@ struct Picker {
     filter: String,
 }
 
+/// One row in the slash-command popup (built-in or user-defined).
+pub struct SlashEntry {
+    pub cmd: String,
+    pub desc: String,
+    /// Bare name when user-defined — used by repl to route submission.
+    pub custom: Option<String>,
+}
+
 impl Picker {
     fn filtered(&self) -> Vec<usize> {
         let f = self.filter.to_lowercase();
@@ -146,6 +154,10 @@ pub struct Tui {
     slash_sel: usize,
     /// Project files for `@mention` completion (relative paths, sorted).
     files: Vec<String>,
+    /// User-defined slash commands (name, description), loaded at startup.
+    pub custom_cmds: Vec<(String, String)>,
+    /// Full templates keyed by command name for submission rendering.
+    pub custom_templates: std::collections::BTreeMap<String, String>,
     /// Highlighted row in the @-file popup.
     at_sel: usize,
     /// Ctrl+O output-expansion overlay (last tool results in full).
@@ -179,12 +191,14 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
     ("/diff", "show uncommitted git changes"),
+    ("/undo", "revert file changes from the last turn"),
     ("/init", "create an AGENTS.md project brief"),
     ("/quit", "exit Laudacode"),
 ];
 
 /// Indices into `SLASH_COMMANDS` whose name starts with `query`
-/// (case-insensitive). Empty query returns everything.
+/// (case-insensitive). Empty query returns everything. Test-only helper.
+#[cfg(test)]
 fn filter_slash_commands(query: &str) -> Vec<usize> {
     let q = query.to_lowercase();
     SLASH_COMMANDS
@@ -216,6 +230,8 @@ impl Tui {
             pending_approval: None,
             slash_sel: 0,
             files: vec![],
+            custom_cmds: vec![],
+            custom_templates: Default::default(),
             at_sel: 0,
             overlay: false,
             overlay_scroll: 0,
@@ -402,12 +418,42 @@ impl Tui {
         self.input.starts_with('/') && !self.input.chars().skip(1).any(char::is_whitespace)
     }
 
-    /// Matching commands for the current input, as indices into `SLASH_COMMANDS`.
+    /// Built-in + custom command entries for the popup.
+    pub fn slash_entries(&self) -> Vec<SlashEntry> {
+        let mut v: Vec<SlashEntry> = SLASH_COMMANDS
+            .iter()
+            .map(|(c, d)| SlashEntry {
+                cmd: c.to_string(),
+                desc: d.to_string(),
+                custom: None,
+            })
+            .collect();
+        for cc in &self.custom_cmds {
+            v.push(SlashEntry {
+                cmd: format!("/{}", cc.0),
+                desc: cc.1.clone(),
+                custom: Some(cc.0.clone()),
+            });
+        }
+        v
+    }
+
+    /// Matching entries for the current input as indices into `slash_entries`.
     pub fn slash_matches(&self) -> Vec<usize> {
         if !self.slash_popup_active() {
             return Vec::new();
         }
-        filter_slash_commands(&self.input)
+        let q = self.input.to_lowercase();
+        self.slash_entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| q.is_empty() || e.cmd.starts_with(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn set_custom_cmds(&mut self, cmds: Vec<(String, String)>) {
+        self.custom_cmds = cmds;
     }
 
     /// Replace the typed token with the highlighted suggestion (plus a space).
@@ -417,8 +463,7 @@ impl Tui {
             return;
         }
         let idx = matches[self.slash_sel.min(matches.len() - 1)];
-        let (cmd, _) = SLASH_COMMANDS[idx];
-        self.input = format!("{cmd} ");
+        self.input = format!("{} ", self.slash_entries()[idx].cmd);
         self.slash_sel = 0;
     }
 
@@ -909,21 +954,24 @@ impl Tui {
         }
         let rect = Rect { x: area.x, y, width, height };
 
+        let entries = self.slash_entries();
         let sel = self.slash_sel.min(matches.len() - 1);
         // Keep the highlighted row inside a sliding window.
         let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
         let items: Vec<ListItem> = matches[start..start + visible]
             .iter()
             .map(|&i| {
-                let (cmd, desc) = SLASH_COMMANDS[i];
+                let entry = &entries[i];
+                let (cmd, desc) = (&entry.cmd, &entry.desc);
                 let selected = i == matches[sel];
                 let style = if selected {
                     Style::default().bg(Color::Rgb(60, 60, 80)).fg(Color::White)
                 } else {
                     Style::default()
                 };
+                let name_color = if entry.custom.is_some() { Color::LightGreen } else { Color::Cyan };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{cmd:<12}"), style.fg(if selected { Color::White } else { Color::Cyan }).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{:<14}", cmd), style.fg(if selected { Color::White } else { name_color }).add_modifier(Modifier::BOLD)),
                     Span::styled(desc.to_string(), if selected { style } else { Style::default().fg(Color::DarkGray) }),
                 ]))
             })
@@ -1114,7 +1162,7 @@ impl Tui {
             let matches = self.slash_matches();
             if !matches.is_empty() {
                 let idx = matches[self.slash_sel.min(matches.len() - 1)];
-                let (cmd, _) = SLASH_COMMANDS[idx];
+                let cmd = self.slash_entries()[idx].cmd.clone();
                 match key.code {
                     KeyCode::Up => {
                         self.move_slash_sel(-1);
@@ -1409,11 +1457,12 @@ mod tests {
         assert_eq!(filter_slash_commands("/resum"), vec![8]); // /resume
         assert_eq!(filter_slash_commands("/imag"), vec![9]); // /image
         assert_eq!(filter_slash_commands("/RETRY"), vec![6]);
-        assert_eq!(filter_slash_commands("/quit"), vec![13]);
+        assert_eq!(filter_slash_commands("/quit"), vec![14]);
         // Newer commands are discoverable too.
         assert_eq!(filter_slash_commands("/status"), vec![10]);
         assert_eq!(filter_slash_commands("/diff"), vec![11]);
-        assert!(filter_slash_commands("/zzz").is_empty());
+        assert_eq!(filter_slash_commands("/undo"), vec![12]);
+                assert!(filter_slash_commands("/zzz").is_empty());
     }
 
     #[test]

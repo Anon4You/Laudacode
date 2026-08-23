@@ -275,6 +275,8 @@ pub enum WorkerCmd {
     Diff,
     /// Open the /resume picker with recent sessions.
     ListSessions,
+    /// Revert file changes made during the most recent agent turn.
+    Undo,
     /// Replace the live conversation with a stored session id.
     ResumeSession(String),
     /// Attach a local image to the next submitted prompt.
@@ -541,14 +543,44 @@ fn worker_main(
                     let _ = ev_tx.send(WorkerEvent::Error(format!("export failed: {e:#}")));
                 }
             },
-            WorkerCmd::InitAgentsMd => match init_agents_md(&app.cwd) {
-                Ok(msg) => {
-                    let _ = ev_tx.send(WorkerEvent::Info(msg));
+            WorkerCmd::InitAgentsMd => {
+                if app.cwd.join("AGENTS.md").exists() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "AGENTS.md already exists — edit it directly or ask the agent to update it"
+                            .into(),
+                    ));
+                } else {
+                    // Smart /init: have the agent analyze the project and
+                    // write a real brief instead of dumping a stub.
+                    let _ = ev_tx.send(WorkerEvent::Busy(true));
+                    const INIT_PROMPT: &str = "\
+Create an AGENTS.md file for THIS project in this directory. First explore: read Cargo.toml/package.json/Makefile/etc., list directories, skim key sources. Then write AGENTS.md containing: project overview (2-3 lines), build & test commands, code layout, and conventions you can infer. Keep it under 40 lines.";
+                    cancel.store(false, Ordering::Relaxed);
+                    let mut bridge = WorkerBridge {
+                        tx: ev_tx.clone(),
+                        approve_rx: approve_rx.clone(),
+                        cancel: cancel.clone(),
+                    };
+                    match rt.block_on(app.agent.run_turn(INIT_PROMPT, &[], &mut bridge, Some(&cancel))) {
+                        Ok(()) => {
+                            app.persist();
+                            let msg = if app.cwd.join("AGENTS.md").exists() {
+                                "created AGENTS.md — review it and adjust to taste".to_string()
+                            } else {
+                                "agent finished but did not write AGENTS.md — try again".to_string()
+                            };
+                            let _ = ev_tx.send(WorkerEvent::Info(msg));
+                        }
+                        Err(e) => {
+                            // Offline / broken provider → fall back to stub.
+                            let fallback = init_agents_md_stub(&app.cwd)
+                                .unwrap_or_else(|fe| format!("{e:#}; stub also failed: {fe:#}"));
+                            let _ = ev_tx.send(WorkerEvent::Info(fallback));
+                        }
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
                 }
-                Err(e) => {
-                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
-                }
-            },
+            }
             WorkerCmd::Status => {
                 let a = &app.agent;
                 let mode = match a.mode {
@@ -599,6 +631,10 @@ fn worker_main(
                 }
                 let _ = ev_tx.send(WorkerEvent::Busy(false));
             }
+            WorkerCmd::Undo => match app.agent.undo_last_turn() {
+                Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Info(msg)); }
+                Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+            },
             WorkerCmd::ListSessions => {
                 let recent = Session::list_recent(12);
                 if recent.is_empty() {
@@ -810,7 +846,7 @@ fn export_transcript(app: &App) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn init_agents_md(cwd: &std::path::Path) -> Result<String> {
+fn init_agents_md_stub(cwd: &std::path::Path) -> Result<String> {
     let path = cwd.join("AGENTS.md");
     if path.exists() {
         return Ok("AGENTS.md already exists here".into());
@@ -820,7 +856,128 @@ fn init_agents_md(cwd: &std::path::Path) -> Result<String> {
         - Describe code conventions the agent must follow.\n\
         - Keep it short; it is loaded into the system prompt.\n";
     std::fs::write(&path, stub).with_context(|| format!("writing {}", path.display()))?;
-    Ok("created AGENTS.md — edit it to give the agent project instructions".into())
+    Ok("created a stub AGENTS.md (offline fallback) — edit it with project instructions".into())
+}
+
+// ---------------------------------------------------------------------------
+// Custom commands (.laudacode/commands/*.md + global dir)
+// ---------------------------------------------------------------------------
+
+/// A user-defined slash command (parity with modern agent CLIs).
+#[derive(Debug, Clone)]
+pub struct CustomCmd {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+}
+
+/// Scan the project `.laudacode/commands/` and the global
+/// `config_dir/laudacode/commands/`. Project entries override global ones.
+pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
+    let mut out: Vec<CustomCmd> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(g) = dirs::config_dir() {
+        dirs.push(g.join("laudacode").join("commands"));
+    }
+    dirs.push(cwd.join(".laudacode").join("commands"));
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        files.sort_by_key(|e| e.file_name());
+        for f in files {
+            let name = f.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(f.path()) else { continue };
+            let (description, template) = split_frontmatter(&raw);
+            let cmd_name = name.trim_end_matches(".md").to_string();
+            out.retain(|c: &CustomCmd| c.name != cmd_name); // later dir wins
+            out.push(CustomCmd { name: cmd_name, description, template });
+        }
+    }
+    out
+}
+
+/// Split optional `--- description: … ---` frontmatter from the body.
+fn split_frontmatter(raw: &str) -> (String, String) {
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let head = &rest[..end];
+            let body = rest[end + 4..].trim_start_matches('\n').to_string();
+            let mut description = String::new();
+            for line in head.lines() {
+                if let Some(v) = line.trim().strip_prefix("description:") {
+                    description = v.trim().to_string();
+                }
+            }
+            return (description, body);
+        }
+    }
+    (String::new(), trimmed.to_string())
+}
+
+/// Render a command template:
+/// - `$ARGUMENTS` → all args; `$1..$9` → positional args
+/// - `` !`cmd` `` → shell output (runs in cwd)
+/// - `@path` → file contents inline
+pub fn render_command_template(tpl: &str, args: &str, cwd: &std::path::Path) -> String {
+    let argv: Vec<&str> = args.split_whitespace().collect();
+    let mut out = tpl.replace("$ARGUMENTS", args.trim());
+    for (i, v) in argv.iter().enumerate().take(9) {
+        out = out.replace(&format!("${}", i + 1), v);
+    }
+
+    // Shell injection: !`cmd`
+    while let Some(start) = out.find("!`") {
+        let Some(rel_end) = out[start + 2..].find('`') else { break };
+        let cmd = &out[start + 2..start + 2 + rel_end];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .map(|o| {
+                let mut s =
+                    String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s.trim_end().to_string()
+            })
+            .unwrap_or_else(|| "(command failed)".into());
+        let capped: String = output.chars().take(4000).collect();
+        out.replace_range(start..start + 2 + rel_end + 1, &capped);
+    }
+
+    // File references: @relative/path (until whitespace)
+    let mut rendered = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find('@') {
+        let boundary = at == 0 || !{
+            let prev = rest[..at].chars().last().unwrap_or(' ');
+            prev.is_alphanumeric()
+        };
+        let token: String = rest[at + 1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .collect();
+        if boundary && !token.is_empty() && token != "ARGUMENTS" {
+            if let Ok(content) = std::fs::read_to_string(cwd.join(&token)) {
+                let capped: String = content.chars().take(8 * 1024).collect();
+                rendered.push_str(&rest[..at]);
+                rendered.push_str(&format!(
+                    "\n--- {token} ---\n{capped}\n--- end {token} ---\n"
+                ));
+                rest = &rest[at + 1 + token.len()..];
+                continue;
+            }
+        }
+        rendered.push_str(&rest[..at + 1]);
+        rest = &rest[at + 1..];
+    }
+    rendered.push_str(rest);
+    rendered
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +997,8 @@ pub struct App {
     pub pending_images: Vec<String>,
     /// Entries to replay into the TUI on start (set by session restores).
     pub pending_transcript: Vec<Entry>,
+    /// Custom commands loaded at startup (kept for submission routing).
+    pending_custom_cmds: Vec<CustomCmd>,
 }
 
 /// Summary of a finished TUI session, used for the exit resume hint.
@@ -874,6 +1033,7 @@ impl App {
 
     fn tui_main(mut self) -> Result<SessionExit> {
         let initial_id = self.session.id.clone();
+        let project_cwd = self.cwd.clone();
         let mut tui = Tui::new();
         // Keep UI and agent in lock-step from frame one: without this the
         // composer claimed BUILD while the agent still enforced read-only
@@ -899,6 +1059,29 @@ impl App {
             });
             tui.set_files(files);
         }
+        // User-defined /commands from .laudacode/commands + global dir.
+        let custom_cmds = load_custom_commands(&self.cwd);
+        if !custom_cmds.is_empty() {
+            let listing = custom_cmds
+                .iter()
+                .map(|c| format!("  /{:<14} {}", c.name, c.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tui.push(Entry::Info(format!(
+                "custom commands loaded:\n{listing}\n\nargs: $ARGUMENTS/$1 · @file inlines a file · !`cmd` injects output"
+            )));
+        }
+        tui.custom_templates = custom_cmds
+            .iter()
+            .map(|c| (c.name.clone(), c.template.clone()))
+            .collect();
+        tui.set_custom_cmds(
+            custom_cmds
+                .iter()
+                .map(|c| (c.name.clone(), c.description.clone()))
+                .collect(),
+        );
+        self.pending_custom_cmds = custom_cmds;
         let config_note = if placeholder_key(&self.active.api_key) {
             format!(
                 "\n⚠ API key looks like a placeholder — fix {} or unset OPENAI_API_KEY",
@@ -991,17 +1174,34 @@ impl App {
                             return false;
                         }
                     } else if tui.is_busy() && !text.starts_with('#') && !text.starts_with('!') {
-                        tui.push(Entry::Error(
-                            "agent is busy — press Esc to interrupt first".into(),
-                        ));
+                        // Queue the next prompt while the agent works — it runs
+                        // automatically when the current turn finishes.
+                        tui.push(Entry::User(format!("⏳ {text}")));
+                        tui.set_status("queued");
+                        let _ = ui_cmd.send(WorkerCmd::Submit(text));
                     } else {
+                        let mut prompt = text.clone();
+                        // Custom commands take priority over built-ins.
+                        if prompt.starts_with('/') {
+                            let (head, rest) = match prompt.split_once(' ') {
+                                Some((h, r)) => (h.to_string(), r.to_string()),
+                                None => (prompt.clone(), String::new()),
+                            };
+                            let bare = head.trim_start_matches('/');
+                            if let Some(cc) = custom_lookup(tui, bare) {
+                                tui.push(Entry::User(text.clone()));
+                                prompt = render_command_template(&cc.template, &rest, &project_cwd);
+                                let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
+                                return true;
+                            }
+                        }
                         if text.starts_with('#') || text.starts_with('!') {
                             // Memory notes / shell passthrough run even while busy.
                         } else {
                             tui.push(Entry::User(text.clone()));
                         }
                         tui.set_status("thinking");
-                        let _ = ui_cmd.send(WorkerCmd::Submit(text));
+                        let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
                     }
                 }
                 KeyAction::None => {}
@@ -1061,12 +1261,16 @@ impl App {
             active.name == "openrouter" || active.base_url.contains("openrouter"),
             active.reasoning_effort.clone(),
         )?;
-        let agent = Agent::new(client, active.model.clone(), cwd.clone(), mode);
+        let permissions = config.permission.clone();
+        // Install user-defined specialists from [agents.*] before any
+        // delegate schema is built.
+        crate::agents::install_custom(&config.agents);
+        let agent = Agent::new(client, active.model.clone(), cwd.clone(), mode, permissions);
 
         let session = Session::new();
         let ui = TermUi::new()?;
         let ctx_window = config.context_window.unwrap_or(128_000);
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![] })
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![], pending_custom_cmds: vec![] })
     }
 
     /// Bare App with a placeholder provider — used when config resolution
@@ -1083,11 +1287,17 @@ impl App {
             reasoning_effort: None,
         };
         let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, false, None)?;
-        let agent = Agent::new(client, String::new(), cwd.clone(), ApprovalMode::Suggest);
+        let agent = Agent::new(
+            client,
+            String::new(),
+            cwd.clone(),
+            ApprovalMode::Suggest,
+            crate::permissions::Permissions::default(),
+        );
         let session = Session::new();
         let ui = TermUi::new()?;
         let ctx_window = 128_000;
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![] })
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![], pending_custom_cmds: vec![] })
     }
 
     pub fn restore_session(&mut self, sess: Session) {
@@ -1255,6 +1465,17 @@ fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
     }
 }
 
+/// Find a user-defined command by bare name in the TUI's loaded lists.
+fn custom_lookup(tui: &Tui, name: &str) -> Option<CustomCmd> {
+    let (_, description) = tui.custom_cmds.iter().find(|(n, _)| n == name)?;
+    let template = tui.custom_templates.get(name)?.clone();
+    Some(CustomCmd {
+        name: name.to_string(),
+        description: description.clone(),
+        template,
+    })
+}
+
 /// Cycle PLAN → BUILD → FULL AUTO and inform the worker.
 fn cycle_mode(tui: &mut Tui, cmd: &Sender<WorkerCmd>) {
     tui.mode = tui.mode.next();
@@ -1302,7 +1523,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                  /export       save the transcript as markdown\n\
                  /status       provider · model · session info\n\
                  /diff         show uncommitted git changes\n\
-                 /init         create an AGENTS.md project brief\n\
+                 /undo         revert file changes from the last turn\n\
+                 /init         analyze the project and write AGENTS.md\n\
+                 /your-cmd     custom commands from .laudacode/commands/*.md\n\
                  @file         mention a file in your prompt\n\
                  #note         save a memory into AGENTS.md\n\
                  !<command>    run a shell command locally (no agent)\n\
@@ -1391,6 +1614,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "diff" => {
             tui.set_status("computing diff");
             let _ = cmd.send(WorkerCmd::Diff);
+        }
+        "undo" => {
+            tui.set_status("reverting last turn");
+            let _ = cmd.send(WorkerCmd::Undo);
         }
         other => {
             tui.push(Entry::Error(format!("unknown command '/{other}' — try /help")));
@@ -1704,6 +1931,37 @@ fn prompt_hidden(label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_command_pipeline_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("lc-cmds-{}", std::process::id()));
+        let cmds = dir.join(".laudacode/commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(
+            cmds.join("greet.md"),
+            "---\ndescription: say hi\n---\nHello $1 you said: $ARGUMENTS\n",
+        )
+        .unwrap();
+        // Project overrides global on name clash.
+        std::fs::write(cmds.join("review.md"), "Review @notes.md now\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "IMPORTANT NOTE CONTENT").unwrap();
+
+        let loaded = load_custom_commands(&dir);
+        assert_eq!(loaded.len(), 2);
+        let greet = loaded.iter().find(|c| c.name == "greet").unwrap();
+        assert_eq!(greet.description, "say hi");
+
+        let rendered = render_command_template(&greet.template, "Bob extra", &dir);
+        assert!(rendered.contains("Hello Bob"), "{rendered}");
+        assert!(rendered.contains("you said: Bob extra"), "{rendered}");
+
+        let review = loaded.iter().find(|c| c.name == "review").unwrap();
+        let rendered = render_command_template(&review.template, "", &dir);
+        assert!(rendered.contains("IMPORTANT NOTE CONTENT"), "{rendered}");
+        assert!(rendered.contains("@notes.md") == false || rendered.contains("--- notes.md ---"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn header_parsing() {

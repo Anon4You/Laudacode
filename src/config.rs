@@ -37,6 +37,19 @@ pub struct Profile {
     pub model_reasoning_effort: Option<String>,
 }
 
+/// User-defined specialist for the delegate team (`[agents.<name>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomAgent {
+    #[serde(default)]
+    pub description: String,
+    pub prompt: String,
+    /// Tool names this role may use; empty means read-only set.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +65,12 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Provider>,
+    /// Per-tool allow/ask/deny rules with wildcards (see `permissions.rs`).
+    #[serde(default)]
+    pub permission: crate::permissions::Permissions,
+    /// Custom specialists for the delegate tool (`[agents.<name>]`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, CustomAgent>,
 }
 
 /// Fully resolved provider settings ready for an API call.
