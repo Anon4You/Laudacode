@@ -36,6 +36,15 @@ pub struct Cli {
     #[arg(short = 'c', long, global = true)]
     pub continue_last: bool,
 
+    /// Resume a saved session by its unique id (shown when you exit)
+    #[arg(
+        long,
+        global = true,
+        value_name = "SESSION_ID",
+        conflicts_with = "continue_last"
+    )]
+    pub resume: Option<String>,
+
     /// Activate a named profile from your config ([profiles.<name>])
     #[arg(long, global = true)]
     pub profile: Option<String>,

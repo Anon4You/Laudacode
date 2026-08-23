@@ -193,7 +193,7 @@ Rules:
     /// (vision models only; plain-text providers ignore them).
     ///
     /// `cancel` lets the host interrupt between rounds, mid-stream and
-    /// between individual tool executions (codex-style Esc interrupt).
+    /// between individual tool executions (Esc interrupt).
     pub async fn run_turn(
         &mut self,
         input: &str,

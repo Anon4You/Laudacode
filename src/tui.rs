@@ -12,7 +12,7 @@ use ratatui::{
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
-/// Collaboration mode, cycled with Shift+Tab like Codex.
+/// Collaboration mode, cycled with Shift+Tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Read-only planning: model explores and produces a plan.
@@ -58,7 +58,7 @@ pub const BANNER: &str = concat!(
 );
 
 /// Banner renders as a vertical green → cyan → blue gradient, echoing the
-/// OpenAI/Codex palette.
+/// Bright green → cyan → blue terminal palette.
 const BANNER_COLORS: &[Color] = &[
     Color::LightGreen,
     Color::Green,
@@ -131,7 +131,7 @@ pub struct Tui {
     /// Agent activity indicator (rendered in the footer, never in the transcript).
     busy: bool,
     busy_label: String,
-    /// When the current busy stretch started — drives the codex-style
+    /// When the current busy stretch started — drives the
     /// "working (esc · Ns)" elapsed counter.
     busy_since: Option<Instant>,
     /// Last reported token usage + assumed window for the context meter.
@@ -597,7 +597,7 @@ impl Tui {
                     format!(" v{} ", env!("CARGO_PKG_VERSION")),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled("— codex-class agent, pure Rust", Style::default().fg(Color::DarkGray)),
+                Span::styled("— AI coding agent, pure Rust", Style::default().fg(Color::DarkGray)),
             ]));
             f.render_widget(Paragraph::new(banner_lines), h);
         }
@@ -662,7 +662,7 @@ impl Tui {
             self.draw_at_popup(f, area, composer_area);
         }
 
-        // Codex-style hints strip under the composer.
+        // Hints strip under the composer.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " enter send · esc interrupt · tab mode · ctrl+o expand · ! shell · ctrl+c quit ",
@@ -707,7 +707,7 @@ impl Tui {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
 
-        // Context-left meter, codex-style: ▕██████░░░░░░▏ 38%
+        // Context-left meter: ▕██████░░░░░░▏ 38%
         let pct = self
             .ctx_used
             .min(self.ctx_total)
@@ -742,7 +742,7 @@ impl Tui {
         );
     }
 
-    /// Centered approval dialog, codex-style: detail + y/a/n options.
+    /// Centered approval dialog: detail + y/a/n options.
     fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
         let width = area.width.clamp(40, 64);
         let wrapped = wrap_text(detail, width.saturating_sub(4) as usize);
@@ -1107,7 +1107,7 @@ impl Tui {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match c {
                         'c' | 'd' => {
-                            // Codex-style double-press: first press clears the
+                            // Double-press: first press clears the
                             // composer (or warns), second within 2s quits.
                             let now = Instant::now();
                             let again = self
@@ -1354,7 +1354,7 @@ mod tests {
         assert_eq!(filter_slash_commands("/imag"), vec![9]); // /image
         assert_eq!(filter_slash_commands("/RETRY"), vec![6]);
         assert_eq!(filter_slash_commands("/quit"), vec![13]);
-        // New codex-style commands are discoverable too.
+        // Newer commands are discoverable too.
         assert_eq!(filter_slash_commands("/status"), vec![10]);
         assert_eq!(filter_slash_commands("/diff"), vec![11]);
         assert!(filter_slash_commands("/zzz").is_empty());

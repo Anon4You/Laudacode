@@ -15,7 +15,7 @@ pub enum Action {
     ReadFile { path: String, offset: Option<u64>, limit: Option<u64> },
     WriteFile { path: String, content: String },
     EditFile { path: String, old: String, new: String },
-    /// Codex-style V4A patch — multi-file add/update/delete in one call.
+    /// V4A patch — multi-file add/update/delete in one call.
     ApplyPatch { patch: String },
     RunCommand { command: String },
     FetchUrl { url: String },
@@ -109,7 +109,7 @@ struct TodoWriteArgs {
     todos: Vec<TodoItemArgs>,
 }
 
-/// Codex `update_plan` schema: {plan: [{step, status}]}.
+/// `update_plan` schema: {plan: [{step, status}]}.
 #[derive(Deserialize)]
 struct PlanStepArgs {
     step: String,
@@ -160,7 +160,7 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                 let a: GlobArgs = serde_json::from_value(v)?;
                 Ok(Action::Glob { pattern: a.pattern, path: a.path })
             }
-            // Codex name first; legacy alias kept for old sessions.
+            // Canonical name first; legacy alias kept for old sessions.
             "update_plan" | "todo_write" => {
                 if let Ok(a) = serde_json::from_value::<UpdatePlanArgs>(v.clone()) {
                     Ok(Action::UpdatePlan {
@@ -995,7 +995,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
             r#type: "function",
             function: FunctionDef {
                 name: "apply_patch",
-                description: "Apply a codex-style patch that can add, update (with move/rename), and delete multiple files in one call. Format:\n*** Begin Patch\n*** Add File: path\n+lines\n*** Update File: path\n@@ optional context anchor\n-old\n+new\n*** Delete File: path\n*** End Patch\nContext lines start with a space; '@@ <line>' anchors the next chunk; '*** End of File' appends at EOF.",
+                description: "Apply a patch that can add, update (with move/rename), and delete multiple files in one call. Format:\n*** Begin Patch\n*** Add File: path\n+lines\n*** Update File: path\n@@ optional context anchor\n-old\n+new\n*** Delete File: path\n*** End Patch\nContext lines start with a space; '@@ <line>' anchors the next chunk; '*** End of File' appends at EOF.",
                 parameters: json!({
                     "type": "object",
                     "properties": {

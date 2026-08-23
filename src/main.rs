@@ -142,7 +142,14 @@ fn interactive(cli: &Cli) -> Result<()> {
         }
     };
 
-    if cli.continue_last {
+    if let Some(id) = cli.resume.as_deref() {
+        if id.trim().is_empty() {
+            bail!("usage: laudacode --resume <SESSION_ID>  (ids are shown when you exit, or pick one with /resume)");
+        }
+        let sess = Session::load(id)
+            .with_context(|| format!("no such session '{id}' — recent ids are listed by /resume in the TUI"))?;
+        app.restore_session(sess);
+    } else if cli.continue_last {
         if let Some(sess) = Session::latest() {
             app.restore_session(sess);
         } else {
@@ -159,7 +166,17 @@ fn interactive(cli: &Cli) -> Result<()> {
         app.active = active;
     }
 
-    app.run_tui()
+    let exit = app.run_tui()?;
+
+    // Terminal is restored at this point — show how to get back in.
+    if exit.messages > 0 {
+        println!("{}", "Catch you later!".green().bold());
+        println!();
+        println!("Resume this session with:");
+        println!("{}", format!("  laudacode --resume {}", exit.id).cyan());
+    }
+
+    Ok(())
 }
 
 

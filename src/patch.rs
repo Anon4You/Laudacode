@@ -1,8 +1,7 @@
-//! Codex-style V4A patch format (`*** Begin Patch` … `*** End Patch`).
+//! V4A patch format (`*** Begin Patch` … `*** End Patch`).
 //!
-//! Ported from openai/codex `codex-rs/apply-patch` (parser grammar +
-//! `seek_sequence` fuzzy matcher + chunk replacement algorithm), simplified
-//! to synchronous std::fs with no external deps.
+//! Parser grammar + fuzzy sequence matching + chunk replacement algorithm,
+//! simplified to synchronous std::fs with no external deps.
 //!
 //! Grammar (lenient):
 //! ```text
@@ -36,7 +35,7 @@ pub struct Chunk {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)] // codex names these AddFile/UpdateFile/DeleteFile
+#[allow(clippy::enum_variant_names)] // Add*/Update*/Delete* naming is part of the format
 pub enum Hunk {
     AddFile { path: PathBuf, contents: String },
     DeleteFile { path: PathBuf },
@@ -189,7 +188,7 @@ pub fn parse_patch(raw: &str) -> Result<Vec<Hunk>> {
     Ok(hunks)
 }
 
-/// Fuzzy sequence search, ported from codex `seek_sequence.rs`: exact, then
+/// Fuzzy sequence search: exact, then
 /// rstrip, then full-trim comparison. `eof` prefers matching at end-of-file.
 fn seek_sequence(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Option<usize> {
     if pattern.is_empty() {

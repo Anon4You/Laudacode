@@ -19,7 +19,7 @@ pub struct Provider {
     pub reasoning_effort: Option<String>,
 }
 
-/// Named preset of defaults, activated with `--profile <name>` (codex-style).
+/// Named preset of defaults, activated with `--profile <name>`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]

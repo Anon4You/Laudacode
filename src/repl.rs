@@ -152,7 +152,7 @@ impl UiSink for TermUi {
 }
 
 // ---------------------------------------------------------------------------
-// Agent worker thread (codex-style: UI never blocks on the agent)
+// Agent worker thread (the UI never blocks on the agent)
 // ---------------------------------------------------------------------------
 
 /// Events flowing from the worker thread to the TUI.
@@ -166,6 +166,9 @@ pub enum WorkerEvent {
     Error(String),
     /// Conversation was replaced (resume) — TUI must clear its transcript.
     Reload(String),
+    /// Final state sent right before the worker exits, so the shell
+    /// goodbye can offer an exact `--resume <id>` command.
+    SessionSummary { id: String, messages: usize },
     /// Generic picker: model lists, resume lists, approval modes…
     Pick { title: String, items: Vec<String> },
 }
@@ -266,7 +269,15 @@ fn worker_main(
 
     for cmd in cmd_rx {
         match cmd {
-            WorkerCmd::Quit => break,
+            WorkerCmd::Quit => {
+                // Flush state and tell the host how to resume this session.
+                app.persist();
+                let _ = ev_tx.send(WorkerEvent::SessionSummary {
+                    id: app.session.id.clone(),
+                    messages: app.agent.messages.iter().filter(|m| m.role != "system").count(),
+                });
+                break;
+            }
             WorkerCmd::Submit(text) => {
                 if let Some(memory) = text.strip_prefix('#') {
                     match add_memory(&app.cwd, memory) {
@@ -698,12 +709,18 @@ pub struct App {
     pub pending_images: Vec<String>,
 }
 
+/// Summary of a finished TUI session, used for the exit resume hint.
+pub struct SessionExit {
+    pub id: String,
+    pub messages: usize,
+}
+
 impl App {
     /// True when no provider is usable yet (fresh install, no config).
     pub fn needs_onboarding(&self) -> bool {
         self.active.api_key.is_empty()
             || self.active.base_url.is_empty()
-            || self.config.providers.is_empty() && self.active.name == "default"
+            || (self.config.providers.is_empty() && self.active.name == "default")
     }
 
     // -----------------------------------------------------------------------
@@ -713,16 +730,22 @@ impl App {
     /// Run the interactive full-screen TUI until the user quits.
     ///
     /// Sync on purpose: the TUI event loop owns the terminal, and all agent
-    /// work happens on the worker thread (`spawn_worker`).
-    pub fn run_tui(self) -> Result<()> {
+    /// work happens on the worker thread (`spawn_worker`). Returns the final
+    /// session identity so the shell can print an exact `--resume` hint.
+    pub fn run_tui(self) -> Result<SessionExit> {
         tuiapp::enter_tui()?;
         let res = self.tui_main();
         tuiapp::leave_tui();
         res
     }
 
-    fn tui_main(self) -> Result<()> {
+    fn tui_main(self) -> Result<SessionExit> {
+        let initial_id = self.session.id.clone();
         let mut tui = Tui::new();
+        // Keep UI and agent in lock-step from frame one: without this the
+        // composer claimed BUILD while the agent still enforced read-only
+        // PLAN rules (the agent's default is Suggest, the widget's was Build).
+        tui.mode = tui_mode_of(self.agent.mode);
         tui.set_usage(0, self.ctx_window);
         // Seed the @-mention list from the project tree.
         {
@@ -752,46 +775,58 @@ impl App {
             String::new()
         };
         tui.push(Entry::Info(format!(
-            "LaudaCode ready — model {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
-            self.active.model, config_note
+            "LaudaCode ready — model {} · mode {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
+            self.active.model,
+            tui.mode.label(),
+            config_note
         )));
         let subtitle = format!("· {}", self.active.name);
 
         let worker = spawn_worker(self);
+        // The UI closure takes ownership of the command/approve handles; the
+        // event stream is shared (Arc) so we can also catch the worker's
+        // final summary after the loop ends.
+        let events = Arc::new(std::sync::Mutex::new(worker.events));
+        let wait_events = Arc::clone(&events);
+        // Clone the channel handles for the closure — `worker` itself keeps
+        // nothing else we need here.
+        let ui_cmd = worker.cmd.clone();
+        let ui_approve = worker.approve.clone();
+        let ui_cancel = Arc::clone(&worker.cancel);
 
         let keep_going = tuiapp::run_tui(&mut tui, subtitle, move |tui, action| {
             // Drain everything the worker produced since the last tick.
-            while let Ok(ev) = worker.events.try_recv() {
+            while let Ok(ev) = events.lock().unwrap().try_recv() {
                 apply_worker_event(tui, ev);
             }
 
             match action {
                 KeyAction::Quit => {
-                    let _ = worker.approve.send(false); // unblock a pending approval
-                    let _ = worker.cmd.send(WorkerCmd::Quit);
+                    let _ = ui_approve.send(false); // unblock a pending approval
+                    let _ = ui_cmd.send(WorkerCmd::Quit);
                     return false;
                 }
-                KeyAction::CycleMode => cycle_mode(tui, &worker),
+                KeyAction::CycleMode => cycle_mode(tui, &ui_cmd),
                 KeyAction::ToggleBanner => {
                     tui.toggle_banner();
                     let state = if tui.banner_visible() { "shown" } else { "hidden" };
                     tui.set_status(format!("banner {state} — Ctrl+B to toggle"));
                 }
                 KeyAction::Approve(answer) => {
-                    let _ = worker.approve.send(answer);
+                    let _ = ui_approve.send(answer);
                 }
                 KeyAction::ApproveAlways => {
-                    // Codex "always allow": approve now + flip to FULL AUTO.
+                    // "Always allow": approve now + flip to FULL AUTO.
                     tui.mode = tuiapp::Mode::FullAuto;
-                    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::FullAuto));
+                    let _ = ui_cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::FullAuto));
                     tui.push(Entry::Info(
                         "approved — approval mode set to FULL AUTO for this session".into(),
                     ));
-                    let _ = worker.approve.send(true);
+                    let _ = ui_approve.send(true);
                 }
                 KeyAction::Interrupt => {
                     if tui.is_busy() {
-                        worker.cancel.store(true, Ordering::Relaxed);
+                        ui_cancel.store(true, Ordering::Relaxed);
                         tui.set_status("interrupting…");
                     }
                 }
@@ -799,22 +834,22 @@ impl App {
                     // Picker selections arrive as "title:value".
                     if let Some(model) = sel.strip_prefix("model:") {
                         tui.set_status("switching model");
-                        let _ = worker.cmd.send(WorkerCmd::SetModel(model.to_string()));
+                        let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
                     } else if let Some(resume_id) = sel.strip_prefix("resume:") {
                         let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
                         tui.set_status("restoring session");
-                        let _ = worker.cmd.send(WorkerCmd::ResumeSession(real));
+                        let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
                     } else if let Some(image) = sel.strip_prefix("image:") {
-                        let _ = worker.cmd.send(WorkerCmd::QueueImage(image.to_string()));
+                        let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
                     } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
-                        apply_mode_by_label(tui, &worker, mode_label);
+                        apply_mode_by_label(tui, &ui_cmd, mode_label);
                     }
                 }
                 KeyAction::Submit(text) => {
                     if text.starts_with('/') {
-                        if !handle_slash(tui, &worker, &text) {
-                            let _ = worker.approve.send(false); // unblock pending approval
-                            let _ = worker.cmd.send(WorkerCmd::Quit);
+                        if !handle_slash(tui, &ui_cmd, &text) {
+                            let _ = ui_approve.send(false); // unblock pending approval
+                            let _ = ui_cmd.send(WorkerCmd::Quit);
                             return false;
                         }
                     } else if tui.is_busy() && !text.starts_with('#') && !text.starts_with('!') {
@@ -828,7 +863,7 @@ impl App {
                             tui.push(Entry::User(text.clone()));
                         }
                         tui.set_status("thinking");
-                        let _ = worker.cmd.send(WorkerCmd::Submit(text));
+                        let _ = ui_cmd.send(WorkerCmd::Submit(text));
                     }
                 }
                 KeyAction::None => {}
@@ -839,7 +874,26 @@ impl App {
         if keep_going.is_err() {
             return Err(anyhow::anyhow!("tui loop failed"));
         }
-        Ok(())
+
+        // The worker sends its final state right before exiting — give it a
+        // moment so the shell goodbye can offer an exact resume command.
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut exit_id = initial_id;
+        let mut exit_messages = 0usize;
+        while std::time::Instant::now() < deadline {
+            match wait_events.lock().unwrap().recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(WorkerEvent::SessionSummary { id, messages }) => {
+                    exit_id = id;
+                    exit_messages = messages;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(_) => break, // worker gone without a summary
+            }
+        }
+        Ok(SessionExit { id: exit_id, messages: exit_messages })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -971,12 +1025,24 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
             tui.entries.clear();
             tui.push(Entry::Info(s));
         }
+        // Consumed by tui_main after the loop ends; never reaches the UI.
+        WorkerEvent::SessionSummary { .. } => {}
         WorkerEvent::Pick { title, items } => tui.open_picker(title, items),
     }
 }
 
+/// Map the agent's approval policy to the TUI mode chip (inverse of
+/// `ApprovalMode::from_tui_mode`).
+fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
+    match mode {
+        ApprovalMode::Suggest => tuiapp::Mode::Plan,
+        ApprovalMode::AutoEdit => tuiapp::Mode::Build,
+        ApprovalMode::FullAuto => tuiapp::Mode::FullAuto,
+    }
+}
+
 /// Cycle PLAN → BUILD → FULL AUTO and inform the worker.
-fn cycle_mode(tui: &mut Tui, worker: &WorkerHandle) {
+fn cycle_mode(tui: &mut Tui, cmd: &Sender<WorkerCmd>) {
     tui.mode = tui.mode.next();
     let label = match tui.mode {
         tuiapp::Mode::Plan => "PLAN — read-only exploration, no edits",
@@ -985,11 +1051,11 @@ fn cycle_mode(tui: &mut Tui, worker: &WorkerHandle) {
     };
     tui.set_status(label);
     tui.push(Entry::Info(format!("switched to {}", tui.mode.label())));
-    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(tui.mode)));
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(tui.mode)));
 }
 
 /// Apply a mode chosen from the /approvals picker.
-fn apply_mode_by_label(tui: &mut Tui, worker: &WorkerHandle, label: &str) {
+fn apply_mode_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
     let mode = match label.to_lowercase().as_str() {
         "plan (read-only)" | "plan" => tuiapp::Mode::Plan,
         "build (auto-edit)" | "build" => tuiapp::Mode::Build,
@@ -997,16 +1063,16 @@ fn apply_mode_by_label(tui: &mut Tui, worker: &WorkerHandle, label: &str) {
         _ => return,
     };
     tui.mode = mode;
-    let _ = worker.cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(mode)));
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(mode)));
     tui.push(Entry::Info(format!("approval mode set to {}", mode.label())));
 }
 
 /// Slash-command dispatch inside the TUI — forwards to the worker./// Returns false when the loop should quit.
-fn handle_slash(tui: &mut Tui, worker: &WorkerHandle, line: &str) -> bool {
+fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
     let mut parts = line.split_whitespace();
-    let cmd = parts.next().unwrap_or("").trim_start_matches('/').to_lowercase();
+    let name = parts.next().unwrap_or("").trim_start_matches('/').to_lowercase();
     let arg: Vec<&str> = parts.collect();
-    match cmd.as_str() {
+    match name.as_str() {
         "help" => {
             tui.push(Entry::Info(
                 "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
@@ -1045,10 +1111,10 @@ fn handle_slash(tui: &mut Tui, worker: &WorkerHandle, line: &str) -> bool {
         }
         "compact" => {
             tui.set_status("compacting");
-            let _ = worker.cmd.send(WorkerCmd::Compact);
+            let _ = cmd.send(WorkerCmd::Compact);
         }
         "clear" | "new" => {
-            let _ = worker.cmd.send(WorkerCmd::Clear);
+            let _ = cmd.send(WorkerCmd::Clear);
             tui.entries.clear();
             tui.push(Entry::Info("conversation cleared".into()));
         }
@@ -1058,14 +1124,14 @@ fn handle_slash(tui: &mut Tui, worker: &WorkerHandle, line: &str) -> bool {
         }
         "provider" => match arg.first().copied().unwrap_or("list") {
             "list" | "ls" => {
-                let _ = worker.cmd.send(WorkerCmd::ListProviders);
+                let _ = cmd.send(WorkerCmd::ListProviders);
             }
             "show" | "status" => {
-                let _ = worker.cmd.send(WorkerCmd::ShowProvider);
+                let _ = cmd.send(WorkerCmd::ShowProvider);
             }
             "use" => match arg.get(1) {
                 Some(name) => {
-                    let _ = worker.cmd.send(WorkerCmd::UseProvider((*name).to_string()));
+                    let _ = cmd.send(WorkerCmd::UseProvider((*name).to_string()));
                 }
                 None => tui.push(Entry::Error("usage: /provider use <name>".into())),
             },
@@ -1078,35 +1144,35 @@ fn handle_slash(tui: &mut Tui, worker: &WorkerHandle, line: &str) -> bool {
         },
         "model" => {
             tui.set_status("fetching models");
-            let _ = worker.cmd.send(WorkerCmd::ListModels);
+            let _ = cmd.send(WorkerCmd::ListModels);
         }
         "retry" => {
             tui.set_status("retrying");
-            let _ = worker.cmd.send(WorkerCmd::Retry);
+            let _ = cmd.send(WorkerCmd::Retry);
         }
         "resume" | "continue" => {
             tui.set_status("loading sessions");
-            let _ = worker.cmd.send(WorkerCmd::ListSessions);
+            let _ = cmd.send(WorkerCmd::ListSessions);
         }
         "image" => match arg.first() {
             Some(path) => {
-                let _ = worker.cmd.send(WorkerCmd::QueueImage((*path).to_string()));
+                let _ = cmd.send(WorkerCmd::QueueImage((*path).to_string()));
             }
             None => tui.push(Entry::Error("usage: /image <path/to/file.png>".into())),
         },
         "export" => {
-            let _ = worker.cmd.send(WorkerCmd::Export);
+            let _ = cmd.send(WorkerCmd::Export);
         }
         "init" => {
-            let _ = worker.cmd.send(WorkerCmd::InitAgentsMd);
+            let _ = cmd.send(WorkerCmd::InitAgentsMd);
         }
         "status" => {
             tui.set_status("gathering status");
-            let _ = worker.cmd.send(WorkerCmd::Status);
+            let _ = cmd.send(WorkerCmd::Status);
         }
         "diff" => {
             tui.set_status("computing diff");
-            let _ = worker.cmd.send(WorkerCmd::Diff);
+            let _ = cmd.send(WorkerCmd::Diff);
         }
         other => {
             tui.push(Entry::Error(format!("unknown command '/{other}' — try /help")));
@@ -1147,7 +1213,7 @@ pub fn print_banner() {
     println!(
         "{}",
         format!(
-            " LaudaCode v{} — codex-class AI agent, pure Rust",
+            " LaudaCode v{} — AI coding agent for your terminal",
             env!("CARGO_PKG_VERSION")
         )
         .dark_grey()
