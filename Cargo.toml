@@ -1,0 +1,36 @@
+[package]
+name = "laudacode"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Anon4You"]
+description = "Laudacode — a fast, lightweight AI coding agent for your terminal. Pure Rust, built for Termux."
+repository = "https://github.com/Anon4You/Laudacode"
+license = "MIT"
+readme = "README.md"
+keywords = ["ai", "agent", "cli", "llm", "termux"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "laudacode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
+crossterm = "0.28"
+dirs = "5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

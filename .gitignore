@@ -1,0 +1,11 @@
+/target
+Cargo.lock.orig
+*.swp
+*.swo
+.DS_Store
+.env
+.env.*
+!.env.example
+config.toml
+config.json
+*.log

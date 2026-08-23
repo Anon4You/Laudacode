@@ -1,0 +1,40 @@
+# Laudacode example configuration
+# Copy to ~/.config/laudacode/config.toml and edit.
+# Environment variables (OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL)
+# override the active provider's values.
+
+# Which provider to use by default
+active_provider = "openrouter"
+
+# Default approval mode: suggest | auto-edit | full-auto
+approval_mode = "suggest"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key  = "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "stealth/ox-alpha"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "gpt-4o-mini"
+
+[providers.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key  = "gsk_xxxxxxxxxxxxxxxx"
+model    = "llama-3.3-70b-versatile"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxx"
+model    = "deepseek-chat"
+
+[providers.ollama]
+base_url = "http://localhost:11434/v1"
+api_key  = "ollama"
+model    = "qwen2.5-coder:7b"
+
+# Custom headers per provider (e.g. OpenRouter ranking headers):
+# [providers.openrouter.headers]
+# "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"
+# "X-Title"      = "Laudacode"
