@@ -44,6 +44,8 @@ pub enum AgentEvent {
     ToolStart { name: String, summary: String },
     /// A tool finished; `preview` carries a short excerpt of its output.
     ToolDone { name: String, ok: bool, preview: String },
+    /// A tool mutated files — UI renders these as colored diffs.
+    ToolEdit { name: String, files: Vec<crate::diff::FileDiff> },
     /// Token usage from the last request.
     Usage(Usage),
     /// The agent wrote a fresh todo list.
@@ -55,6 +57,9 @@ pub trait UiSink {
     fn on_event(&mut self, ev: AgentEvent);
     /// Ask the user to approve an action. Blocks until answered. Return true to proceed.
     fn approve(&mut self, action: &tools::Action, danger: tools::Danger) -> bool;
+    /// A separate sink for one concurrent sub-agent; events are tagged with
+    /// `prefix` so the transcript can attribute them.
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink>;
 }
 
 const MAX_TOOL_ROUNDS: usize = 30;
@@ -112,7 +117,10 @@ Rules:
 5. Keep responses concise. Use short markdown. Code blocks must specify the language.
 6. When you finish a task, summarize what changed in 1-3 bullet points.
 7. If something fails, read the error output and iterate until fixed.
-8. Do not invent APIs or libraries that are not already used by the project."#,
+8. Do not invent APIs or libraries that are not already used by the project.
+
+Team:
+You can delegate to specialist sub-agents with the delegate tool: planner, researcher, coder, reviewer, tester (see tool schema). Use it when work splits into independent chunks — e.g. research two areas at once, or have reviewer check your change while tester runs the suite. Give each task precise, self-contained instructions. Do NOT delegate trivial one-file tweaks — just do them directly."#,
             cwd = cwd.display(),
             os = std::env::consts::OS,
             date = chrono_today(),
@@ -180,11 +188,53 @@ Rules:
     }
 
     fn toolset_for_mode(&self) -> Vec<crate::api::ToolDef> {
-        match self.mode {
+        let mut defs = match self.mode {
             // Plan mode exposes only read-only tools; writes are impossible.
             ApprovalMode::Suggest => tools::plan_tool_defs(),
             _ => tools::tool_defs(),
+        };
+        // The orchestrator can always call specialists (Plan mode gets the
+        // read-only subset via the schema enum).
+        defs.push(crate::agents::delegate_tool_def(self.mode == ApprovalMode::Suggest));
+        defs
+    }
+
+    /// Fan a delegate call out to its specialists concurrently and collect
+    /// their reports into one tool result.
+    async fn execute_delegate(&mut self, arguments: &str, ui: &mut dyn UiSink) -> String {
+        let tasks = match crate::agents::parse_delegate_args(arguments) {
+            Ok(t) => t,
+            Err(e) => return format!("Error parsing delegate call: {e:#}"),
+        };
+        if self.mode == ApprovalMode::Suggest {
+            for (name, _) in &tasks {
+                let ro = crate::agents::get(name).map(|s| s.read_only).unwrap_or(false);
+                if !ro {
+                    return format!(
+                        "Blocked: '{name}' can mutate files — switch to BUILD to delegate it."
+                    );
+                }
+            }
         }
+        let cwd = self.cwd.clone();
+        let mode = self.mode;
+        let client = self.client.clone();
+        let model = self.model.clone();
+
+        let futures = tasks.into_iter().map(|(name, task)| {
+            let sink = ui.fork(&format!("[{name}]"));
+            let client = client.clone();
+            let model = model.clone();
+            let cwd = cwd.clone();
+            async move {
+                crate::agents::run_sub_agent(
+                    &client, &model, &cwd, mode, &name, &task, sink,
+                )
+                .await
+            }
+        });
+        let results = futures_util::future::join_all(futures).await;
+        results.join("\n\n")
     }
 
     /// Run one full agent turn: user input -> (tool calls)* -> final answer.
@@ -284,6 +334,10 @@ Rules:
     }
 
     async fn execute_call(&mut self, tc: &ToolCall, ui: &mut dyn UiSink) -> String {
+        // Orchestration tool — handled before the regular action pipeline.
+        if tc.function.name == "delegate" {
+            return self.execute_delegate(&tc.function.arguments, ui).await;
+        }
         let action = match tools::parse_tool_action(&tc.function.name, &tc.function.arguments) {
             Ok(a) => a,
             Err(e) => return format!("Error parsing tool call: {e}"),
@@ -323,8 +377,12 @@ Rules:
             ui.on_event(AgentEvent::Todo(todos.clone()));
         }
 
-        match action.perform(&self.cwd).await {
-            Ok(out) => {
+        match action.perform_with_diff(&self.cwd).await {
+            Ok((out, files)) => {
+                // Surface colored diffs for any mutated files first.
+                if !files.is_empty() {
+                    ui.on_event(AgentEvent::ToolEdit { name: name.clone(), files });
+                }
                 let preview: String = out
                     .lines()
                     .filter(|l| !l.trim().is_empty())

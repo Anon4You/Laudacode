@@ -79,6 +79,8 @@ pub enum Entry {
     Reasoning(String),
     ToolCall { name: String, summary: String },
     ToolResult { name: String, ok: bool, preview: String },
+    /// A tool mutated files — rendered as colored unified diffs.
+    ToolDiff { name: String, files: Vec<crate::diff::FileDiff> },
     Info(String),
     Error(String),
 }
@@ -440,6 +442,10 @@ impl Tui {
             | Entry::Error(t) => t.len(),
             Entry::ToolCall { name, summary } => name.len() + summary.len(),
             Entry::ToolResult { name, preview, .. } => name.len() + preview.len(),
+            Entry::ToolDiff { name, files } => {
+                name.len()
+                    + files.iter().map(|f| f.path.len() + f.lines.iter().map(|l| l.text.len()).sum::<usize>()).sum::<usize>()
+            }
         }
     }
 
@@ -481,6 +487,50 @@ impl Tui {
                         format!("  {l}"),
                         Style::default().fg(Color::Gray),
                     )));
+                }
+                lines
+            }
+            Entry::ToolDiff { name, files } => {
+                use crate::diff::LineKind;
+                let total_add: usize = files.iter().map(|f| f.added).sum();
+                let total_del: usize = files.iter().map(|f| f.removed).sum();
+                let mut lines = vec![Line::from(vec![
+                    Span::styled("✎ ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        name.clone(),
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  +{total_add} −{total_del}"),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])];
+                for f in files {
+                    if f.is_empty() {
+                        continue;
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("┌─ ", Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("{} (+{} −{})", f.path, f.added, f.removed),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    for dl in &f.lines {
+                        // Hard-wrap long diff rows so phones don't scroll sideways.
+                        for seg in wrap_text(&dl.text, width.saturating_sub(4) as usize) {
+                            let style = match dl.kind {
+                                LineKind::Add => Style::default().fg(Color::Green),
+                                LineKind::Del => Style::default().fg(Color::Red),
+                                LineKind::Meta => {
+                                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC)
+                                }
+                                LineKind::Ctx => Style::default().fg(Color::DarkGray),
+                            };
+                            lines.push(Line::from(Span::styled(format!("│{seg}"), style)));
+                        }
+                    }
+                    lines.push(Line::from(Span::styled("└─", Style::default().fg(Color::Cyan))));
                 }
                 lines
             }
@@ -817,6 +867,12 @@ impl Tui {
                             Style::default().fg(Color::Gray),
                         )));
                     }
+                    lines.push(Line::from(Span::raw(String::new())));
+                }
+                Entry::ToolDiff { .. } => {
+                    // Full colored rendering reuses the transcript pipeline.
+                    let w = area.width.saturating_sub(2).max(20);
+                    lines.extend(Self::entry_lines(e, w));
                     lines.push(Line::from(Span::raw(String::new())));
                 }
                 _ => {}
@@ -1556,6 +1612,35 @@ mod tests {
         t.entries.clear();
         t.ensure_render_cache(40);
         assert!(t.cached_lines.is_empty());
+    }
+
+    #[test]
+    fn tool_diffs_render_in_color() {
+        use crate::diff::{unified_diff, LineKind};
+        let d = unified_diff("src/lib.rs", "a\nb\n", "a\nc\n", 1);
+        let mut t = Tui::new();
+        t.push(Entry::ToolDiff { name: "edit_file".into(), files: vec![d] });
+        let lines = line_texts(&t, 60);
+        let joined = lines.join("\n");
+        assert!(joined.contains("✎ edit_file"), "{joined}");
+        assert!(joined.contains("┌─ src/lib.rs (+1 −1)"), "{joined}");
+        assert!(joined.contains("│-b"), "{joined}");
+        assert!(joined.contains("│+c"), "{joined}");
+        // Colors are attached to the right kinds.
+        let mut probe = clone_shallow(&t);
+        probe.ensure_render_cache(60);
+        let add_span = probe
+            .cached_lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "│+c"))
+            .unwrap();
+        assert_eq!(add_span.spans[0].style.fg, Some(Color::Green));
+        let del_span = probe
+            .cached_lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content == "│-b"))
+            .unwrap();
+        assert_eq!(del_span.spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]

@@ -293,8 +293,80 @@ impl Action {
         }
     }
 
-    /// Execute the action inside `cwd`, returning output for the model.
-    pub async fn perform(&self, cwd: &Path) -> Result<String> {
+    /// Execute the action inside `cwd`, returning output plus unified diffs
+    /// of any files this action mutated (empty for read-only actions).
+    pub async fn perform_with_diff(
+        &self,
+        cwd: &Path,
+    ) -> Result<(String, Vec<crate::diff::FileDiff>)> {
+        match self {
+            // Mutating: capture pre-image → mutate → diff.
+            Action::WriteFile { path, content } => {
+                let p = resolve_in(cwd, path)?;
+                let old = std::fs::read_to_string(&p).unwrap_or_default();
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                std::fs::write(&p, content.as_bytes())
+                    .with_context(|| format!("writing {}", p.display()))?;
+                let diff = crate::diff::unified_diff(path, &old, content, 3);
+                Ok((
+                    format!("wrote {} ({} bytes)", p.display(), content.len()),
+                    if diff.is_empty() { vec![] } else { vec![diff] },
+                ))
+            }
+            Action::EditFile { path, old, new } => {
+                let p = resolve_in(cwd, path)?;
+                let raw = std::fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?;
+                let count = raw.matches(old.as_str()).count();
+                match count {
+                    0 => bail!("pattern not found in {}. Nothing changed.", p.display()),
+                    1 => {}
+                    n => bail!(
+                        "pattern appears {n} times in {}; refusing ambiguous edit. \
+                         Provide more surrounding context.",
+                        p.display()
+                    ),
+                }
+                let updated = raw.replacen(old.as_str(), new.as_str(), 1);
+                std::fs::write(&p, updated.as_bytes())
+                    .with_context(|| format!("writing {}", p.display()))?;
+                let diff = crate::diff::unified_diff(path, &raw, &updated, 3);
+                Ok((
+                    format!("edited {} (-{} +{} lines)",
+                        p.display(), old.lines().count(), new.lines().count()),
+                    if diff.is_empty() { vec![] } else { vec![diff] },
+                ))
+            }
+            Action::ApplyPatch { patch } => {
+                let hunks = crate::patch::parse_patch(patch)?;
+                // Plan mode already blocks non-read-only actions; this extra
+                // guard keeps outside-workspace hunks from sneaking through
+                // when the caller skipped danger classification.
+                for h in &hunks {
+                    let target = resolve_in(cwd, h.classify_path().to_string_lossy().as_ref())?;
+                    if !contained_in_workspace_path(cwd, &target) {
+                        bail!(
+                            "patch touches '{}' which is outside the workspace — refused",
+                            h.classify_path().display()
+                        );
+                    }
+                }
+                let applied = crate::patch::apply_hunks(cwd, &hunks)?;
+                Ok((applied.summary, applied.files))
+            }
+            // Everything else has no file mutation — reuse plain perform().
+            other => {
+                let out = Self::perform_plain(other, cwd).await?;
+                Ok((out, Vec::new()))
+            }
+        }
+    }
+
+    /// The original read-only/command paths (no diff capture).
+    async fn perform_plain(&self, cwd: &Path) -> Result<String> {
         match self {
             Action::ListDir { path } => {
                 let root = resolve_in(cwd, path)?;
@@ -366,53 +438,12 @@ impl Action {
                 }
                 Ok(out)
             }
-            Action::WriteFile { path, content } => {
-                let p = resolve_in(cwd, path)?;
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("creating {}", parent.display()))?;
-                }
-                std::fs::write(&p, content.as_bytes())
-                    .with_context(|| format!("writing {}", p.display()))?;
-                Ok(format!("wrote {} ({} bytes)", p.display(), content.len()))
-            }
-            Action::EditFile { path, old, new } => {
-                let p = resolve_in(cwd, path)?;
-                let raw = std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?;
-                let count = raw.matches(old.as_str()).count();
-                match count {
-                    0 => bail!("pattern not found in {}. Nothing changed.", p.display()),
-                    1 => {}
-                    n => bail!(
-                        "pattern appears {n} times in {}; refusing ambiguous edit. \
-                         Provide more surrounding context.",
-                        p.display()
-                    ),
-                }
-                let updated = raw.replacen(old.as_str(), new.as_str(), 1);
-                std::fs::write(&p, updated.as_bytes())
-                    .with_context(|| format!("writing {}", p.display()))?;
-                Ok(format!("edited {} (-{} +{} lines)",
-                    p.display(), old.lines().count(), new.lines().count()))
+            // Mutating actions never reach perform_plain — perform_with_diff
+            // handles them (with diff capture) and routes only the rest here.
+            Action::WriteFile { .. } | Action::EditFile { .. } | Action::ApplyPatch { .. } => {
+                unreachable!("mutating actions are intercepted by perform_with_diff")
             }
             Action::RunCommand { command } => run_shell(command, cwd).await,
-            Action::ApplyPatch { patch } => {
-                let hunks = crate::patch::parse_patch(patch)?;
-                // Plan mode already blocks non-read-only actions; this extra
-                // guard keeps outside-workspace hunks from sneaking through
-                // when the caller skipped danger classification.
-                for h in &hunks {
-                    let target = resolve_in(cwd, h.classify_path().to_string_lossy().as_ref())?;
-                    if !contained_in_workspace_path(cwd, &target) {
-                        bail!(
-                            "patch touches '{}' which is outside the workspace — refused",
-                            h.classify_path().display()
-                        );
-                    }
-                }
-                crate::patch::apply_hunks(cwd, &hunks)
-            }
             Action::FetchUrl { url } => fetch_url(url).await,
             Action::Grep { pattern, path, ignore_case } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
@@ -1261,13 +1292,15 @@ mod tests {
         }
     }
 
-    /// Drive the async perform() from a sync test (pure fs work, no awaits
-    /// actually suspend).
+    /// Drive the async perform_with_diff() from a sync test (pure fs work, no
+    /// awaits actually suspend).
     fn perform_sync(action: Action, cwd: &Path) -> String {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
-        rt.block_on(action.perform(cwd)).expect("perform should succeed")
+        rt.block_on(action.perform_with_diff(cwd))
+            .expect("perform should succeed")
+            .0
     }
 
     #[test]

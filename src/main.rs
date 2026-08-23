@@ -1,7 +1,9 @@
 mod agent;
+mod agents;
 mod api;
 mod cli;
 mod config;
+mod diff;
 mod markdown;
 mod patch;
 mod repl;

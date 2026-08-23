@@ -38,6 +38,8 @@ laudacode exec "list the files in this directory"
 | `src/api.rs`     | OpenAI-compatible chat client, SSE streaming, tool-call accumulation, vision multipart messages |
 | `src/agent.rs`   | agent loop (LLM ↔ tools), approval modes, system prompt, /compact     |
 | `src/tools.rs`   | tool schemas + execution: list_dir, read_file, write_file, edit_file, apply_patch, run_command, fetch_url, grep, glob, update_plan |
+| `src/diff.rs`    | dependency-free unified-diff engine (colored edit previews everywhere) |
+| `src/agents.rs`  | specialist sub-agent registry (`delegate` tool) + concurrent sub-agent runner |
 | `src/patch.rs`   | V4A patch parser/applier (`*** Begin Patch` format)                   |
 | `src/session.rs` | conversation persistence (~/.local/share/laudacode/sessions), resume by unique id |
 | `src/repl.rs`    | interactive REPL, slash commands, streaming UI, provider flows        |

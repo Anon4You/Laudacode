@@ -320,10 +320,11 @@ fn apply_update(cwd: &Path, path: &Path, move_path: &Option<PathBuf>, chunks: &[
     Ok(out)
 }
 
-/// Apply parsed hunks under `cwd`. Returns a human-readable summary.
-/// Per-file failures abort remaining hunks for that file but report progress.
-pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<String> {
+/// Apply parsed hunks under `cwd`. Returns a human-readable summary plus a
+/// per-file unified diff so the UI can render colored edits.
+pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
     let mut changed: Vec<String> = Vec::new();
+    let mut files: Vec<crate::diff::FileDiff> = Vec::new();
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
@@ -334,27 +335,55 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<String> {
                 }
                 std::fs::write(&abs, contents.as_bytes())
                     .with_context(|| format!("writing {}", abs.display()))?;
+                files.push(crate::diff::unified_diff(
+                    &path.display().to_string(),
+                    "",
+                    contents,
+                    3,
+                ));
                 changed.push(hunk.describe());
             }
             Hunk::DeleteFile { path } => {
                 let abs = cwd.join(path);
-                if !abs.exists() {
-                    bail!("Failed to delete {}: does not exist", abs.display());
-                }
+                let old = std::fs::read_to_string(&abs)
+                    .with_context(|| format!("reading {}", abs.display()))?;
                 std::fs::remove_file(&abs)
                     .with_context(|| format!("deleting {}", abs.display()))?;
+                files.push(crate::diff::unified_diff(
+                    &path.display().to_string(),
+                    &old,
+                    "",
+                    3,
+                ));
                 changed.push(hunk.describe());
             }
             Hunk::UpdateFile { path, move_path, chunks } => {
-                apply_update(cwd, path, move_path, chunks)?;
+                // Snapshot the pre-image BEFORE mutating for the diff.
+                let old = std::fs::read_to_string(cwd.join(path)).unwrap_or_default();
+                let new_contents = apply_update(cwd, path, move_path, chunks)?;
+                let display = move_path
+                    .as_ref()
+                    .map(|m| format!("{} -> {}", path.display(), m.display()))
+                    .unwrap_or_else(|| path.display().to_string());
+                files.push(crate::diff::unified_diff(&display, &old, &new_contents, 3));
                 changed.push(hunk.describe());
             }
         }
     }
-    Ok(format!(
-        "Success. Updated the following files:\n{}",
-        changed.iter().map(|d| format!("M {d}")).collect::<Vec<_>>().join("\n")
-    ))
+    Ok(AppliedPatch {
+        summary: format!(
+            "Success. Updated the following files:\n{}",
+            changed.iter().map(|d| format!("M {d}")).collect::<Vec<_>>().join("\n")
+        ),
+        files,
+    })
+}
+
+/// Result of applying a whole patch: text summary for the model + diffs for the UI.
+#[derive(Debug, Clone)]
+pub struct AppliedPatch {
+    pub summary: String,
+    pub files: Vec<crate::diff::FileDiff>,
 }
 
 #[cfg(test)]
@@ -415,7 +444,8 @@ mod tests {
         // Two separate UpdateFile hunks for the same file — supported sequentially.
         let hunks = parse_patch(p).unwrap();
         let out = apply_hunks(&dir, &hunks).unwrap();
-        assert!(out.contains("Success"), "{out}");
+        assert!(out.summary.contains("Success"), "{}", out.summary);
+        assert_eq!(out.files.len(), 2, "one diff per update hunk");
         let text = std::fs::read_to_string(dir.join("src/a.rs")).unwrap();
         assert!(text.contains("\"patched\""), "{text}");
         assert!(text.contains("42"), "{text}");

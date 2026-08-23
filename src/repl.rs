@@ -63,6 +63,10 @@ impl UiSink for TermUi {
                     let obj = serde_json::json!({ "type": "tool_done", "tool": name, "ok": ok, "preview": preview });
                     println!("{obj}");
                 }
+                AgentEvent::ToolEdit { name, files } => {
+                    let obj = serde_json::json!({ "type": "tool_edit", "tool": name, "files": files });
+                    println!("{obj}");
+                }
                 AgentEvent::Usage(u) => {
                     let obj = serde_json::json!({
                         "type": "usage",
@@ -105,6 +109,29 @@ impl UiSink for TermUi {
                 println!("{}", format!("· {name}: {summary}").dark_grey());
                 let _ = std::io::stdout().flush();
             }
+            AgentEvent::ToolEdit { name, files } => {
+                use crossterm::style::{Color as CT, Stylize as _};
+                for f in &files {
+                    println!(
+                        "{}",
+                        format!("┌─ {} (+{} −{})", f.path, f.added, f.removed)
+                            .with(CT::Cyan)
+                            .bold()
+                    );
+                    for l in &f.lines {
+                        let line = match l.kind {
+                            crate::diff::LineKind::Add => l.text.clone().with(CT::Green),
+                            crate::diff::LineKind::Del => l.text.clone().with(CT::Red),
+                            crate::diff::LineKind::Meta => format!("  {text}", text = l.text).with(CT::Blue).italic(),
+                            crate::diff::LineKind::Ctx => l.text.clone().dark_grey().to_string().dark_grey(),
+                        };
+                        println!("│{line}");
+                    }
+                    println!("{}", "└─".with(CT::Cyan));
+                }
+                let _ = name; // header already shows the tool via ToolStart
+                let _ = std::io::stdout().flush();
+            }
             AgentEvent::ToolDone { ok: false, .. } => {
                 println!("{}", "✗ failed".red().bold());
                 let _ = std::io::stdout().flush();
@@ -112,6 +139,10 @@ impl UiSink for TermUi {
             AgentEvent::ToolDone { ok: true, .. } => {}
             _ => {}
         }
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(TermSubUi { prefix: prefix.to_string() })
     }
 
     fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
@@ -151,6 +182,58 @@ impl UiSink for TermUi {
     }
 }
 
+/// Plain-text sink for one sub-agent in exec mode — prefixes every event so
+/// concurrent specialists stay attributable on a dumb terminal.
+struct TermSubUi {
+    prefix: String,
+}
+
+impl UiSink for TermSubUi {
+    fn on_event(&mut self, ev: AgentEvent) {
+        match ev {
+            AgentEvent::Content(d) => print!("{}{d}", format!("{} ", self.prefix).dark_grey()),
+            AgentEvent::ToolStart { name, summary } => {
+                println!("{}", format!("· {prefix}{name}: {summary}", prefix = self.prefix).dark_grey());
+            }
+            AgentEvent::ToolEdit { files, .. } => {
+                use crossterm::style::{Color as CT, Stylize as _};
+                for f in &files {
+                    println!(
+                        "{}",
+                        format!("┌─ [{p}] {path} (+{a} −{r})", p = self.prefix, path = f.path, a = f.added, r = f.removed)
+                            .with(CT::Cyan)
+                    );
+                }
+            }
+            AgentEvent::ToolDone { ok: false, .. } => println!("{}", "✗ failed".red().bold()),
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        // Sub-agent approvals in exec mode: plain stdin prompt.
+        println!(
+            "{}{}{}",
+            "? ".yellow().bold(),
+            format!("[{}] wants to: ", self.prefix).bold(),
+            action.describe()
+        );
+        if danger == tools::Danger::High {
+            println!("{}", "  [DANGEROUS]".red().bold());
+        }
+        let mut line = String::new();
+        print!("[y]es / [n]o: ");
+        let _ = std::io::stdout().flush();
+        std::io::stdin().read_line(&mut line).is_ok()
+            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "")
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(TermSubUi { prefix: format!("{}>{prefix}", self.prefix) })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Agent worker thread (the UI never blocks on the agent)
 // ---------------------------------------------------------------------------
@@ -164,8 +247,9 @@ pub enum WorkerEvent {
     Busy(bool),
     Info(String),
     Error(String),
-    /// Conversation was replaced (resume) — TUI must clear its transcript.
-    Reload(String),
+    /// Conversation was replaced (resume) — TUI must clear its transcript
+    /// and replay the restored messages.
+    Reload { text: String, entries: Vec<Entry> },
     /// Final state sent right before the worker exits, so the shell
     /// goodbye can offer an exact `--resume <id>` command.
     SessionSummary { id: String, messages: usize },
@@ -218,6 +302,48 @@ impl UiSink for WorkerBridge {
         }
         let _ = self.tx.send(WorkerEvent::NeedApproval(desc));
         matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
+    }
+
+    /// Each concurrent sub-agent gets its own bridge sharing the same
+    /// channels; approval requests queue up in the single TUI modal.
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(SubBridge { inner: WorkerBridge {
+            tx: self.tx.clone(),
+            approve_rx: self.approve_rx.clone(),
+            cancel: self.cancel.clone(),
+        }, prefix: format!("[{prefix}] ") })
+    }
+}
+
+/// A forked [`WorkerBridge`] tagging events with the sub-agent's name.
+struct SubBridge {
+    inner: WorkerBridge,
+    prefix: String,
+}
+
+impl UiSink for SubBridge {
+    fn on_event(&mut self, ev: AgentEvent) {
+        let tagged = match ev {
+            AgentEvent::ToolStart { name, summary } => AgentEvent::ToolStart {
+                name: format!("{}{}", self.prefix, name),
+                summary,
+            },
+            AgentEvent::ToolDone { name, ok, preview } => AgentEvent::ToolDone {
+                name: format!("{}{}", self.prefix, name),
+                ok,
+                preview,
+            },
+            other => other,
+        };
+        let _ = self.inner.tx.send(WorkerEvent::Ev(tagged));
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        self.inner.approve(action, danger)
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        self.inner.fork(prefix)
     }
 }
 
@@ -494,7 +620,9 @@ fn worker_main(
                 // The picker sends "id · date · preview" — take the id part.
                 let real_id = id.split(" · ").next().unwrap_or(&id).to_string();
                 match resume_session(&mut app, &real_id) {
-                    Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Reload(msg)); }
+                    Ok((msg, entries)) => {
+                        let _ = ev_tx.send(WorkerEvent::Reload { text: msg, entries });
+                    }
                     Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
                 }
             }
@@ -592,8 +720,9 @@ pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
     Ok(format!("data:{mime};base64,{}", crate::api::base64_encode(&bytes)))
 }
 
-/// Replace the live conversation with a stored session.
-fn resume_session(app: &mut App, id: &str) -> Result<String> {
+/// Replace the live conversation with a stored session. Returns a status
+/// line plus the replayed transcript for the TUI.
+fn resume_session(app: &mut App, id: &str) -> Result<(String, Vec<Entry>)> {
     let sess = Session::load(id)?;
     let kept: Vec<Message> = sess
         .restore()
@@ -612,7 +741,9 @@ fn resume_session(app: &mut App, id: &str) -> Result<String> {
     app.agent.todos.clear();
     app.session = sess;
     app.persist();
-    Ok(format!("resumed session {id}"))
+    // Replay what happened so the user sees their earlier work on screen.
+    let entries = transcript_entries(&app.agent.messages);
+    Ok((format!("resumed session {id} — replayed {} items above", entries.len()), entries))
 }
 
 /// `1760000000` → `2025-10-09` without pulling chrono.
@@ -707,6 +838,8 @@ pub struct App {
     pub ctx_window: u64,
     /// Data-URI images queued for the first prompt (`-i` flag).
     pub pending_images: Vec<String>,
+    /// Entries to replay into the TUI on start (set by session restores).
+    pub pending_transcript: Vec<Entry>,
 }
 
 /// Summary of a finished TUI session, used for the exit resume hint.
@@ -739,7 +872,7 @@ impl App {
         res
     }
 
-    fn tui_main(self) -> Result<SessionExit> {
+    fn tui_main(mut self) -> Result<SessionExit> {
         let initial_id = self.session.id.clone();
         let mut tui = Tui::new();
         // Keep UI and agent in lock-step from frame one: without this the
@@ -747,6 +880,11 @@ impl App {
         // PLAN rules (the agent's default is Suggest, the widget's was Build).
         tui.mode = tui_mode_of(self.agent.mode);
         tui.set_usage(0, self.ctx_window);
+        // Replay any restored conversation (from --resume / --continue-last)
+        // so the transcript shows earlier work from the first frame.
+        for e in std::mem::take(&mut self.pending_transcript) {
+            tui.push(e);
+        }
         // Seed the @-mention list from the project tree.
         {
             let mut files = Vec::new();
@@ -928,7 +1066,7 @@ impl App {
         let session = Session::new();
         let ui = TermUi::new()?;
         let ctx_window = config.context_window.unwrap_or(128_000);
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![] })
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![] })
     }
 
     /// Bare App with a placeholder provider — used when config resolution
@@ -949,7 +1087,7 @@ impl App {
         let session = Session::new();
         let ui = TermUi::new()?;
         let ctx_window = 128_000;
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![] })
+        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![] })
     }
 
     pub fn restore_session(&mut self, sess: Session) {
@@ -965,6 +1103,9 @@ impl App {
             ));
         }
         self.session = sess;
+        // Replay the restored conversation into the TUI so the user actually
+        // SEES their earlier work instead of a blank transcript.
+        self.pending_transcript = transcript_entries(&self.agent.messages);
         println!("{}", "· resumed previous session".dark_grey());
     }
 
@@ -999,6 +1140,9 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         WorkerEvent::Ev(AgentEvent::ToolDone { name, ok, preview }) => {
             tui.push(Entry::ToolResult { name, ok, preview });
         }
+        WorkerEvent::Ev(AgentEvent::ToolEdit { name, files }) => {
+            tui.push(Entry::ToolDiff { name, files });
+        }
         WorkerEvent::Ev(AgentEvent::Usage(u)) => {
             let total = tui.ctx_total;
             tui.set_usage(u.prompt_tokens, total);
@@ -1021,9 +1165,12 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
         WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
-        WorkerEvent::Reload(s) => {
+        WorkerEvent::Reload { text, entries } => {
             tui.entries.clear();
-            tui.push(Entry::Info(s));
+            for e in entries {
+                tui.push(e);
+            }
+            tui.push(Entry::Info(text));
         }
         // Consumed by tui_main after the loop ends; never reaches the UI.
         WorkerEvent::SessionSummary { .. } => {}
@@ -1031,8 +1178,75 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
     }
 }
 
-/// Map the agent's approval policy to the TUI mode chip (inverse of
-/// `ApprovalMode::from_tui_mode`).
+/// Rebuild visible transcript entries from stored conversation messages so
+/// a resumed session shows everything that happened earlier — not just feed
+/// it into the model's context silently.
+pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
+    use std::collections::HashMap;
+    let mut out: Vec<Entry> = Vec::new();
+    // tool_call id -> tool name, so results can be paired with their calls.
+    let mut open_calls: HashMap<String, String> = HashMap::new();
+    const MARKERS: &[&str] = &[
+        "[Resuming previous session",
+        "[Conversation was compacted",
+    ];
+    for m in messages {
+        match m.role.as_str() {
+            "user" => {
+                let Some(text) = &m.content else { continue };
+                if MARKERS.iter().any(|k| text.starts_with(k)) {
+                    continue; // housekeeping markers are noise on screen
+                }
+                out.push(Entry::User(text.clone()));
+            }
+            "assistant" => {
+                for tc in &m.tool_calls {
+                    open_calls.insert(tc.id.clone(), tc.function.name.clone());
+                    let summary = tools::parse_tool_action(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                    )
+                    .map(|a| a.describe())
+                    .unwrap_or_else(|_| {
+                        tc.function.arguments.chars().take(80).collect()
+                    });
+                    out.push(Entry::ToolCall {
+                        name: tc.function.name.clone(),
+                        summary,
+                    });
+                }
+                if let Some(text) = &m.content {
+                    if !text.trim().is_empty() {
+                        out.push(Entry::Assistant(text.clone()));
+                    }
+                }
+            }
+            "tool" => {
+                let name = m
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| open_calls.get(id).cloned())
+                    .unwrap_or_else(|| "tool".into());
+                let body = m.content.clone().unwrap_or_default();
+                let failed =
+                    body.starts_with("Error") || body.starts_with("Command failed");
+                out.push(Entry::ToolResult {
+                    name,
+                    ok: !failed,
+                    preview: body.lines().take(4).collect::<Vec<_>>().join("\n"),
+                });
+            }
+            _ => {} // system prompts stay invisible
+        }
+    }
+    // Keep memory bounded on marathon sessions — show the most recent tail.
+    if out.len() > 400 {
+        out.drain(..out.len() - 400);
+    }
+    out
+}
+
+
 fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
     match mode {
         ApprovalMode::Suggest => tuiapp::Mode::Plan,
@@ -1078,6 +1292,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
                  /model        pick a model from the provider's live list\n\
                  /approvals    switch approval mode via picker (or Tab)\n\
+                 /agents       list the specialist sub-agent team\n\
                  /provider     manage providers (list|show|use <name>)\n\
                  /compact      summarize history to free context\n\
                  /clear        reset conversation\n\
@@ -1108,6 +1323,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                     "full auto".into(),
                 ],
             );
+        }
+        "agents" | "team" => {
+            tui.push(Entry::Info(crate::agents::describe_team()));
         }
         "compact" => {
             tui.set_status("compacting");
@@ -1495,6 +1713,56 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(parse_headers("").is_empty());
         assert!(parse_headers("no-colon-here").is_empty());
+    }
+
+    #[test]
+    fn restored_sessions_replay_into_visible_transcript() {
+        // A realistic stored conversation: user ask → tool call → result → answer.
+        let msgs = vec![
+            Message::system("system prompt"),
+            Message::user("fix the build"),
+            Message::assistant_with_tools(
+                vec![crate::api::ToolCall {
+                    id: "call_0".into(),
+                    kind: "function".into(),
+                    function: crate::api::FunctionCall {
+                        name: "run_command".into(),
+                        arguments: r#"{"command":"cargo build"}"#.into(),
+                    },
+                }],
+                None,
+            ),
+            Message::tool_result("call_0", "[exit: 0]\nFinished dev profile"),
+            Message::assistant("Fixed — one missing import."),
+        ];
+        let entries = transcript_entries(&msgs);
+        let kinds: Vec<String> = entries
+            .iter()
+            .map(|e| match e {
+                Entry::User(_) => "user".into(),
+                Entry::Assistant(t) => format!("assistant:{t}"),
+                Entry::ToolCall { name, .. } => format!("call:{name}"),
+                Entry::ToolResult { name, ok, .. } => format!("result:{name}:{ok}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user",
+                "call:run_command",
+                "result:run_command:true",
+                "assistant:Fixed — one missing import.",
+            ],
+            "{kinds:?}"
+        );
+        // System prompts and housekeeping markers never leak on screen.
+        let with_markers = vec![
+            Message::user("[Resuming previous session above. Continue where it left off.]".to_string()),
+            Message::user("real question"),
+        ];
+        let replay = transcript_entries(&with_markers);
+        assert_eq!(replay.len(), 1);
     }
 
     #[test]
