@@ -8,16 +8,15 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-/// Token colors — tuned to echo vim/treesitter palettes on the TUI's bright
-/// theme (magenta keywords, green strings, blue calls, yellow types).
-pub const KEYWORD: Color = Color::LightMagenta;
-pub const STRING: Color = Color::LightGreen;
-pub const COMMENT: Color = Color::DarkGray;
-pub const NUMBER: Color = Color::LightYellow;
-pub const TYPE: Color = Color::Yellow;
-pub const FUNCTION: Color = Color::LightBlue;
-pub const MACRO_: Color = Color::LightRed;
-pub const OPERATOR: Color = Color::Cyan;
+// Token colors come from the active theme (see src/theme.rs).
+pub fn c_kw() -> Color { crate::theme::get().kw }
+pub fn c_string() -> Color { crate::theme::get().string }
+pub fn c_comment() -> Color { crate::theme::get().comment }
+pub fn c_number() -> Color { crate::theme::get().num }
+pub fn c_type() -> Color { crate::theme::get().ty }
+pub fn c_func() -> Color { crate::theme::get().func }
+pub fn c_macro() -> Color { crate::theme::get().mac }
+pub fn c_op() -> Color { crate::theme::get().op }
 
 /// Multi-line tokenizer carry-over (C-family block comments).
 #[derive(Default, Clone, Debug)]
@@ -118,13 +117,13 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
             match rest.find("*/") {
                 Some(end) => {
                     let seg: String = chars[i..=i + end + 1].iter().collect();
-                    styled(&mut out, seg, COMMENT, true, base);
+                    styled(&mut out, seg, c_comment(), true, base);
                     i += end + 2;
                     state.in_block_comment = false;
                 }
                 None => {
                     let seg: String = chars[i..].iter().collect();
-                    styled(&mut out, seg, COMMENT, true, base);
+                    styled(&mut out, seg, c_comment(), true, base);
                     return out;
                 }
             }
@@ -136,7 +135,7 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
         // Comments.
         if rest.starts_with("//") {
             let seg: String = chars[i..].iter().collect();
-            styled(&mut out, seg, COMMENT, true, base);
+            styled(&mut out, seg, c_comment(), true, base);
             break;
         }
         if has_block_comments(lang) && rest.starts_with("/*") {
@@ -145,13 +144,13 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
         }
         if is_hash_comment(lang) && chars[i] == '#' {
             let seg: String = chars[i..].iter().collect();
-            styled(&mut out, seg, COMMENT, true, base);
+            styled(&mut out, seg, c_comment(), true, base);
             break;
         }
         // C preprocessor directives.
         if lang == "cpp" && chars[i] == '#' && plain.trim().is_empty() && out.is_empty() {
             let seg: String = chars[i..].iter().collect();
-            styled(&mut out, seg, MACRO_, false, base);
+            styled(&mut out, seg, c_macro(), false, base);
             break;
         }
         // Rust attributes #[...].
@@ -169,7 +168,7 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
             }
             let seg: String = chars[depth_start..=j.min(chars.len() - 1)].iter().collect();
             push_plain(&mut out, &mut plain);
-            styled(&mut out, seg, MACRO_, false, base);
+            styled(&mut out, seg, c_macro(), false, base);
             i = j + 1;
             continue;
         }
@@ -181,7 +180,7 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
             }
             let seg: String = chars[i..j].iter().collect();
             push_plain(&mut out, &mut plain);
-            styled(&mut out, seg, MACRO_, false, base);
+            styled(&mut out, seg, c_macro(), false, base);
             i = j;
             continue;
         }
@@ -198,7 +197,7 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
             }
             let seg: String = chars[i..j.min(chars.len())].iter().collect();
             push_plain(&mut out, &mut plain);
-            styled(&mut out, seg, STRING, false, base);
+            styled(&mut out, seg, c_string(), false, base);
             i = j + 1;
             continue;
         }
@@ -217,7 +216,7 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
             }
             let seg: String = chars[i..j].iter().collect();
             push_plain(&mut out, &mut plain);
-            styled(&mut out, seg, NUMBER, false, base);
+            styled(&mut out, seg, c_number(), false, base);
             i = j;
             continue;
         }
@@ -234,21 +233,21 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
                 k += 1;
             }
             let color = if word == "self" || word == "this" {
-                TYPE
+                c_type()
             } else if LITERALS.contains(&word.as_str()) {
-                NUMBER
+                c_number()
             } else if KEYWORDS.contains(&word.as_str()) {
-                KEYWORD
+                c_kw()
             } else if TYPES.contains(&word.as_str()) || word.chars().next().is_some_and(|c| c.is_uppercase()) {
-                TYPE
+                c_type()
             } else if chars.get(k) == Some(&'(') {
-                FUNCTION
+                c_func()
             } else if chars.get(i) == Some(&'!') {
                 // Rust macro: include the '!'.
                 i += 1;
                 let seg: String = chars[start..i].iter().collect();
                 push_plain(&mut out, &mut plain);
-                styled(&mut out, seg, MACRO_, false, base);
+                styled(&mut out, seg, c_macro(), false, base);
                 continue;
             } else {
                 // Plain identifier — fold into the plain buffer.
@@ -256,14 +255,14 @@ pub fn highlight_line(line: &str, lang: &str, state: &mut SynState, base: Style)
                 continue;
             };
             push_plain(&mut out, &mut plain);
-            let it = color == COMMENT;
+            let it = color == c_comment();
             styled(&mut out, word, color, it, base);
             continue;
         }
         // Operators / punctuation — slightly brighter than plain text.
         if "+-*/%=<>!&|^~:".contains(chars[i]) {
             push_plain(&mut out, &mut plain);
-            styled(&mut out, chars[i].to_string(), OPERATOR, false, base);
+            styled(&mut out, chars[i].to_string(), c_op(), false, base);
             i += 1;
             continue;
         }
@@ -293,8 +292,8 @@ mod tests {
                 .find(|s| s.content.split(&[' ', ':', '<']).any(|w| w == needle))
                 .unwrap_or_else(|| panic!("no span containing word {needle:?} in {spans:?}"))
         };
-        assert_eq!(find("let").style.fg, Some(KEYWORD));
-        assert_eq!(find("compute").style.fg, Some(FUNCTION));
+        assert_eq!(find("let").style.fg, Some(c_kw()));
+        assert_eq!(find("compute").style.fg, Some(c_func()));
         // Plain identifiers keep the base foreground.
         let plain_total = spans.iter().find(|s| s.content.contains("total")).unwrap();
         assert_eq!(plain_total.style.fg, BASE.fg);
@@ -306,13 +305,13 @@ mod tests {
         let spans = highlight_line("s = \"hi\" # note", "python", &mut st, BASE);
         let str_span = spans.iter().find(|s| s.content.contains("hi"))
             .unwrap_or_else(|| panic!("no string span in {spans:?}"));
-        assert_eq!(str_span.style.fg, Some(STRING));
+        assert_eq!(str_span.style.fg, Some(c_string()));
         let com = spans.iter().find(|s| s.content.contains("note"))
             .unwrap_or_else(|| panic!("no comment span in {spans:?}"));
-        assert_eq!(com.style.fg, Some(COMMENT));
+        assert_eq!(com.style.fg, Some(c_comment()));
         let mut st = SynState::default();
         let spans = highlight_line("let n = 0xFF;", "rust", &mut st, BASE);
-        assert_eq!(spans.iter().find(|s| s.content == "0xFF").unwrap().style.fg, Some(NUMBER));
+        assert_eq!(spans.iter().find(|s| s.content == "0xFF").unwrap().style.fg, Some(c_number()));
     }
 
     #[test]
@@ -320,19 +319,19 @@ mod tests {
         let mut st = SynState::default();
         let l1 = highlight_line("/* start", "rust", &mut st, BASE);
         assert!(st.in_block_comment);
-        assert_eq!(l1.last().unwrap().style.fg, Some(COMMENT));
+        assert_eq!(l1.last().unwrap().style.fg, Some(c_comment()));
         let l2 = highlight_line("end */ let x;", "rust", &mut st, BASE);
         assert!(!st.in_block_comment);
         let kw = l2.iter().find(|s| s.content == "let").unwrap();
-        assert_eq!(kw.style.fg, Some(KEYWORD));
+        assert_eq!(kw.style.fg, Some(c_kw()));
     }
 
     #[test]
     fn camel_case_reads_as_type_and_macros() {
         let mut st = SynState::default();
         let spans = highlight_line("let v: Vec<u8> = format!(\"x\");", "rust", &mut st, BASE);
-        assert_eq!(spans.iter().find(|s| s.content == "Vec").unwrap().style.fg, Some(TYPE));
-        assert!(spans.iter().any(|s| s.content == "format!" && s.style.fg == Some(MACRO_)));
+        assert_eq!(spans.iter().find(|s| s.content == "Vec").unwrap().style.fg, Some(c_type()));
+        assert!(spans.iter().any(|s| s.content == "format!" && s.style.fg == Some(c_macro())));
     }
 
     #[test]
@@ -359,6 +358,6 @@ mod tests {
         let spans = highlight_line("let x", "rust", &mut st, base);
         let kw = spans.iter().find(|s| s.content == "let").unwrap();
         assert_eq!(kw.style.bg, Some(Color::Rgb(10, 10, 10)), "background survives");
-        assert_eq!(kw.style.fg, Some(KEYWORD), "token color wins");
+        assert_eq!(kw.style.fg, Some(c_kw()), "token color wins");
     }
 }

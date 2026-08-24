@@ -4,12 +4,14 @@ mod api;
 mod cli;
 mod config;
 mod diff;
+mod effects;
 mod markdown;
 mod patch;
 mod permissions;
 mod repl;
 mod session;
 mod syntax;
+mod theme;
 mod tools;
 mod tui;
 

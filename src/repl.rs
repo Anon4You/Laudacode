@@ -306,6 +306,10 @@ pub enum WorkerCmd {
     EditProviderSetModel { provider: String, model: String },
     /// Replace the stored API key of a configured provider.
     FinishEditApiKey { provider: String, api_key: String },
+    /// Persist the chosen color theme.
+    SetTheme(String),
+    /// Persist the chosen ambient effect.
+    SetEffect(String),
     Quit,
 }
 
@@ -758,6 +762,24 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         let _ = ev_tx.send(WorkerEvent::Error(format!("provider setup failed: {e:#}")));
                     }
                 }
+            }
+            WorkerCmd::SetTheme(name) => {
+                app.config.theme = Some(name.clone());
+                let res = app.config.save();
+                let msg = match res {
+                    Ok(()) => format!("theme saved: {name}"),
+                    Err(e) => format!("{e:#}"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
+            }
+            WorkerCmd::SetEffect(name) => {
+                app.config.effect = Some(name.clone());
+                let res = app.config.save();
+                let msg = match res {
+                    Ok(()) => format!("effect saved: {name}"),
+                    Err(e) => format!("{e:#}"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
             }
             WorkerCmd::PickProvider(purpose) => {
                 if app.config.providers.is_empty() {
@@ -1254,6 +1276,13 @@ impl App {
         tui.needs_setup = needs_setup;
         // ↑/↓ recall of prompts from previous sessions too.
         tui.seed_history(load_prompt_history());
+        // Apply persisted look & feel before the first frame renders.
+        if let Some(t) = &self.config.theme {
+            crate::theme::set(t);
+        }
+        tui.fx = crate::effects::Engine::new(crate::effects::EffectKind::parse(
+            self.config.effect.as_deref(),
+        ));
         let shown_model = if self.active.model.is_empty() {
             "(not configured)".to_string()
         } else {
@@ -1347,6 +1376,18 @@ impl App {
                         let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
                     } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
                         apply_mode_by_label(tui, &ui_cmd, mode_label);
+                    } else if let Some(name) = sel.strip_prefix("theme:") {
+                        if crate::theme::set(name) {
+                            tui.set_status(format!("theme: {name}"));
+                            let _ = ui_cmd.send(WorkerCmd::SetTheme(name.to_string()));
+                        } else {
+                            tui.push(Entry::Error(format!("unknown theme '{name}'")));
+                        }
+                    } else if let Some(kind) = sel.strip_prefix("effect:") {
+                        let k = crate::effects::EffectKind::parse(Some(kind));
+                        tui.fx.set(k);
+                        tui.set_status(format!("effect: {}", k.as_str()));
+                        let _ = ui_cmd.send(WorkerCmd::SetEffect(k.as_str().to_string()));
                     } else if let Some(what) = sel.strip_prefix("provider_menu:") {
                         // `/provider` root menu: add · use · edit.
                         match what.split(" · ").next().unwrap_or("") {
@@ -1622,6 +1663,9 @@ impl App {
     ) -> Result<Self> {
         let active =
             config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
+        if let Some(t) = &config.theme {
+            crate::theme::set(t);
+        }
         // BUILD is the default collaboration mode (auto-approve edits,
         // ask for commands) unless overridden by flag/config.
         let mode = mode_override
@@ -2058,6 +2102,17 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.set_status("computing diff");
             let _ = cmd.send(WorkerCmd::Diff);
         }
+        "theme" => {
+            let items = crate::theme::names().into_iter().map(String::from).collect();
+            tui.open_picker("theme", items);
+        }
+        "effect" => {
+            let items = crate::effects::EffectKind::all()
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect();
+            tui.open_picker("effect", items);
+        }
         "undo" => {
             tui.set_status("reverting last turn");
             let _ = cmd.send(WorkerCmd::Undo);
@@ -2085,25 +2140,31 @@ fn placeholder_key(key: &str) -> bool {
 /// Print the brand banner to a plain terminal (exec mode, wizard).
 pub fn print_banner() {
     use crossterm::style::Color as CT;
-    // Same green→cyan→blue gradient as the TUI banner; branding text is
-    // already embedded in the art's right-hand columns.
-    const GRADIENT: &[CT] = &[
-        CT::Green,
-        CT::DarkGreen,
-        CT::DarkGreen,
-        CT::Cyan,
-        CT::Cyan,
-        CT::DarkCyan,
-        CT::DarkCyan,
-        CT::Blue,
-        CT::Blue,
-        CT::DarkBlue,
-        CT::DarkBlue,
-        CT::DarkBlue,
-        CT::DarkBlue,
-    ];
+    // Theme-driven gradient; branding text is embedded in the art itself.
+    fn to_ct(c: ratatui::style::Color) -> CT {
+        use ratatui::style::Color as RC;
+        match c {
+            RC::Rgb(r, g, b) => CT::Rgb { r, g, b },
+            RC::Black => CT::Black,
+            RC::White => CT::White,
+            RC::Gray => CT::Grey,
+            RC::DarkGray => CT::DarkGrey,
+            RC::Red => CT::Red,
+            RC::LightRed => CT::DarkRed,
+            RC::Green => CT::Green,
+            RC::LightGreen => CT::DarkGreen,
+            RC::Yellow => CT::Yellow,
+            RC::LightYellow => CT::DarkYellow,
+            RC::Blue => CT::Blue,
+            RC::LightBlue => CT::DarkBlue,
+            RC::Cyan => CT::Cyan,
+            RC::LightCyan => CT::DarkCyan,
+            _ => CT::Green,
+        }
+    }
+    let grad = crate::theme::banner_gradient(crate::tui::BANNER.lines().count());
     for (i, line) in crate::tui::BANNER.lines().enumerate() {
-        let color = GRADIENT.get(i).copied().unwrap_or(CT::Green);
+        let color = grad.get(i).copied().map(to_ct).unwrap_or(CT::Green);
         println!("{}", line.with(color).bold());
     }
     println!();

@@ -22,11 +22,6 @@ pub enum Mode {
     FullAuto,
 }
 
-/// Subtle background tints so added/removed diff rows stay unmistakable
-/// while syntax token colors render inside them.
-const ADD_BG: Color = Color::Rgb(24, 48, 30);
-const DEL_BG: Color = Color::Rgb(56, 26, 30);
-
 /// Cap on remembered prompts for ↑/↓ recall.
 const HISTORY_MAX: usize = 500;
 
@@ -46,10 +41,11 @@ impl Mode {
         }
     }
     pub fn color(&self) -> Color {
+        let t = crate::theme::get();
         match self {
-            Mode::Plan => Color::LightBlue,
-            Mode::Build => Color::LightGreen,
-            Mode::FullAuto => Color::Yellow,
+            Mode::Plan => t.mode_plan,
+            Mode::Build => t.mode_build,
+            Mode::FullAuto => t.mode_full,
         }
     }
 }
@@ -74,23 +70,10 @@ pub const BANNER: &str = concat!(
     "⠀⠀⠀⠀⠙⠛⠛⠛⠋⠁⠀⠙⠻⠿⠟⠋⠑⠛⠋⠀⠀",
 );
 
-/// Banner renders as a vertical green → cyan → blue gradient, echoing the
-/// Bright green → cyan → blue terminal palette.
-const BANNER_COLORS: &[Color] = &[
-    Color::LightGreen,
-    Color::Green,
-    Color::Green,
-    Color::Cyan,
-    Color::Cyan,
-    Color::LightCyan,
-    Color::LightCyan,
-    Color::LightBlue,
-    Color::LightBlue,
-    Color::Blue,
-    Color::Blue,
-    Color::Blue,
-    Color::Blue,
-];
+/// Banner gradient derived from the active theme's three color stops.
+fn banner_colors() -> Vec<Color> {
+    crate::theme::banner_gradient(crate::tui::HEADER_HEIGHT as usize)
+}
 
 /// Total header height: 13 braille-art rows (branding is embedded in the art).
 const HEADER_HEIGHT: u16 = 13;
@@ -283,6 +266,8 @@ pub struct Tui {
     last_tick: Instant,
     /// Session start for the dashboard elapsed timer.
     session_started: Instant,
+    /// Ambient particle effect engine (rendered in the banner band).
+    pub fx: crate::effects::Engine,
     /// Sent-prompt history for ↑/↓ recall (newest last).
     pub history: Vec<String>,
     /// Index into [`Tui::history`] while browsing; None = not browsing.
@@ -367,6 +352,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "create an AGENTS.md project brief"),
     ("/quit", "exit Laudacode"),
     ("/exit", "exit Laudacode (alias of /quit)"),
+    ("/theme", "switch color theme"),
+    ("/effect", "ambient effects (petals, rain, …)"),
 ];
 
 /// Indices into `SLASH_COMMANDS` whose name starts with `query`
@@ -422,6 +409,7 @@ impl Tui {
             processed_entries: 0,
             entry_state: Vec::new(),
             last_tick: Instant::now(),
+            fx: crate::effects::Engine::new(crate::effects::EffectKind::Off),
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -834,7 +822,7 @@ impl Tui {
         match e {
             Entry::User(t) => vec![Line::from(Span::styled(
                 format!("{} {}", "›", t),
-                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::get().user).add_modifier(Modifier::BOLD),
             ))],
             Entry::Assistant(t) => {
                 crate::markdown::render_markdown(t, width.saturating_sub(2) as usize)
@@ -849,15 +837,16 @@ impl Tui {
                 })
                 .collect(),
             Entry::ToolCall { name, summary } => vec![Line::from(vec![
-                Span::styled("● ", Style::default().fg(Color::LightBlue)),
+                Span::styled("● ", Style::default().fg(crate::theme::get().accent2)),
                 Span::styled(
                     name.clone(),
-                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+                    Style::default().fg(crate::theme::get().accent2).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
             ])],
             Entry::ToolResult { name, ok, preview } => {
-                let color = if *ok { Color::LightGreen } else { Color::LightRed };
+                let t = crate::theme::get();
+                let color = if *ok { t.success } else { t.error };
                 let mut lines = vec![Line::from(vec![
                     Span::styled(if *ok { "✔ " } else { "✘ " }, Style::default().fg(color)),
                     Span::styled(name.clone(), Style::default().fg(color)),
@@ -875,10 +864,10 @@ impl Tui {
                 let total_add: usize = files.iter().map(|f| f.added).sum();
                 let total_del: usize = files.iter().map(|f| f.removed).sum();
                 let mut lines = vec![Line::from(vec![
-                    Span::styled("✎ ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+                    Span::styled("✎ ", Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
                     Span::styled(
                         name.clone(),
-                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                        Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("  +{total_add} −{total_del}"),
@@ -890,10 +879,10 @@ impl Tui {
                         continue;
                     }
                     lines.push(Line::from(vec![
-                        Span::styled("┌─ ", Style::default().fg(Color::Cyan)),
+                        Span::styled("┌─ ", Style::default().fg(crate::theme::get().accent2)),
                         Span::styled(
                             format!("{} (+{} −{})", f.path, f.added, f.removed),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default().fg(crate::theme::get().accent2).add_modifier(Modifier::BOLD),
                         ),
                     ]));
                     // Syntax-aware diff rows: token colors from the file's
@@ -902,14 +891,14 @@ impl Tui {
                     let mut syn_state = crate::syntax::SynState::default();
                     for dl in &f.lines {
                         let (bar, tint) = match dl.kind {
-                            LineKind::Add => ("│", Some(ADD_BG)),
-                            LineKind::Del => ("│", Some(DEL_BG)),
+                            LineKind::Add => ("│", Some(crate::theme::get().add_bg)),
+                            LineKind::Del => ("│", Some(crate::theme::get().del_bg)),
                             LineKind::Meta => ("│", None),
                             LineKind::Ctx => ("│", None),
                         };
                         let bar_style = match dl.kind {
-                            LineKind::Add => Style::default().fg(Color::Green),
-                            LineKind::Del => Style::default().fg(Color::Red),
+                            LineKind::Add => Style::default().fg(crate::theme::get().success),
+                            LineKind::Del => Style::default().fg(crate::theme::get().error),
                             LineKind::Meta => {
                                 Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC)
                             }
@@ -930,8 +919,8 @@ impl Tui {
                                 let mut spans: Vec<Span<'static>> = Vec::new();
                                 if let Some(rest) = dl.text.strip_prefix('+').or_else(|| dl.text.strip_prefix('-')) {
                                     let sign_color = match dl.kind {
-                                        LineKind::Add => Color::Green,
-                                        _ => Color::Red,
+                                        LineKind::Add => crate::theme::get().success,
+                                        _ => crate::theme::get().error,
                                     };
                                     spans.push(Span::styled(
                                         dl.text[..1].to_string(),
@@ -950,13 +939,13 @@ impl Tui {
                             lines.push(Line::from(row));
                         }
                     }
-                    lines.push(Line::from(Span::styled("└─", Style::default().fg(Color::Cyan))));
+                    lines.push(Line::from(Span::styled("└─", Style::default().fg(crate::theme::get().accent2))));
                 }
                 lines
             }
             Entry::Info(t) => t
                 .lines()
-                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::LightBlue))))
+                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(crate::theme::get().heading))))
                 .collect(),
             Entry::Error(t) => wrap_text(t, width.saturating_sub(2) as usize)
                 .into_iter()
@@ -1088,9 +1077,10 @@ impl Tui {
         };
 
         if let Some(h) = header {
+            let grad = banner_colors();
             let banner_lines: Vec<Line> = BANNER
                 .lines()
-                .zip(BANNER_COLORS.iter())
+                .zip(grad.iter())
                 .map(|(row, color)| {
                     Line::from(Span::styled(
                         row.to_string(),
@@ -1099,6 +1089,11 @@ impl Tui {
                 })
                 .collect();
             f.render_widget(Paragraph::new(banner_lines), h);
+            // Ambient particles live inside the banner band only.
+            self.fx.set_area(h.width, h.height);
+            if !self.is_busy() {
+                self.fx.render(f.buffer_mut(), h);
+            }
         }
 
         // Transcript
@@ -1478,10 +1473,10 @@ const DASH_WIDTH: u16 = 28;
         ]));
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::LightGreen))
+            .border_style(Style::default().fg(crate::theme::get().accent))
             .title(Span::styled(
                 format!(" {} ", m.title),
-                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
             ));
         f.render_widget(Clear, rect);
         f.render_widget(
@@ -2020,6 +2015,9 @@ where
             // with no key activity — this is what makes streamed output,
             // spinner animation and interrupts work without key presses.
             if tui.tick_due() {
+                if !tui.is_busy() && tui.fx.kind != crate::effects::EffectKind::Off {
+                    tui.fx.tick();
+                }
                 let _ = on_action(tui, Action::None);
             }
             continue;
@@ -2623,16 +2621,16 @@ mod tests {
             .iter()
             .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "+" && l.spans[2].content == "c")
             .unwrap_or_else(|| panic!("no +c diff line"));
-        assert_eq!(add_line.spans[0].style.fg, Some(Color::Green), "add bar green");
-        assert_eq!(add_line.spans[1].style.fg, Some(Color::Green), "+ sign stays green");
-        assert_eq!(add_line.spans[2].style.bg, Some(ADD_BG), "add tint behind content");
+        assert_eq!(add_line.spans[0].style.fg, Some(crate::theme::get().success), "add bar green");
+        assert_eq!(add_line.spans[1].style.fg, Some(crate::theme::get().success), "+ sign stays green");
+        assert_eq!(add_line.spans[2].style.bg, Some(crate::theme::get().add_bg), "add tint behind content");
         let del_line = probe
             .cached_lines
             .iter()
             .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "-" && l.spans[2].content == "b")
             .unwrap();
-        assert_eq!(del_line.spans[0].style.fg, Some(Color::Red), "del bar red");
-        assert_eq!(del_line.spans[2].style.bg, Some(DEL_BG), "del tint behind content");
+        assert_eq!(del_line.spans[0].style.fg, Some(crate::theme::get().error), "del bar red");
+        assert_eq!(del_line.spans[2].style.bg, Some(crate::theme::get().del_bg), "del tint behind content");
     }
 
     #[test]
@@ -2687,11 +2685,39 @@ mod tests {
     }
 
     #[test]
-    fn banner_colors_match_rows_and_are_bright() {
-        assert_eq!(BANNER_COLORS.len(), BANNER.lines().count());
-        for c in BANNER_COLORS {
-            assert!(!matches!(c, Color::Magenta | Color::LightMagenta | Color::DarkGray), "no pinks/dulls allowed");
-        }
+    fn banner_gradient_matches_rows() {
+        let grad = banner_colors();
+        assert_eq!(grad.len(), BANNER.lines().count());
+        // Gradient endpoints come from the theme's stops.
+        let t = crate::theme::get();
+        assert_eq!(grad[0], t.banner[0]);
+        assert_eq!(grad[grad.len() - 1], t.banner[2]);
+    }
+
+    #[test]
+    fn theme_switch_recolors_entries() {
+        use crate::theme;
+        let mut t = Tui::new();
+        t.push(Entry::Info("hello".into()));
+        theme::set("dracula");
+        let lines = line_texts_colored(&t, 60);
+        assert_eq!(lines[0].1, Some(theme::get().heading));
+        theme::set("lauda");
+    }
+
+    fn line_texts_colored(t: &Tui, width: u16) -> Vec<(String, Option<Color>)> {
+        let mut probe = clone_shallow(t);
+        probe.ensure_render_cache(width);
+        probe
+            .cached_lines
+            .iter()
+            .map(|l| {
+                (
+                    l.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(""),
+                    l.spans.first().and_then(|s| s.style.fg),
+                )
+            })
+            .collect()
     }
 
     #[test]

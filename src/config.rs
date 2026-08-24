@@ -61,6 +61,12 @@ pub struct Config {
     /// Assumed context window (tokens) used by the TUI context-left meter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Color theme name (see src/theme.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// Ambient effect name (see src/effects.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

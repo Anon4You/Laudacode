@@ -2,9 +2,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-const CODE_FG: Color = Color::LightYellow;
-const CODE_BG: Color = Color::Rgb(35, 35, 50);
-const RULE: Color = Color::Rgb(95, 95, 120);
+fn code_fg() -> Color { crate::theme::get().code_fg }
+fn code_bg() -> Color { crate::theme::get().code_bg }
+fn rule_c() -> Color { crate::theme::get().rule }
 
 /// Render assistant markdown into styled transcript lines.
 ///
@@ -35,7 +35,7 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
         if in_code {
             // Syntax-highlighted code row(s), padded and hard-split.
             let inner_w = w.saturating_sub(3);
-            let base = Style::default().fg(CODE_FG).bg(CODE_BG);
+            let base = Style::default().fg(code_fg()).bg(code_bg());
             let mut spans = vec![Span::styled("  ".to_string(), base)];
             spans.extend(crate::syntax::highlight_line(line, code_lang, &mut syn_state, base));
             out.extend(hard_split_spans(spans, inner_w));
@@ -107,7 +107,7 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
 fn rule_line(w: usize) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {}", "─".repeat(w.saturating_sub(2).min(58))),
-        Style::default().fg(RULE),
+        Style::default().fg(rule_c()),
     ))
 }
 
@@ -184,7 +184,7 @@ fn flush(spans: &mut Vec<Span<'static>>, buf: &mut String, bold: bool, italic: b
     let mut style = Style::default();
     if code {
         // Inline code renders as a chip: tinted text on a darker plate.
-        style = style.fg(CODE_FG).bg(CODE_BG);
+        style = style.fg(code_fg()).bg(code_bg());
     } else {
         style = style.fg(Color::White);
         if bold {
@@ -306,7 +306,7 @@ mod tests {
     fn inline_code_is_light_yellow() {
         let spans = parse_inline("run `cargo build` now");
         let code = spans.iter().find(|s| s.content.contains("cargo build")).unwrap();
-        assert_eq!(code.style.fg, Some(CODE_FG));
+        assert_eq!(code.style.fg, Some(code_fg()));
     }
 
     #[test]
