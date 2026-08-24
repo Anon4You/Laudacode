@@ -1008,10 +1008,11 @@ impl Tui {
     }
 
     /// Dashboard panel size gate (None = hidden): shown on terminals that
-    /// are at least 88 columns wide AND 50 rows tall. Anything narrower or
+    /// are at least 88 columns wide AND 39 rows tall — covers both portrait
+    /// desktop splits and Termux landscape (~39×147). Anything narrower or
     /// shorter keeps the single-column layout untouched.
     pub fn dash_width(total_w: u16, total_h: u16) -> Option<u16> {
-        if total_w >= 88 && total_h >= 50 {
+        if total_w >= 88 && total_h >= 39 {
             Some(Self::DASH_WIDTH)
         } else {
             None
@@ -2262,10 +2263,11 @@ mod tests {
 
     #[test]
     fn dashboard_appears_only_on_wide_terminals() {
-        // Needs BOTH ≥88 columns and ≥50 rows.
+        // Needs BOTH ≥88 columns and ≥39 rows (Termux landscape is ~39 tall).
         assert_eq!(Tui::dash_width(87, 50), None);
         assert_eq!(Tui::dash_width(88, 50), Some(28));
-        assert_eq!(Tui::dash_width(88, 49), None, "too short — no dashboard");
+        assert_eq!(Tui::dash_width(147, 39), Some(28), "Termux landscape");
+        assert_eq!(Tui::dash_width(88, 38), None, "too short — no dashboard");
         assert_eq!(Tui::dash_width(100, 30), None, "short terminal keeps old layout");
         assert_eq!(Tui::dash_width(220, 60), Some(28));
     }
