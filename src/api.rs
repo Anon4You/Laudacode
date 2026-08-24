@@ -547,6 +547,53 @@ impl ChatClient {
         ids.sort();
         Ok(ids)
     }
+
+    /// Prove that the key AND model actually work by running a real
+    /// 1-token completion. Public `/models` endpoints succeed even with
+    /// garbage keys, so this is the only trustworthy pre-flight check for
+    /// provider setup (`/provider add|edit`).
+    pub async fn probe_chat(&self, model: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        let url = self.endpoint("/chat/completions");
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.headers()?)
+            .json(&body)
+            .send()
+            .await
+            .context("probe request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = Self::parse_error_body(resp).await;
+            bail!("key/model check failed ({status}): {msg}");
+        }
+        Ok(())
+    }
+
+    /// Extract the provider's error message from an error response body.
+    async fn parse_error_body(resp: reqwest::Response) -> String {
+        let text = resp.text().await.unwrap_or_default();
+        serde_json::from_str::<ApiErrorBody>(&text)
+            .ok()
+            .and_then(|b| {
+                b.error
+                    .and_then(|e| e.get("message").and_then(|m| m.as_str().map(String::from)))
+                    .or(b.message)
+            })
+            .unwrap_or_else(|| {
+                if text.is_empty() {
+                    "no details".into()
+                } else {
+                    text.chars().take(500).collect()
+                }
+            })
+    }
 }
 
 /// Locate the end of the next SSE frame in `buf`.
@@ -662,5 +709,37 @@ mod tests {
         let legacy: Message =
             serde_json::from_str(r#"{"role":"user","content":"old"}"#).unwrap();
         assert!(legacy.images.is_empty());
+    }
+
+    /// Offline plumbing check: probe against a dead port must surface an
+    /// error (not hang or silently succeed).
+    #[tokio::test]
+    async fn probe_fails_without_server() {
+        let c = ChatClient::new("http://127.0.0.1:9/v1", "k", &Default::default(), false, None)
+            .expect("client builds");
+        assert!(c.probe_chat("m").await.is_err());
+    }
+
+    /// Live proof that a garbage key is rejected by a real provider even
+    /// when its /models endpoint is public. Run explicitly:
+    /// `cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn probe_rejects_garbage_key_on_openrouter() {
+        let c = ChatClient::new(
+            "https://openrouter.ai/api/v1",
+            "sk-definitely-not-a-real-key",
+            &Default::default(),
+            false,
+            None,
+        )
+        .unwrap();
+        // /models is public and would happily return 200 — the chat probe
+        // must NOT be fooled.
+        assert!(c.list_models().await.is_ok(), "precondition: public catalog");
+        assert!(
+            c.probe_chat("openai/gpt-4o-mini").await.is_err(),
+            "garbage key must fail a real completion"
+        );
     }
 }

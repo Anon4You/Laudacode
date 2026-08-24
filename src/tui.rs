@@ -46,14 +46,24 @@ impl Mode {
     }
 }
 
-/// Brand banner — must spell exactly "LaudaCode".
+/// Brand banner — braille-art LaudaCode mascot with the wordmark, version
+/// and tagline embedded in the right-hand columns.
 pub const BANNER: &str = concat!(
-    "█                 █       ███         █     \n",
-    "█     ██  █  █    █  ██  █     ██     █  ██ \n",
-    "█    █  █ █  █  ███ █  █ █    █  █  ███ ████\n",
-    "█    █  █ █  █ █  █ █  █ █    █  █ █  █ █   \n",
-    "█    ████ █  █ █  █ ████ █    █  █ █  █ █   \n",
-    "████ █  █  ██   ███ █  █  ███  ██   ███  ██ ",
+    "⠀⠀⠀⠀⠀⠀⣠⣤⣤⣤⣤⣤⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
+    "⡀⠀⠀⠀⠀⢰⡿⠋⠁⠀⠀⠈⠉⠙⠻⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
+    "⠇⠀⠀⠀⢀⣿⠇⠈⢀⣴⣶⡾⠿⠿⠿⢿⣿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
+    "⠃⠀⣀⣀⣸⡿⠀⠀⢸⣿⣇⠀⠀⠀⠀⠀⠀⠙⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
+    "⠇⣾⡟⠛⣿⡇⠀⠀⢸⣿⣿⣷⣤⣤⣤⣤⣶⣶⣿⠇⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀\n",
+    "⢅⣿⠀⢀⣿⡇⠀⠀⠀⠻⢿⣿⣿⣿⣿⣿⠿⣿⡏⠀⠀⠀⠀⢴⣶⣶⣿⣿⣿⣆\n",
+    "⣺⣿⠀⢸⣿⡇⠀⠀⠀⠀⠀⠈⠉⠁⠀⠀⠀⣿⡇⣀⣠⣴⣾⣮⣝⠿⠿⠿⣻⡟\n",
+    "⢺⣿⠀⠘⣿⡇⠀⠀⠀⠀⠀⠀⠀⣠⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠉⠀\n",
+    "⠼⣿⠀⠀⣿⡇⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⠉ ⠀⠀⠀* LaudaCode *⠀\n",
+    "⠅⠻⣷⣶⣿⣇⠀⠀⠀⢠⣼⣿⣿⣿⣿⣿⣿⣿⣛⣛⣻⠉⠁⠀⠀         v",
+    env!("CARGO_PKG_VERSION"),
+    "⠀\n",
+    "⡂⠀⠀⠀⢸⣿⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀AI coding agent, pure Rust\n",
+    "⠀⠀⠀⠀⢸⣿⣀⣀⣀⣼⡿⢿⣿⣿⣿⣿⣿⡿⣿⣿⡿⠀  ---------------------------⠀⠀⠀⠀⠀⠀⠀⠀\n",
+    "⠀⠀⠀⠀⠙⠛⠛⠛⠋⠁⠀⠙⠻⠿⠟⠋⠑⠛⠋⠀⠀",
 );
 
 /// Banner renders as a vertical green → cyan → blue gradient, echoing the
@@ -61,14 +71,21 @@ pub const BANNER: &str = concat!(
 const BANNER_COLORS: &[Color] = &[
     Color::LightGreen,
     Color::Green,
+    Color::Green,
+    Color::Cyan,
     Color::Cyan,
     Color::LightCyan,
+    Color::LightCyan,
     Color::LightBlue,
+    Color::LightBlue,
+    Color::Blue,
+    Color::Blue,
+    Color::Blue,
     Color::Blue,
 ];
 
-/// Total header height: 6 art rows + 1 tagline row.
-const HEADER_HEIGHT: u16 = 7;
+/// Total header height: 13 braille-art rows (branding is embedded in the art).
+const HEADER_HEIGHT: u16 = 13;
 
 /// One entry in the transcript (the scrolling history above the composer).
 #[derive(Debug, Clone)]
@@ -100,6 +117,8 @@ pub enum Action {
     Interrupt,
     /// Ctrl+B — show/hide the brand banner.
     ToggleBanner,
+    /// The input modal was answered with Enter; carries the typed text.
+    InputSubmit(String),
 }
 
 /// A modal picker over a list of strings (models, providers, ...).
@@ -116,6 +135,73 @@ pub struct SlashEntry {
     pub desc: String,
     /// Bare name when user-defined — used by repl to route submission.
     pub custom: Option<String>,
+}
+
+/// Which interactive `/provider` flow is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupKind {
+    /// Connect a brand-new provider from a preset.
+    Add,
+    /// Replace the stored API key of an existing provider.
+    EditKey,
+}
+
+/// Metadata for a running `/provider add|edit` flow — tells the app what an
+/// [`Action::InputSubmit`] from the modal belongs to.
+pub struct ProviderSetup {
+    pub kind: SetupKind,
+    /// Preset key (Add) or configured provider name (EditKey).
+    pub name: String,
+    pub base_url: String,
+    /// Set once the key modal has been answered (Add only).
+    pub api_key: Option<String>,
+}
+
+impl ProviderSetup {
+    pub fn add(key: &str, base_url: &str) -> Self {
+        Self {
+            kind: SetupKind::Add,
+            name: key.to_string(),
+            base_url: base_url.to_string(),
+            api_key: None,
+        }
+    }
+
+    pub fn edit_key(name: &str) -> Self {
+        Self {
+            kind: SetupKind::EditKey,
+            name: name.to_string(),
+            base_url: String::new(),
+            api_key: None,
+        }
+    }
+}
+
+/// Modal single-line input dialog (masked for API keys). Rendered centered
+/// over the transcript; typing goes to the modal, not the chat composer.
+pub struct InputModal {
+    pub title: String,
+    /// One-line instruction shown above the input field.
+    pub hint: String,
+    pub value: String,
+    /// Render bullets instead of the typed characters.
+    pub mask: bool,
+}
+
+impl InputModal {
+    pub fn new(title: impl Into<String>, hint: impl Into<String>, mask: bool) -> Self {
+        Self { title: title.into(), hint: hint.into(), value: String::new(), mask }
+    }
+
+    /// What the input row displays (masked or plain) plus the caret.
+    pub fn display(&self) -> String {
+        let shown = if self.mask {
+            "•".repeat(self.value.chars().count())
+        } else {
+            self.value.clone()
+        };
+        format!("{shown}█")
+    }
 }
 
 impl Picker {
@@ -148,6 +234,8 @@ pub struct Tui {
     pub ctx_total: u64,
     scroll: usize,
     picker: Option<Picker>,
+    /// Modal text-input dialog (API keys, model ids) for /provider flows.
+    pub input_modal: Option<InputModal>,
     pending_approval: Option<String>,
     /// Highlighted row in the slash-command suggestion popup.
     slash_sel: usize,
@@ -159,6 +247,15 @@ pub struct Tui {
     pub custom_templates: std::collections::BTreeMap<String, String>,
     /// Right-side dashboard state (visible on wide terminals).
     pub dash: Dash,
+    /// In-progress `/provider add` flow (composer submissions are captured).
+    pub pending_setup: Option<ProviderSetup>,
+    /// True when no usable provider is configured — plain prompts are
+    /// redirected to `/provider add` until one is set up.
+    pub needs_setup: bool,
+    /// Header subtitle ("· provider-name") — updated on provider switches.
+    pub subtitle: String,
+    /// Provider being edited via the `/provider edit` sub-menus.
+    pub edit_target: Option<String>,
     /// Highlighted row in the @-file popup.
     at_sel: usize,
     /// Ctrl+O output-expansion overlay (last tool results in full).
@@ -206,6 +303,12 @@ impl Dash {
         self.messages = messages;
     }
 
+    /// Reflect a live model/provider switch in the dashboard immediately.
+    pub fn set_endpoint(&mut self, provider: &str, model: &str) {
+        self.provider = provider.to_string();
+        self.model = model.to_string();
+    }
+
     pub fn record_usage(&mut self, prompt: u64, completion: u64) {
         self.prompt_tokens = prompt;
         self.completion_tokens = completion;
@@ -237,7 +340,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/model", "pick a model from the live list"),
     ("/approvals", "switch approval mode (plan/build/full-auto)"),
-    ("/provider", "manage providers (list|show|use <name>)"),
+    ("/provider", "menu: add · use · edit · list"),
     ("/compact", "summarize history to free context"),
     ("/clear", "reset the conversation"),
     ("/retry", "re-run the previous task"),
@@ -283,12 +386,17 @@ impl Tui {
             ctx_total: 128_000,
             scroll: 0,
             picker: None,
+            input_modal: None,
             pending_approval: None,
             slash_sel: 0,
             files: vec![],
             custom_cmds: vec![],
             custom_templates: Default::default(),
             dash: Dash::default(),
+            pending_setup: None,
+            needs_setup: false,
+            subtitle: String::new(),
+            edit_target: None,
             session_started: Instant::now(),
             at_sel: 0,
             overlay: false,
@@ -343,6 +451,13 @@ impl Tui {
     /// Insert bracketed-paste content verbatim (newlines included).
     /// Never triggers submission — the user sends with Enter afterwards.
     pub fn insert_paste(&mut self, text: &str) {
+        if self.input_modal.is_some() {
+            // Pasting a key/model lands directly in the modal's field.
+            if let Some(m) = &mut self.input_modal {
+                m.value.push_str(text.trim_end_matches(['\r', '\n']));
+            }
+            return;
+        }
         if self.pending_approval.is_some() || self.picker.is_some() || self.overlay {
             return; // modals take over all input
         }
@@ -350,6 +465,43 @@ impl Tui {
         self.input.push_str(&normalized);
         self.slash_sel = 0;
         self.at_sel = 0;
+    }
+
+    /// Open the centered input dialog (API key, model id, …).
+    pub fn open_input_modal(&mut self, modal: InputModal) {
+        self.input_modal = Some(modal);
+    }
+
+    fn on_input_modal_key(&mut self, key: KeyEvent) -> Action {
+        let Some(m) = &mut self.input_modal else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Enter => {
+                let value = std::mem::take(&mut m.value);
+                self.input_modal = None;
+                Action::InputSubmit(value)
+            }
+            KeyCode::Esc => {
+                self.input_modal = None;
+                Action::None
+            }
+            KeyCode::Backspace => {
+                m.value.pop();
+                Action::None
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if c == 'c' {
+                        self.input_modal = None;
+                    }
+                } else {
+                    m.value.push(c);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     /// Composer height for the current input: grows line-by-line as the
@@ -718,22 +870,30 @@ impl Tui {
         }
     }
 
-    /// Dashboard panel width for a given terminal width (None = hidden).
-    /// Narrow/normal terminals keep today's single-column layout untouched.
-    pub fn dash_width(total: u16) -> Option<u16> {
-        if total >= 100 {
+    /// Dashboard panel size gate (None = hidden): shown on terminals that
+    /// are at least 88 columns wide AND 50 rows tall. Anything narrower or
+    /// shorter keeps the single-column layout untouched.
+    pub fn dash_width(total_w: u16, total_h: u16) -> Option<u16> {
+        if total_w >= 88 && total_h >= 50 {
             Some(Self::DASH_WIDTH)
         } else {
             None
         }
     }
 
-    pub fn draw(&mut self, f: &mut Frame, subtitle: &str) {
+    pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
 
         // Ctrl+O full-output overlay takes over the screen.
         if self.overlay {
             self.draw_overlay(f, area);
+            return;
+        }
+
+        // Input modal (API key / model id) floats over everything.
+        if let Some(mut m) = self.input_modal.take() {
+            self.draw_input_modal(f, area, &mut m);
+            self.input_modal = Some(m);
             return;
         }
 
@@ -745,9 +905,9 @@ impl Tui {
             return;
         }
 
-        // Wide terminals get a persistent side dashboard; normal sizes keep
-        // the classic single-column layout pixel-for-pixel.
-        let (area, dash_area) = match Self::dash_width(area.width) {
+        // Terminals ≥88×50 get a persistent side dashboard; smaller sizes
+        // keep the classic single-column layout pixel-for-pixel.
+        let (area, dash_area) = match Self::dash_width(area.width, area.height) {
             Some(dw) => {
                 let cols = Layout::horizontal([
                     Constraint::Min(40),
@@ -762,8 +922,9 @@ impl Tui {
         // The composer grows with the draft instead of clipping long prompts.
         let comp_h = self.composer_height(area.width, area.height);
 
-        // Header (brand banner) is shown when there's room for it.
-        let show_header = self.show_banner && area.height >= 23 && area.width >= 46;
+        // Header (brand banner) is shown when there's room for it — the art
+        // is 13 rows and up to 59 columns wide (embedded wordmark text).
+        let show_header = self.show_banner && area.height >= 23 && area.width >= 60;
         let chunks = if show_header {
             Layout::vertical([
                 Constraint::Length(HEADER_HEIGHT), // banner
@@ -789,7 +950,7 @@ impl Tui {
         };
 
         if let Some(h) = header {
-            let mut banner_lines: Vec<Line> = BANNER
+            let banner_lines: Vec<Line> = BANNER
                 .lines()
                 .zip(BANNER_COLORS.iter())
                 .map(|(row, color)| {
@@ -799,14 +960,6 @@ impl Tui {
                     ))
                 })
                 .collect();
-            banner_lines.push(Line::from(vec![
-                Span::styled(" LaudaCode", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!(" v{} ", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled("— AI coding agent, pure Rust", Style::default().fg(Color::DarkGray)),
-            ]));
             f.render_widget(Paragraph::new(banner_lines), h);
         }
 
@@ -948,7 +1101,7 @@ impl Tui {
             Color::DarkGray
         };
         let meter_spans = vec![
-            Span::styled(subtitle.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(self.subtitle.clone(), Style::default().fg(Color::DarkGray)),
             Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
             Span::styled("▕", Style::default().fg(Color::DarkGray)),
             Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
@@ -1141,6 +1294,56 @@ const DASH_WIDTH: u16 = 28;
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(Span::styled(" approval ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            rect,
+        );
+    }
+
+    /// Centered modal input dialog: hint line + live input field with caret.
+    fn draw_input_modal(&mut self, f: &mut Frame, area: Rect, m: &mut InputModal) {
+        let width = 64.min(area.width.saturating_sub(4)).max(30);
+        let hint_lines = wrap_text(&m.hint, width.saturating_sub(4) as usize);
+        let height = (hint_lines.len() as u16 + 6).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        for l in &hint_lines {
+            lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))));
+        }
+        lines.push(Line::from(String::new()));
+        // The field itself: a filled row so it reads as an input box.
+        let field_w = (width.saturating_sub(4)) as usize;
+        let mut shown = m.display();
+        if shown.chars().count() >= field_w {
+            shown = shown.chars().skip(shown.chars().count() - field_w).collect();
+        }
+        let pad = field_w.saturating_sub(shown.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {shown}"), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" ".repeat(pad), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(vec![
+            Span::styled("enter", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::raw(" confirm   "),
+            Span::styled("esc", Style::default().fg(Color::Gray)),
+            Span::raw(" cancel"),
+        ]));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::LightGreen))
+            .title(Span::styled(
+                format!(" {} ", m.title),
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ));
         f.render_widget(Clear, rect);
         f.render_widget(
             Paragraph::new(lines)
@@ -1374,6 +1577,11 @@ const DASH_WIDTH: u16 = 28;
                 }
                 _ => Action::None,
             };
+        }
+
+        // Input modal (API keys / model ids) takes over all keys.
+        if self.input_modal.is_some() {
+            return self.on_input_modal_key(key);
         }
 
         // Modal approval takes over all keys.
@@ -1639,12 +1847,15 @@ pub fn run_tui<F>(tui: &mut Tui, subtitle: String, mut on_action: F) -> anyhow::
 where
     F: FnMut(&mut Tui, Action) -> bool,
 {
+    // Seed once; afterwards the subtitle is live state that provider/model
+    // switches update (see ProviderSwitched handling in repl).
+    tui.subtitle = subtitle;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
         .map_err(|e| anyhow::anyhow!("terminal init failed: {e}"))?;
 
     loop {
         terminal
-            .draw(|f| tui.draw(f, &subtitle))
+            .draw(|f| tui.draw(f))
             .map_err(|e| anyhow::anyhow!("draw failed: {e}"))?;
 
         // Poll with a short timeout so the spinner can tick while idle.
@@ -1887,10 +2098,21 @@ mod tests {
 
     #[test]
     fn dashboard_appears_only_on_wide_terminals() {
-        assert_eq!(Tui::dash_width(79), None);
-        assert_eq!(Tui::dash_width(99), None, "normal terminal keeps old layout");
-        assert_eq!(Tui::dash_width(100), Some(28));
-        assert_eq!(Tui::dash_width(220), Some(28));
+        // Needs BOTH ≥88 columns and ≥50 rows.
+        assert_eq!(Tui::dash_width(87, 50), None);
+        assert_eq!(Tui::dash_width(88, 50), Some(28));
+        assert_eq!(Tui::dash_width(88, 49), None, "too short — no dashboard");
+        assert_eq!(Tui::dash_width(100, 30), None, "short terminal keeps old layout");
+        assert_eq!(Tui::dash_width(220, 60), Some(28));
+    }
+
+    #[test]
+    fn dash_endpoint_updates_live() {
+        let mut t = Tui::new();
+        t.dash.set_session("abc-123", "m1", "p1", "~", 0);
+        t.dash.set_endpoint("tokenrouter", "gpt-5-mini");
+        assert_eq!(t.dash.provider, "tokenrouter");
+        assert_eq!(t.dash.model, "gpt-5-mini");
     }
 
     #[test]
@@ -2146,7 +2368,7 @@ mod tests {
 
     #[test]
     fn tool_diffs_render_in_color() {
-        use crate::diff::{unified_diff, LineKind};
+        use crate::diff::unified_diff;
         let d = unified_diff("src/lib.rs", "a\nb\n", "a\nc\n", 1);
         let mut t = Tui::new();
         t.push(Entry::ToolDiff { name: "edit_file".into(), files: vec![d] });
@@ -2176,15 +2398,21 @@ mod tests {
     #[test]
     fn banner_spells_laudacode_shape() {
         let lines: Vec<&str> = BANNER.lines().collect();
-        assert_eq!(lines.len(), 6);
-        let widths: std::collections::HashSet<usize> = lines.iter().map(|l| l.chars().count()).collect();
-        assert_eq!(widths.len(), 1, "all rows must align");
-        let w = *widths.iter().next().unwrap();
-        assert!(w <= 50, "must fit phone screens: {w}");
+        assert_eq!(lines.len(), HEADER_HEIGHT as usize);
+        // Branding is embedded in the art's right-hand columns.
+        assert!(BANNER.contains("LaudaCode"));
+        assert!(BANNER.contains("pure Rust"));
+        assert!(BANNER.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         for line in &lines {
+            assert!(!line.trim().is_empty());
+            assert!(!line.contains('\t'), "tabs would break column alignment");
+            // Rows are left-anchored braille art — no trailing dead space.
+            let trimmed = line.trim_end_matches(' ');
+            assert!(!trimmed.is_empty());
             assert!(
-                line.chars().all(|c| c == '█' || c == ' '),
-                "banner may only contain block glyphs and spaces"
+                trimmed.starts_with(' ')
+                    || ('\u{2800}'..='\u{28FF}').contains(&trimmed.chars().next().unwrap()),
+                "every row must start with a braille glyph or space"
             );
         }
     }

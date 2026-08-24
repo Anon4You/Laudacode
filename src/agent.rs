@@ -751,7 +751,7 @@ mod tests {
         // Key operational knowledge stays in the prompt.
         assert!(prompt.contains("*** Begin Patch"));
         assert!(prompt.contains("update_plan"));
-        assert!(prompt.contains("PLAN mode is active") == false, "plan note is per-request only");
+        assert!(!prompt.contains("PLAN mode is active"), "plan note is per-request only");
     }
 
     #[test]
@@ -764,10 +764,7 @@ mod tests {
         for name in &registry_names {
             assert!(block.contains(name));
         }
-        assert_eq!(
-            block.matches("- ").count() >= registry_names.len(),
-            true
-        );
+        assert!(block.matches("- ").count() >= registry_names.len());
     }
 
     #[test]

@@ -133,13 +133,13 @@ fn build_app(cli: &Cli) -> Result<App> {
 
 fn interactive(cli: &Cli) -> Result<()> {
     // Interactive-first: never bail out on missing config. Build what we can,
-    // run the onboarding wizard if needed, then hand over to the full-screen
-    // TUI. Only a hard build failure (bad cwd etc.) exits here.
+    // then hand over to the full-screen TUI — no first-run wizard; users
+    // connect via `/provider add` inside the TUI instead.
     let mut app = match build_app(cli) {
         Ok(app) => app,
         Err(e) => {
             // Config problems (no provider yet) should not kill the session;
-            // fall back to a bare default and let the wizard fix it.
+            // fall back to a bare default and let /provider add fix it.
             eprintln!("{} {e:#}", "·".dark_grey());
             App::build_unconfigured(std::env::current_dir()?)?
         }
@@ -158,15 +158,6 @@ fn interactive(cli: &Cli) -> Result<()> {
         } else {
             println!("{}", "· no previous session found, starting fresh".dark_grey());
         }
-    }
-
-    // First-run wizard before entering the full-screen UI.
-    if app.needs_onboarding() {
-        let name = repl::onboarding_wizard(&mut app.config)?;
-        let active = app.config.resolve_active(Some(&name), None, None, None)?;
-        app.agent.client = repl::rebuild_client(&active)?;
-        app.agent.model = active.model.clone();
-        app.active = active;
     }
 
     let exit = app.run_tui()?;
@@ -193,10 +184,10 @@ fn provider_cli(cmd: ProviderCmd) -> Result<()> {
                         Some(n) => config::sanitize_name(&n)?,
                         None => bail!("--name required when using flags"),
                     };
-                    cfg.providers.insert(
-                        n.clone(),
-                        config::Provider { base_url: b, api_key: k, model: m, headers: Default::default(), reasoning_effort: None },
-                    );
+                    let p = config::Provider { base_url: b, api_key: k, model: m, headers: Default::default(), reasoning_effort: None };
+                    // Prove the key/model before touching the config.
+                    repl::verify_provider_creds(&p)?;
+                    cfg.providers.insert(n.clone(), p);
                     cfg.active_provider = Some(n.clone());
                     cfg.save()?;
                     println!("· saved and activated provider '{}'", n.green());

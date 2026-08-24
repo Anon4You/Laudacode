@@ -255,6 +255,12 @@ pub enum WorkerEvent {
     SessionSummary { id: String, messages: usize },
     /// Generic picker: model lists, resume lists, approval modes…
     Pick { title: String, items: Vec<String> },
+    /// The active endpoint changed (model switch, provider switch or a fresh
+    /// `/provider add`) — the dashboard must re-render model/provider.
+    ProviderSwitched { provider: String, model: String },
+    /// Authenticated catalog fetch failed during `/provider add` — the UI
+    /// switches to manual model-name capture instead of a picker.
+    SetupModelsFailed,
 }
 
 /// Commands flowing from the TUI to the worker thread.
@@ -281,8 +287,39 @@ pub enum WorkerCmd {
     ResumeSession(String),
     /// Attach a local image to the next submitted prompt.
     QueueImage(String),
+    /// Authenticated model-catalog fetch for `/provider add` (key already
+    /// captured). Replies with a models picker or SetupModelsFailed.
+    SetupListModels { base_url: String, api_key: String },
+    /// Persist + activate a provider created by the in-TUI `/provider add`.
+    FinishProviderSetup {
+        name: String,
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
+    /// Open a picker of configured providers (`use` or `edit` intent).
+    PickProvider(ProviderMenu),
+    /// Fetch the catalog for a configured provider so the user can re-pick
+    /// its model (`/provider edit`).
+    EditProviderPickModel(String),
+    /// Persist a new default model for a configured provider.
+    EditProviderSetModel { provider: String, model: String },
+    /// Replace the stored API key of a configured provider.
+    FinishEditApiKey { provider: String, api_key: String },
     Quit,
 }
+
+/// Intent behind the configured-provider picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMenu {
+    Use,
+    Edit,
+}
+
+/// Extra entry shown at the top of every model picker — catalogs lag behind
+/// reality (hidden/experimental models like `stealth/ox-alpha` work by id
+/// long before they appear in /models), so typing an id must always win.
+pub const MANUAL_MODEL_ITEM: &str = "(+ type a model name instead)";
 
 #[derive(Clone)]
 struct WorkerBridge {
@@ -462,7 +499,7 @@ fn worker_main(
                     Ok(models) => {
                         let _ = ev_tx.send(WorkerEvent::Pick {
                             title: "model".into(),
-                            items: models,
+                            items: with_manual_model_entry(models),
                         });
                     }
                     Err(e) => {
@@ -474,7 +511,10 @@ fn worker_main(
             }
             WorkerCmd::SetModel(model) => {
                 app.agent.model = model.clone();
-                let _ = ev_tx.send(WorkerEvent::Info(format!("model set to {model}")));
+                let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                    provider: app.active.name.clone(),
+                    model,
+                });
             }
             WorkerCmd::SetApprovalMode(mode) => {
                 app.agent.mode = mode;
@@ -485,7 +525,14 @@ fn worker_main(
                 &name,
                 &app.cwd,
             ) {
-                Ok(()) => {
+                Ok(active) => {
+                    // Keep App state in sync so /status and the dashboard
+                    // reflect the switch immediately.
+                    app.active = active;
+                    let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                        provider: name.clone(),
+                        model: app.agent.model.clone(),
+                    });
                     let _ = ev_tx.send(WorkerEvent::Info(format!(
                         "switched to '{name}' — model {}",
                         app.agent.model
@@ -678,6 +725,107 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
                 }
             },
+            WorkerCmd::SetupListModels { base_url, api_key } => {
+                // Authenticated catalog peek — this doubles as proof that
+                // the freshly typed key actually works before we save it.
+                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), false, None);
+                match probe.and_then(|c| rt.block_on(c.list_models())) {
+                    Ok(models) => {
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "models".into(),
+                            items: with_manual_model_entry(models),
+                        });
+                    }
+                    Err(_) => {
+                        let _ = ev_tx.send(WorkerEvent::SetupModelsFailed);
+                    }
+                }
+            }
+            WorkerCmd::FinishProviderSetup { name, base_url, model, api_key } => {
+                match finish_provider_setup(
+                    &mut app, &rt, &name, &base_url, &model, &api_key,
+                ) {
+                    Ok(note) => {
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: app.active.name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(note));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("provider setup failed: {e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::PickProvider(purpose) => {
+                if app.config.providers.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "no providers configured yet — run /provider → add first".into(),
+                    ));
+                } else {
+                    let title = match purpose {
+                        ProviderMenu::Use => "provider_use",
+                        ProviderMenu::Edit => "provider_edit",
+                    };
+                    let items = app
+                        .config
+                        .providers
+                        .iter()
+                        .map(|(n, p)| format!("{n} · {}", p.model))
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick { title: title.into(), items });
+                }
+            }
+            WorkerCmd::EditProviderPickModel(name) => {
+                let Some(p) = app.config.providers.get(&name).cloned() else {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("provider '{name}' not found")));
+                    continue;
+                };
+                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, false, None);
+                match client.and_then(|c| rt.block_on(c.list_models())) {
+                    Ok(models) => {
+                        let mut items = with_manual_model_entry(models);
+                        items.insert(0, "(keep current model)".into());
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "edit model".into(),
+                            items,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!(
+                            "couldn't list models for '{name}': {e:#} — is the stored key valid?"
+                        )));
+                    }
+                }
+            }
+            WorkerCmd::EditProviderSetModel { provider, model } => {
+                match edit_provider_model(&mut app, &provider, &model) {
+                    Ok(msg) => {
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: app.active.name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(msg));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::FinishEditApiKey { provider, api_key } => {
+                match finish_edit_api_key(&mut app, &rt, &provider, &api_key) {
+                    Ok(note) => {
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: app.active.name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(note));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
         }
     }
     app.persist();
@@ -1012,13 +1160,6 @@ pub struct SessionExit {
 }
 
 impl App {
-    /// True when no provider is usable yet (fresh install, no config).
-    pub fn needs_onboarding(&self) -> bool {
-        self.active.api_key.is_empty()
-            || self.active.base_url.is_empty()
-            || (self.config.providers.is_empty() && self.active.name == "default")
-    }
-
     // -----------------------------------------------------------------------
     // Full-screen TUI mode
     // -----------------------------------------------------------------------
@@ -1106,12 +1247,29 @@ impl App {
         } else {
             String::new()
         };
+        // No wizard on first run — the user connects from inside the TUI.
+        let needs_setup = self.active.api_key.is_empty() || self.active.model.is_empty();
+        tui.needs_setup = needs_setup;
+        let shown_model = if self.active.model.is_empty() {
+            "(not configured)".to_string()
+        } else {
+            self.active.model.clone()
+        };
         tui.push(Entry::Info(format!(
-            "LaudaCode ready — model {} · mode {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
-            self.active.model,
+            "LaudaCode ready — model {shown_model} · mode {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
             tui.mode.label(),
             config_note
         )));
+        if needs_setup {
+            let presets = PROVIDER_PRESETS
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tui.push(Entry::Info(format!(
+                "no provider configured yet — run /provider add to connect\npresets: {presets}"
+            )));
+        }
         let subtitle = format!("· {}", self.active.name);
 
         let worker = spawn_worker(self);
@@ -1165,8 +1323,18 @@ impl App {
                 KeyAction::OpenSlash(sel) => {
                     // Picker selections arrive as "title:value".
                     if let Some(model) = sel.strip_prefix("model:") {
-                        tui.set_status("switching model");
-                        let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
+                        if model == MANUAL_MODEL_ITEM {
+                            // Hidden/new model not in the catalog — type it.
+                            tui.open_input_modal(tuiapp::InputModal::new(
+                                "Model id",
+                                "Type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                false,
+                            ));
+                            tui.set_status("enter model id");
+                        } else {
+                            tui.set_status("switching model");
+                            let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
+                        }
                     } else if let Some(resume_id) = sel.strip_prefix("resume:") {
                         let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
                         tui.set_status("restoring session");
@@ -1175,6 +1343,133 @@ impl App {
                         let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
                     } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
                         apply_mode_by_label(tui, &ui_cmd, mode_label);
+                    } else if let Some(what) = sel.strip_prefix("provider_menu:") {
+                        // `/provider` root menu: add · use · edit.
+                        match what.split(" · ").next().unwrap_or("") {
+                            "add" => {
+                                let items = PROVIDER_PRESETS
+                                    .iter()
+                                    .map(|(k, u)| format!("{k} · {u}"))
+                                    .collect();
+                                tui.open_picker("provider_add", items);
+                            }
+                            "use" => {
+                                tui.set_status("loading providers");
+                                let _ = ui_cmd.send(WorkerCmd::PickProvider(ProviderMenu::Use));
+                            }
+                            "edit" => {
+                                tui.set_status("loading providers");
+                                let _ = ui_cmd.send(WorkerCmd::PickProvider(ProviderMenu::Edit));
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_add:") {
+                        // Add step 1: preset picked → API-key dialog opens.
+                        match parse_preset_label(label) {
+                            Some((key, base_url)) => {
+                                tui.pending_setup =
+                                    Some(tuiapp::ProviderSetup::add(&key, &base_url));
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("API key — {key}"),
+                                    format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
+                                    true,
+                                ));
+                                tui.set_status(format!("{key}: enter API key"));
+                            }
+                            None => tui.push(Entry::Error("bad provider preset".into())),
+                        }
+                    } else if let Some(models) = sel.strip_prefix("models:") {
+                        // Add final step: model chosen from the authenticated
+                        // catalog (the key was already proven to get here).
+                        let model_choice = tui
+                            .pending_setup
+                            .as_mut()
+                            .filter(|ps| ps.kind == tuiapp::SetupKind::Add)
+                            .map(|ps| (ps.name.clone(), ps.base_url.clone(), ps.api_key.clone()));
+                        if let Some((name, base_url, api_key)) = model_choice {
+                            if models == MANUAL_MODEL_ITEM {
+                                // Hidden/new model not in the catalog — type it.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {name}"),
+                                    "Catalogs lag behind: type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                    false,
+                                ));
+                                tui.set_status("enter model id");
+                            } else if models.starts_with('(') {
+                                // Defensive: any other special entry reopens the dialog.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {name}"),
+                                    "Type the exact model id and press Enter.",
+                                    false,
+                                ));
+                            } else {
+                                tui.push(Entry::User(format!("model: {models}")));
+                                tui.pending_setup = None;
+                                tui.set_status("saving provider…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                    name,
+                                    base_url,
+                                    model: models.to_string(),
+                                    api_key: api_key.unwrap_or_default(),
+                                });
+                            }
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_use:") {
+                        // Menu → use: label is "{name} · {model}".
+                        if let Some((name, _)) = parse_preset_label(label) {
+                            tui.set_status(format!("switching to {name}"));
+                            let _ = ui_cmd.send(WorkerCmd::UseProvider(name));
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_edit:") {
+                        // Menu → edit: pick the provider, then choose a field.
+                        if let Some((name, _)) = parse_preset_label(label) {
+                            tui.edit_target = Some(name.clone());
+                            tui.open_picker(
+                                "provider_edit_field",
+                                vec![
+                                    format!("replace api key · {name}"),
+                                    format!("change model · {name}"),
+                                ],
+                            );
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_edit_field:") {
+                        if let Some((field, name)) = parse_preset_label(label) {
+                            if field == "replace api key" {
+                                tui.pending_setup = Some(tuiapp::ProviderSetup::edit_key(&name));
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("New API key — {name}"),
+                                    "Paste the replacement key and press Enter.\nIt is verified live; on failure the old key stays.",
+                                    true,
+                                ));
+                                tui.set_status(format!("{name}: enter new API key"));
+                            } else if field == "change model" {
+                                tui.set_status(format!("fetching models for {name}…"));
+                                let _ = ui_cmd.send(WorkerCmd::EditProviderPickModel(name));
+                            }
+                        }
+                    } else if let Some(model) = sel.strip_prefix("edit model:") {
+                        let provider = tui.edit_target.clone();
+                        if let Some(provider) = provider {
+                            if model == MANUAL_MODEL_ITEM {
+                                // Hidden/new model — type the exact id.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {provider}"),
+                                    "Type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                    false,
+                                ));
+                                tui.set_status("enter model id");
+                            } else if model.starts_with('(') {
+                                tui.set_status("model kept");
+                                tui.edit_target = None;
+                            } else {
+                                tui.edit_target = None;
+                                tui.set_status("saving model…");
+                                let _ = ui_cmd.send(WorkerCmd::EditProviderSetModel {
+                                    provider,
+                                    model: model.to_string(),
+                                });
+                            }
+                        }
                     }
                 }
                 KeyAction::Submit(text) => {
@@ -1184,6 +1479,12 @@ impl App {
                             let _ = ui_cmd.send(WorkerCmd::Quit);
                             return false;
                         }
+                    } else if tui.needs_setup && !text.starts_with('#') && !text.starts_with('!') {
+                        // Nothing configured yet — steer to /provider add
+                        // instead of failing on the first API call.
+                        tui.push(Entry::Info(
+                            "no provider configured — run /provider and choose add\n(pick tokenrouter/openai/openrouter/… → API key → model)".into(),
+                        ));
                     } else if tui.is_busy() && !text.starts_with('#') && !text.starts_with('!') {
                         // Queue the next prompt while the agent works — it runs
                         // automatically when the current turn finishes.
@@ -1215,6 +1516,64 @@ impl App {
                         }
                         tui.set_status("thinking");
                         let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
+                    }
+                }
+                KeyAction::InputSubmit(value) => {
+                    // Answer from the centered input dialog (API key / model).
+                    if value.trim().is_empty() {
+                        tui.set_status("empty input — cancelled");
+                        tui.pending_setup = None;
+                    } else if let Some(ps) = tui.pending_setup.as_mut() {
+                        match (&ps.kind, &ps.api_key) {
+                            (tuiapp::SetupKind::Add, None) => {
+                                // Key answered → prove it via authenticated catalog.
+                                ps.api_key = Some(value.clone());
+                                let base_url = ps.base_url.clone();
+                                tui.push(Entry::User(format!("api key: {}", mask_key(&value))));
+                                tui.set_status("fetching models…");
+                                let _ = ui_cmd.send(WorkerCmd::SetupListModels {
+                                    base_url,
+                                    api_key: value,
+                                });
+                            }
+                            (tuiapp::SetupKind::Add, Some(_)) => {
+                                // Manual model id (catalog unavailable or hidden model).
+                                let (name, base_url) = (ps.name.clone(), ps.base_url.clone());
+                                let api_key = ps.api_key.clone().unwrap_or_default();
+                                tui.push(Entry::User(format!("model: {value}")));
+                                tui.pending_setup = None;
+                                tui.set_status("saving provider…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                    name,
+                                    base_url,
+                                    model: value,
+                                    api_key,
+                                });
+                            }
+                            (tuiapp::SetupKind::EditKey, _) => {
+                                let provider = ps.name.clone();
+                                tui.push(Entry::User(format!("api key: {}", mask_key(&value))));
+                                tui.pending_setup = None;
+                                tui.set_status("verifying new key…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishEditApiKey {
+                                    provider,
+                                    api_key: value,
+                                });
+                            }
+                        }
+                    } else if let Some(provider) = tui.edit_target.take() {
+                        // Typed model id from /provider edit → change model.
+                        tui.push(Entry::User(format!("model: {value}")));
+                        tui.set_status("saving model…");
+                        let _ = ui_cmd.send(WorkerCmd::EditProviderSetModel {
+                            provider,
+                            model: value,
+                        });
+                    } else {
+                        // Typed model id from /model → live session switch.
+                        tui.push(Entry::User(format!("model: {value}")));
+                        tui.set_status("switching model");
+                        let _ = ui_cmd.send(WorkerCmd::SetModel(value));
                     }
                 }
                 KeyAction::None => {}
@@ -1403,6 +1762,27 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         // Consumed by tui_main after the loop ends; never reaches the UI.
         WorkerEvent::SessionSummary { .. } => {}
         WorkerEvent::Pick { title, items } => tui.open_picker(title, items),
+        WorkerEvent::ProviderSwitched { provider, model } => {
+            tui.dash.set_endpoint(&provider, &model);
+            tui.needs_setup = false;
+            tui.subtitle = format!("· {provider}");
+            tui.set_status(format!("{provider} · {model}"));
+        }
+        WorkerEvent::SetupModelsFailed => {
+            // The key didn't survive an authenticated catalog fetch — offer
+            // the manual-model dialog, but don't pretend it's verified.
+            if let Some(ps) = tui.pending_setup.as_ref() {
+                if ps.kind == tuiapp::SetupKind::Add {
+                    let name = ps.name.clone();
+                    tui.open_input_modal(tuiapp::InputModal::new(
+                        format!("Model id — {name}"),
+                        "Couldn't list models with that key.\nType the exact model id (e.g. gpt-4o-mini) and press Enter to save anyway.",
+                        false,
+                    ));
+                    tui.set_status("enter model id");
+                }
+            }
+        }
     }
 }
 
@@ -1543,7 +1923,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                  /model        pick a model from the provider's live list\n\
                  /approvals    switch approval mode via picker (or Tab)\n\
                  /agents       list the specialist sub-agent team\n\
-                 /provider     manage providers (list|show|use <name>)\n\
+                                   /provider     menu: add · use · edit · list\n\
                  /compact      summarize history to free context\n\
                  /clear        reset conversation\n\
                  /retry        re-run the previous task\n\
@@ -1592,23 +1972,51 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.push(Entry::Info("goodbye".into()));
             return false;
         }
-        "provider" => match arg.first().copied().unwrap_or("list") {
-            "list" | "ls" => {
+        "provider" => match arg.first().copied() {
+            // Bare `/provider` → fully interactive menu.
+            None => {
+                tui.open_picker(
+                    "provider_menu",
+                    vec![
+                        "add · connect a new provider".to_string(),
+                        "use · switch active provider".to_string(),
+                        "edit · change a key or model".to_string(),
+                        "list · show configured providers".to_string(),
+                    ],
+                );
+            }
+            Some("add" | "setup") => {
+                let items = PROVIDER_PRESETS
+                    .iter()
+                    .map(|(k, u)| format!("{k} · {u}"))
+                    .collect();
+                tui.open_picker("provider_add", items);
+            }
+            Some("use") => {
+                let _ = cmd.send(WorkerCmd::PickProvider(ProviderMenu::Use));
+            }
+            Some("edit") => {
+                let _ = cmd.send(WorkerCmd::PickProvider(ProviderMenu::Edit));
+            }
+            Some("cancel" | "abort") => {
+                tui.input_modal = None;
+                if tui.pending_setup.take().is_some() || tui.edit_target.take().is_some() {
+                    tui.set_status("provider setup cancelled");
+                    tui.push(Entry::Info("provider setup cancelled".into()));
+                } else {
+                    tui.set_status("nothing to cancel");
+                }
+            }
+            Some("list" | "ls") => {
                 let _ = cmd.send(WorkerCmd::ListProviders);
             }
-            "show" | "status" => {
+            Some("show" | "status") => {
                 let _ = cmd.send(WorkerCmd::ShowProvider);
             }
-            "use" => match arg.get(1) {
-                Some(name) => {
-                    let _ = cmd.send(WorkerCmd::UseProvider((*name).to_string()));
-                }
-                None => tui.push(Entry::Error("usage: /provider use <name>".into())),
-            },
-            other => {
+            Some(other) => {
                 tui.push(Entry::Error(format!(
-                    "provider '{other}' not supported in the TUI — use list|use, \
-                     or run `laudacode provider add` outside the TUI"
+                    "unknown /provider subcommand '{other}' — open the menu with plain /provider \
+                     (add · use · edit · list)"
                 )));
             }
         },
@@ -1671,68 +2079,37 @@ fn placeholder_key(key: &str) -> bool {
 /// Print the brand banner to a plain terminal (exec mode, wizard).
 pub fn print_banner() {
     use crossterm::style::Color as CT;
-    // Same green→cyan→blue gradient as the TUI banner.
+    // Same green→cyan→blue gradient as the TUI banner; branding text is
+    // already embedded in the art's right-hand columns.
     const GRADIENT: &[CT] = &[
         CT::Green,
         CT::DarkGreen,
+        CT::DarkGreen,
+        CT::Cyan,
         CT::Cyan,
         CT::DarkCyan,
+        CT::DarkCyan,
         CT::Blue,
+        CT::Blue,
+        CT::DarkBlue,
+        CT::DarkBlue,
+        CT::DarkBlue,
         CT::DarkBlue,
     ];
     for (i, line) in crate::tui::BANNER.lines().enumerate() {
         let color = GRADIENT.get(i).copied().unwrap_or(CT::Green);
         println!("{}", line.with(color).bold());
     }
-    println!(
-        "{}",
-        format!(
-            " LaudaCode v{} — AI coding agent for your terminal",
-            env!("CARGO_PKG_VERSION")
-        )
-        .dark_grey()
-    );
     println!();
 }
 
 // ---------------------------------------------------------------------------
-// Onboarding wizard (runs before the TUI when no provider is configured)
+// Provider management helpers (shared with CLI)
 // ---------------------------------------------------------------------------
 
-/// First-run wizard: never exits unconfigured. Builds a provider, verifies the
-/// key with a models fetch when possible, then returns the rebuilt App state
-/// via `switch_to`.
-pub fn onboarding_wizard(cfg: &mut Config) -> Result<String> {
-    print_banner();
-    println!("{}", "Welcome to Laudacode — let's connect you to a model provider.".bold());
-    println!("{}", "You can re-run this anytime with /provider add.".dark_grey());
-
-    loop {
-        let name = add_provider_flow(cfg, None)?;
-        let p = cfg.providers.get(&name).context("provider vanished")?;
-        // Verify connectivity unless it's a local server.
-        if !p.base_url.contains("localhost") && !p.base_url.contains("127.0.0.1") {
-            print!("· checking connection… ");
-            std::io::stdout().flush().ok();
-            match verify_provider(p) {
-                Ok(n) => println!("{}", format!("ok ({n} models)").green()),
-                Err(e) => {
-                    println!("{}", "failed".red().bold());
-                    println!("{}", format!("  {e:#}").dark_grey());
-                    println!("{}", "Check the key/URL, or press Enter to retry, 's' to save anyway:".dark_grey());
-                    let ans = prompt_line("", "")?;
-                    if !ans.trim().eq_ignore_ascii_case("s") {
-                        cfg.providers.remove(&name);
-                        continue;
-                    }
-                }
-            }
-        }
-        cfg.active_provider = Some(name.clone());
-        cfg.save()?;
-        return Ok(name);
-    }
-}
+// ---------------------------------------------------------------------------
+// Provider management helpers (shared with CLI)
+// ---------------------------------------------------------------------------
 
 /// Run a future on a throwaway current-thread runtime.
 pub fn block_current<F: std::future::Future>(fut: F) -> Result<F::Output> {
@@ -1742,24 +2119,44 @@ pub fn block_current<F: std::future::Future>(fut: F) -> Result<F::Output> {
     Ok(rt.block_on(fut))
 }
 
-/// Cheap liveness check: GET /models and count entries.
-fn verify_provider(p: &Provider) -> Result<usize> {
-    let client = rebuild_client(&ActiveProvider {
-        name: "verify".into(),
-        base_url: p.base_url.clone(),
-        api_key: p.api_key.clone(),
-        model: p.model.clone(),
-        headers: p.headers.clone(),
-        sources: Default::default(),
-        reasoning_effort: p.reasoning_effort.clone(),
-    })?;
-    let models = block_current(client.list_models())??;
-    Ok(models.len())
+/// Known OpenAI-compatible endpoints surfaced by `/provider add` (TUI) and
+/// the interactive `laudacode provider add` flow. TokenRouter first — it is
+/// the recommended default gateway.
+pub const PROVIDER_PRESETS: &[(&str, &str)] = &[
+    ("tokenrouter", "https://api.tokenrouter.com/v1"),
+    ("openai", "https://api.openai.com/v1"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("groq", "https://api.groq.com/openai/v1"),
+    ("deepseek", "https://api.deepseek.com/v1"),
+    ("together", "https://api.together.xyz/v1"),
+    ("ollama", "http://localhost:11434/v1"),
+    ("lmstudio", "http://localhost:1234/v1"),
+];
+
+/// Split a `"{key} · {base_url}"` picker label back into its parts.
+fn parse_preset_label(label: &str) -> Option<(String, String)> {
+    let (k, u) = label.split_once(" · ")?;
+    Some((k.trim().to_string(), u.trim().to_string()))
 }
 
-// ---------------------------------------------------------------------------
-// Provider management helpers (shared with CLI)
-// ---------------------------------------------------------------------------
+/// Mask an API key for transcript display: keep only a short tail.
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 8 {
+        "••••".into()
+    } else {
+        let tail: String = key.chars().skip(n - 4).collect();
+        format!("••••••••{tail}")
+    }
+}
+
+/// Prepend the manual-entry option to any model list so hidden/new models
+/// that are absent from the catalog can still be typed by id.
+fn with_manual_model_entry(mut models: Vec<String>) -> Vec<String> {
+    models.truncate(200);
+    models.insert(0, MANUAL_MODEL_ITEM.into());
+    models
+}
 
 pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
     ChatClient::new(
@@ -1771,7 +2168,40 @@ pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
     )
 }
 
-fn switch_to(cfg: &mut Config, agent: &mut Agent, name: &str, _cwd: &PathBuf) -> Result<()> {
+/// Prove a candidate provider's key + model with a real 1-token completion
+/// BEFORE it is persisted (shared by TUI setup and CLI `provider add|edit`).
+/// Local servers are skipped. Nothing is written by this function.
+pub fn verify_provider_creds(p: &Provider) -> Result<()> {
+    let local = p.base_url.contains("localhost") || p.base_url.contains("127.0.0.1");
+    if local {
+        return Ok(());
+    }
+    println!("· verifying key and model with a live test request…");
+    let client = rebuild_client(&ActiveProvider {
+        name: "verify".into(),
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        model: p.model.clone(),
+        headers: p.headers.clone(),
+        sources: Default::default(),
+        reasoning_effort: None,
+    })?;
+    let res = block_current(client.probe_chat(&p.model))?;
+    res.with_context(|| {
+        format!(
+            "NOT saved — nothing changed. Check the key/model for {} and retry",
+            p.base_url
+        )
+    })?;
+    Ok(())
+}
+
+fn switch_to(
+    cfg: &mut Config,
+    agent: &mut Agent,
+    name: &str,
+    _cwd: &PathBuf,
+) -> Result<ActiveProvider> {
     if !cfg.providers.contains_key(name) {
         bail!("provider '{name}' not found");
     }
@@ -1780,7 +2210,147 @@ fn switch_to(cfg: &mut Config, agent: &mut Agent, name: &str, _cwd: &PathBuf) ->
     agent.model = active.model.clone();
     cfg.active_provider = Some(name.to_string());
     cfg.save()?;
-    Ok(())
+    Ok(active)
+}
+
+/// Complete an in-TUI `/provider add`: persist the provider, activate it and
+/// hot-swap the live client. Returns a human-readable summary (including a
+/// soft connectivity check that never fails the setup).
+fn finish_provider_setup(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<String> {
+    let sanitized = sanitize_name(name)?;
+    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    anyhow::ensure!(
+        !api_key.trim().is_empty() || is_local,
+        "API key required for {base_url} (local servers may leave it blank)"
+    );
+    anyhow::ensure!(!model.trim().is_empty(), "model name required");
+
+    let p = Provider {
+        base_url: base_url.to_string(),
+        api_key: api_key.trim().to_string(),
+        model: model.trim().to_string(),
+        headers: if base_url.contains("openrouter") {
+            parse_headers("HTTP-Referer: https://github.com/Anon4You/Laudacode, X-Title: Laudacode")
+        } else {
+            Default::default()
+        },
+        reasoning_effort: None,
+    };
+
+    // Prove the key AND the chosen model with a real 1-token completion
+    // BEFORE saving anything — a public /models endpoint can't tell a good
+    // key from a bad one, so this is the check that prevents broken setups.
+    if !is_local {
+        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, false, None)?;
+        rt.block_on(probe.probe_chat(&p.model)).with_context(|| {
+            format!("'{sanitized}' was NOT saved — nothing changed. Fix the key/model and retry /provider add")
+        })?;
+    }
+
+    // Re-running /provider add for the same preset overwrites cleanly.
+    app.config.providers.insert(sanitized.clone(), p);
+    let active = switch_to(&mut app.config, &mut app.agent, &sanitized, &app.cwd)?;
+    app.active = active;
+
+    Ok(format!(
+        "saved and activated '{sanitized}' · {} · {}\n· verified working with a live test request",
+        app.active.base_url, app.agent.model
+    ))
+}
+
+/// `/provider edit` → change model: persist it on the stored provider and
+/// hot-swap the live agent when that provider is currently active.
+fn edit_provider_model(app: &mut App, provider: &str, model: &str) -> Result<String> {
+    let model = model.trim();
+    anyhow::ensure!(!model.is_empty(), "model name required");
+    {
+        let p = app
+            .config
+            .providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow::anyhow!("provider '{provider}' not found"))?;
+        p.model = model.to_string();
+    }
+    let is_active = app.config.active_provider.as_deref() == Some(provider);
+    if is_active {
+        // Re-resolve + rebuild so the running session uses it immediately.
+        let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+        app.active = active;
+    } else {
+        app.config.save()?;
+    }
+    Ok(format!("model for '{provider}' set to {model}{}", if is_active { " (live)" } else { "" }))
+}
+
+/// `/provider edit` → replace the stored API key of a configured provider.
+/// When the provider is active, the live client is rebuilt and verified;
+/// when verification fails the old key is restored instead of saving a
+/// broken one.
+fn finish_edit_api_key(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    provider: &str,
+    api_key: &str,
+) -> Result<String> {
+    anyhow::ensure!(
+        !api_key.trim().is_empty(),
+        "API key cannot be empty — setup cancelled, old key kept"
+    );
+    let is_local = app
+        .config
+        .providers
+        .get(provider)
+        .map(|p| p.base_url.contains("localhost") || p.base_url.contains("127.0.0.1"))
+        .unwrap_or(false);
+    let old_key = {
+        let p = app
+            .config
+            .providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow::anyhow!("provider '{provider}' not found"))?;
+        std::mem::replace(&mut p.api_key, api_key.trim().to_string())
+    };
+    let is_active = app.config.active_provider.as_deref() == Some(provider);
+    if is_active {
+        let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+        app.active = active;
+        if !is_local {
+            // Prove the new key with a real completion before keeping it;
+            // roll back to the old key on failure.
+            let model = app.agent.model.clone();
+            if let Err(e) = rt.block_on(app.agent.client.probe_chat(&model)) {
+                if let Some(p) = app.config.providers.get_mut(provider) {
+                    p.api_key = old_key;
+                }
+                let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+                app.active = active;
+                bail!("key rejected ({e:#}) — old key restored");
+            }
+        }
+        Ok(format!("API key updated for '{provider}' — verified with a live test request"))
+    } else {
+        // Inactive provider: verify before saving so a typo can't poison
+        // the config for later.
+        let (base_url, model, headers) = {
+            let p = app.config.providers.get(provider).unwrap();
+            (p.base_url.clone(), p.model.clone(), p.headers.clone())
+        };
+        if !is_local {
+            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, false, None)?;
+            rt.block_on(probe.probe_chat(&model)).with_context(|| {
+                "key rejected — old key kept unchanged"
+            })?;
+        }
+        app.config.save()?;
+        Ok(format!("API key updated for '{provider}' (not active — /provider use to switch)"))
+    }
 }
 
 pub fn list_providers(cfg: &Config) {
@@ -1817,10 +2387,12 @@ pub fn add_provider_flow(
     }
 
     let presets: &[(&str, &str)] = &[
+        ("tokenrouter", "https://api.tokenrouter.com/v1"),
         ("openai", "https://api.openai.com/v1"),
         ("openrouter", "https://openrouter.ai/api/v1"),
         ("groq", "https://api.groq.com/openai/v1"),
         ("deepseek", "https://api.deepseek.com/v1"),
+        ("together", "https://api.together.xyz/v1"),
         ("ollama", "http://localhost:11434/v1"),
         ("lmstudio", "http://localhost:1234/v1"),
         ("custom", ""),
@@ -1848,6 +2420,8 @@ pub fn add_provider_flow(
     let header_map = parse_headers(&headers);
 
     let p = Provider { base_url, api_key, model, headers: header_map, reasoning_effort: None };
+    // Prove the key/model before touching the config file.
+    verify_provider_creds(&p)?;
     cfg.providers.insert(name.clone(), p);
     cfg.save()?;
     println!("· saved provider '{}'", name.clone().green());
@@ -1879,6 +2453,8 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
         headers: parse_headers(&headers),
         reasoning_effort: p.reasoning_effort.clone(),
     };
+    // Prove the (possibly unchanged) credentials before saving.
+    verify_provider_creds(&updated)?;
     cfg.providers.insert(name.to_string(), updated);
     cfg.save()?;
     println!("· updated '{name}' (key stays in {})", Config::toml_path().display());
@@ -1987,7 +2563,7 @@ mod tests {
         let review = loaded.iter().find(|c| c.name == "review").unwrap();
         let rendered = render_command_template(&review.template, "", &dir);
         assert!(rendered.contains("IMPORTANT NOTE CONTENT"), "{rendered}");
-        assert!(rendered.contains("@notes.md") == false || rendered.contains("--- notes.md ---"));
+        assert!(!rendered.contains("@notes.md") || rendered.contains("--- notes.md ---"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2000,6 +2576,38 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(parse_headers("").is_empty());
         assert!(parse_headers("no-colon-here").is_empty());
+    }
+
+    #[test]
+    fn tokenrouter_preset_is_present_and_first() {
+        let (name, url) = PROVIDER_PRESETS.first().expect("presets non-empty");
+        assert_eq!(*name, "tokenrouter");
+        assert_eq!(*url, "https://api.tokenrouter.com/v1");
+        // Every preset label round-trips through the picker parser.
+        for (k, u) in PROVIDER_PRESETS {
+            let parsed = parse_preset_label(&format!("{k} · {u}")).unwrap();
+            assert_eq!(parsed, (k.to_string(), u.to_string()));
+        }
+        assert!(parse_preset_label("no separator here").is_none());
+    }
+
+    #[test]
+    fn key_masking_keeps_only_tail() {
+        assert_eq!(mask_key(""), "••••");
+        assert_eq!(mask_key("short"), "••••");
+        assert_eq!(mask_key("sk-1234567890abcd"), "••••••••abcd");
+    }
+
+    #[test]
+    fn cli_verification_skips_local_servers_without_network() {
+        let p = Provider {
+            base_url: "http://localhost:11434/v1".into(),
+            api_key: String::new(),
+            model: "qwen2.5-coder:7b".into(),
+            headers: Default::default(),
+            reasoning_effort: None,
+        };
+        assert!(verify_provider_creds(&p).is_ok(), "local URLs skip the probe");
     }
 
     #[test]

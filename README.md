@@ -85,12 +85,23 @@ export OPENAI_MODEL="stealth/ox-alpha"
 laudacode                                     # interactive REPL
 ```
 
-Or skip env vars entirely and use providers:
+Or skip env vars entirely and configure from inside the TUI:
+
+```sh
+laudacode                 # first run: no wizard — just type /provider
+```
+
+`/provider` opens a fully interactive menu (**add · use · edit · list**):
+choose **add** → pick a preset (**tokenrouter**, openai, openrouter, groq,
+deepseek, together, ollama, lmstudio) → paste your API key → pick a model
+from the live catalog. Nothing is saved until a real test request proves
+the key and model work. The CLI flow is still there too — same rule: a provider is only saved
+after a live test request proves the key and model work.
 
 ```sh
 laudacode provider add                        # guided setup (name, url, key, model)
 laudacode provider list
-laudacode provider use openrouter
+laudacode provider use tokenrouter
 laudacode
 ```
 
@@ -117,8 +128,13 @@ Config file at `~/.config/laudacode/config.toml`
 (or `.json`; override location with `LAUDACODE_CONFIG`):
 
 ```toml
-active_provider = "openrouter"
+active_provider = "tokenrouter"
 approval_mode   = "suggest"
+
+[providers.tokenrouter]
+base_url = "https://api.tokenrouter.com/v1"
+api_key  = "tr-..."
+model    = "gpt-4o-mini"
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -171,7 +187,7 @@ laudacode provider add|list|use|edit|remove <name>
 | `/help`              | command overview                             |
 | `/model`             | pick a model from the provider's live list   |
 | `/approvals`         | switch approval mode (plan/build/full-auto)  |
-| `/provider …`        | manage providers (`list` `show` `use <name>`)|
+| `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
 | `/status`            | current provider/model/session               |
 | `/diff`              | git diff of working tree                     |
 | `/init`              | generate AGENTS.md for this project          |
