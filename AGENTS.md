@@ -44,6 +44,10 @@ laudacode exec "list the files in this directory"
 | `src/patch.rs`   | V4A patch parser/applier (`*** Begin Patch` format)                   |
 | `src/session.rs` | conversation persistence (~/.local/share/laudacode/sessions), resume by unique id |
 | `src/repl.rs`    | interactive REPL, slash commands, streaming UI, provider flows        |
+| `src/theme.rs`   | 12 built-in color themes; one palette drives TUI, markdown, syntax and banner gradient |
+| `src/effects.rs` | ambient particle effects in the banner band (petals/rain/lightning/…), xorshift PRNG, auto-pauses while streaming |
+| `src/markdown.rs`| assistant markdown → styled transcript lines (fences highlighted via `syntax.rs`) |
+| `src/syntax.rs`  | dependency-free syntax highlighter feeding code blocks and diff views  |
 
 Precedence rules (do not break): **CLI flags > profile > env vars
 (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`) > config file**.
@@ -58,3 +62,4 @@ Precedence rules (do not break): **CLI flags > profile > env vars
 - Write containment is symlink-aware (`tools::contained_in_workspace*`);
   keep it that way when touching path handling.
 - Tool outputs are truncated (`MAX_TOOL_OUTPUT`) — respect those limits.
+- Never hardcode colors — pull from `theme::get()` so `/theme` recolors everything.

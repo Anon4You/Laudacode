@@ -27,6 +27,10 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
 - 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
 - 📡 **Streaming responses** with reasoning-model support (dimmed "thinking" indicator)
+- 🎨 **12 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice (`/theme`, persisted)
+- ✨ **Ambient effects** — cherry petals 🌸, rain, snow, matrix rain, lightning ⚡, stars, fireflies, bubbles, embers, confetti, meteor comets, aurora (`/effect`, rendered in the banner only)
+- 🌈 **Syntax highlighting** — code blocks and diffs colored per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
+- ⌨️ **Prompt history** — ↑/↓ recall with draft restore; persisted across sessions
 - 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`… plus `@file` mentions, `#note` memories and `!<cmd>` shell passthrough
 - 📄 **AGENTS.md support** — project instructions auto-loaded into context (`/init` generates one)
 - 👤 **Profiles** — named presets in `[profiles.<name>]`, activated with `--profile`
@@ -185,6 +189,8 @@ laudacode provider add|list|use|edit|remove <name>
 | `/model`             | pick a model from the provider's live list   |
 | `/approvals`         | switch approval mode (plan/build/full-auto)  |
 | `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
+| `/theme`             | switch color theme (live preview)            |
+| `/effect`            | ambient effects (petals · rain · lightning…) |
 | `/status`            | current provider/model/session               |
 | `/diff`              | git diff of working tree                     |
 | `/init`              | generate AGENTS.md for this project          |
