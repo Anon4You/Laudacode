@@ -4,10 +4,10 @@
 # override the active provider's values.
 
 # Which provider to use by default
-active_provider = "tokenrouter"
+active_provider = "openrouter"
 
-# Default approval mode: suggest | auto-edit | full-auto
-approval_mode = "suggest"
+# Default approval mode: suggest | auto-edit | full-auto (default: auto-edit)
+approval_mode = "auto-edit"
 
 [providers.tokenrouter]
 base_url = "https://api.tokenrouter.com/v1"

@@ -455,6 +455,8 @@ fn worker_main(
                     run_passthrough_shell(&app, &rt, &ev_tx, shell_cmd);
                     continue;
                 }
+                // Persist for ↑/↓ recall in future sessions.
+                append_prompt_history(&text);
                 last_task = Some(text.clone());
                 let images = std::mem::take(&mut pending_images);
                 run_agent_turn(&mut app, &rt, &ev_tx, &approve_rx, &cancel, &text, &images);
@@ -1250,6 +1252,8 @@ impl App {
         // No wizard on first run — the user connects from inside the TUI.
         let needs_setup = self.active.api_key.is_empty() || self.active.model.is_empty();
         tui.needs_setup = needs_setup;
+        // ↑/↓ recall of prompts from previous sessions too.
+        tui.seed_history(load_prompt_history());
         let shown_model = if self.active.model.is_empty() {
             "(not configured)".to_string()
         } else {
@@ -1618,6 +1622,8 @@ impl App {
     ) -> Result<Self> {
         let active =
             config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
+        // BUILD is the default collaboration mode (auto-approve edits,
+        // ask for commands) unless overridden by flag/config.
         let mode = mode_override
             .or_else(|| {
                 config
@@ -1625,7 +1631,7 @@ impl App {
                     .as_deref()
                     .and_then(ApprovalMode::parse)
             })
-            .unwrap_or(ApprovalMode::Suggest);
+            .unwrap_or(ApprovalMode::AutoEdit);
         let client = ChatClient::new(
             &active.base_url,
             &active.api_key,
@@ -1663,7 +1669,7 @@ impl App {
             client,
             String::new(),
             cwd.clone(),
-            ApprovalMode::Suggest,
+            ApprovalMode::AutoEdit,
             crate::permissions::Permissions::default(),
         );
         let session = Session::new();
@@ -2119,13 +2125,69 @@ pub fn block_current<F: std::future::Future>(fut: F) -> Result<F::Output> {
     Ok(rt.block_on(fut))
 }
 
+// ---------------------------------------------------------------------------
+// Prompt history (~/.local/share/laudacode/sessions/history.txt)
+// ---------------------------------------------------------------------------
+
+fn history_path() -> PathBuf {
+    Session::dir().join("history.txt")
+}
+
+/// Load prompts saved by previous sessions for ↑/↓ recall.
+pub fn load_prompt_history() -> Vec<String> {
+    std::fs::read_to_string(history_path())
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist one submitted prompt (best-effort; history is a convenience).
+fn append_prompt_history(line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let path = history_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+    // The file holds everything the user typed — owner-only on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    trim_history_file(&path);
+}
+
+/// Keep the on-disk history within [`HISTORY_MAX`] lines.
+fn trim_history_file(path: &PathBuf) {
+    const MAX_LINES: usize = 500;
+    let Ok(raw) = std::fs::read_to_string(path) else { return };
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.len() <= MAX_LINES {
+        return;
+    }
+    let keep = lines[lines.len() - MAX_LINES..].join("\n");
+    let _ = std::fs::write(path, keep + "\n");
+}
+
 /// Known OpenAI-compatible endpoints surfaced by `/provider add` (TUI) and
-/// the interactive `laudacode provider add` flow. TokenRouter first — it is
-/// the recommended default gateway.
+/// the interactive `laudacode provider add` flow. OpenRouter first — it is
+/// the default recommendation (widest model catalog).
 pub const PROVIDER_PRESETS: &[(&str, &str)] = &[
+    ("openrouter", "https://openrouter.ai/api/v1"),
     ("tokenrouter", "https://api.tokenrouter.com/v1"),
     ("openai", "https://api.openai.com/v1"),
-    ("openrouter", "https://openrouter.ai/api/v1"),
     ("groq", "https://api.groq.com/openai/v1"),
     ("deepseek", "https://api.deepseek.com/v1"),
     ("together", "https://api.together.xyz/v1"),
@@ -2387,9 +2449,9 @@ pub fn add_provider_flow(
     }
 
     let presets: &[(&str, &str)] = &[
+        ("openrouter", "https://openrouter.ai/api/v1"),
         ("tokenrouter", "https://api.tokenrouter.com/v1"),
         ("openai", "https://api.openai.com/v1"),
-        ("openrouter", "https://openrouter.ai/api/v1"),
         ("groq", "https://api.groq.com/openai/v1"),
         ("deepseek", "https://api.deepseek.com/v1"),
         ("together", "https://api.together.xyz/v1"),
@@ -2579,10 +2641,14 @@ mod tests {
     }
 
     #[test]
-    fn tokenrouter_preset_is_present_and_first() {
+    fn openrouter_preset_is_first_and_labels_roundtrip() {
         let (name, url) = PROVIDER_PRESETS.first().expect("presets non-empty");
-        assert_eq!(*name, "tokenrouter");
-        assert_eq!(*url, "https://api.tokenrouter.com/v1");
+        assert_eq!(*name, "openrouter");
+        assert_eq!(*url, "https://openrouter.ai/api/v1");
+        assert!(
+            PROVIDER_PRESETS.iter().any(|(k, _)| *k == "tokenrouter"),
+            "tokenrouter stays available"
+        );
         // Every preset label round-trips through the picker parser.
         for (k, u) in PROVIDER_PRESETS {
             let parsed = parse_preset_label(&format!("{k} · {u}")).unwrap();
@@ -2608,6 +2674,47 @@ mod tests {
             reasoning_effort: None,
         };
         assert!(verify_provider_creds(&p).is_ok(), "local URLs skip the probe");
+    }
+
+    #[test]
+    fn default_mode_is_build() {
+        let dir = std::env::temp_dir().join(format!("lc-defmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Fully specified endpoint so resolution never touches env vars.
+        let args = (
+            Some("t"),
+            Some("http://localhost:9/v1"),
+            Some("k"),
+            Some("m"),
+        );
+        let app = App::build_with_config(
+            dir.clone(),
+            Config::default(),
+            args.0, args.1, args.2, args.3, None,
+        )
+        .expect("app builds");
+        assert_eq!(app.agent.mode, ApprovalMode::AutoEdit, "BUILD is the default mode");
+        // Explicit config still wins over the default.
+        let cfg = Config {
+            approval_mode: Some("suggest".into()),
+            ..Default::default()
+        };
+        let app = App::build_with_config(dir, cfg, args.0, args.1, args.2, args.3, None).unwrap();
+        assert_eq!(app.agent.mode, ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn prompt_history_roundtrips_through_disk() {        // Same lock as session tests — both flip LAUDACODE_SESSIONS_DIR.
+        let _g = crate::session::test_sync::env_lock();
+        let dir = std::env::temp_dir().join(format!("lc-hist-{}-{}", std::process::id(), std::time::Instant::now().elapsed().as_nanos()));
+        std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
+        // Isolated dir starts empty.
+        assert!(load_prompt_history().is_empty());
+        append_prompt_history("first task");
+        append_prompt_history("second task");
+        append_prompt_history("   ");
+        assert_eq!(load_prompt_history(), vec!["first task", "second task"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

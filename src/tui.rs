@@ -1,5 +1,5 @@
-use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -21,6 +21,14 @@ pub enum Mode {
     /// Everything auto-approved unless dangerous.
     FullAuto,
 }
+
+/// Subtle background tints so added/removed diff rows stay unmistakable
+/// while syntax token colors render inside them.
+const ADD_BG: Color = Color::Rgb(24, 48, 30);
+const DEL_BG: Color = Color::Rgb(56, 26, 30);
+
+/// Cap on remembered prompts for ↑/↓ recall.
+const HISTORY_MAX: usize = 500;
 
 impl Mode {
     pub fn next(self) -> Self {
@@ -275,6 +283,12 @@ pub struct Tui {
     last_tick: Instant,
     /// Session start for the dashboard elapsed timer.
     session_started: Instant,
+    /// Sent-prompt history for ↑/↓ recall (newest last).
+    pub history: Vec<String>,
+    /// Index into [`Tui::history`] while browsing; None = not browsing.
+    history_pos: Option<usize>,
+    /// In-progress draft saved when history browsing starts, restored by ↓.
+    history_draft: String,
 }
 
 /// Identity + counters rendered in the wide-terminal side dashboard.
@@ -408,7 +422,90 @@ impl Tui {
             processed_entries: 0,
             entry_state: Vec::new(),
             last_tick: Instant::now(),
+            history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
         }
+    }
+
+    /// Record a submitted prompt for ↑/↓ recall. Consecutive duplicates are
+    /// skipped and the list is capped.
+    pub fn record_history(&mut self, entry: &str) {
+        self.history_pos = None;
+        self.history_draft.clear();
+        if entry.is_empty() {
+            return;
+        }
+        if self.history.last().map(|l| l == entry).unwrap_or(false) {
+            return;
+        }
+        self.history.push(entry.to_string());
+        if self.history.len() > HISTORY_MAX {
+            let drop = self.history.len() - HISTORY_MAX;
+            self.history.drain(..drop);
+        }
+    }
+
+    /// Seed with persisted history from previous sessions (merged at the
+    /// front so this session's entries stay newest).
+    pub fn seed_history(&mut self, past: Vec<String>) {
+        if past.is_empty() {
+            return;
+        }
+        let mut merged = past;
+        merged.append(&mut self.history);
+        merged.dedup();
+        if merged.len() > HISTORY_MAX {
+            let drop = merged.len() - HISTORY_MAX;
+            merged.drain(..drop);
+        }
+        self.history = merged;
+    }
+
+    /// ↑ — older prompt. Starts browsing from the newest entry (any typed
+    /// draft is saved for ↓ to restore).
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_pos {
+            None => {
+                self.history_draft = std::mem::take(&mut self.input);
+                let pos = self.history.len() - 1;
+                self.history_pos = Some(pos);
+                self.input = self.history[pos].clone();
+            }
+            Some(pos) => {
+                if pos > 0 {
+                    self.history_pos = Some(pos - 1);
+                    self.input = self.history[pos - 1].clone();
+                }
+            }
+        }
+    }
+
+    /// ↓ walks forward through history; past the newest it restores
+    /// the draft and exits browsing mode.
+    fn history_down(&mut self) {
+        if let Some(pos) = self.history_pos {
+            if pos + 1 < self.history.len() {
+                self.history_pos = Some(pos + 1);
+                self.input = self.history[pos + 1].clone();
+            } else {
+                self.history_pos = None;
+                self.input = std::mem::take(&mut self.history_draft);
+            }
+        }
+    }
+
+    /// Scroll the transcript up by `n` rows (wheel / PgUp).
+    pub fn page_up(&mut self, n: usize) {
+        self.scroll += n;
+    }
+
+    /// Scroll the transcript down by `n` rows (wheel / PgDn), clamped at 0.
+    pub fn page_down(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
     }
 
     pub fn push(&mut self, e: Entry) {
@@ -799,18 +896,58 @@ impl Tui {
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         ),
                     ]));
+                    // Syntax-aware diff rows: token colors from the file's
+                    // language over subtle add/remove backgrounds.
+                    let lang = crate::syntax::lang_of(&f.path);
+                    let mut syn_state = crate::syntax::SynState::default();
                     for dl in &f.lines {
-                        // Hard-wrap long diff rows so phones don't scroll sideways.
-                        for seg in wrap_text(&dl.text, width.saturating_sub(4) as usize) {
-                            let style = match dl.kind {
-                                LineKind::Add => Style::default().fg(Color::Green),
-                                LineKind::Del => Style::default().fg(Color::Red),
-                                LineKind::Meta => {
-                                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC)
+                        let (bar, tint) = match dl.kind {
+                            LineKind::Add => ("│", Some(ADD_BG)),
+                            LineKind::Del => ("│", Some(DEL_BG)),
+                            LineKind::Meta => ("│", None),
+                            LineKind::Ctx => ("│", None),
+                        };
+                        let bar_style = match dl.kind {
+                            LineKind::Add => Style::default().fg(Color::Green),
+                            LineKind::Del => Style::default().fg(Color::Red),
+                            LineKind::Meta => {
+                                Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC)
+                            }
+                            LineKind::Ctx => Style::default().fg(Color::DarkGray),
+                        };
+                        // Meta lines (@@ headers) stay plain; code gets tokens.
+                        // The +/-/-sign keeps its strong kind color.
+                        let content: Vec<Span<'static>> = match dl.kind {
+                            LineKind::Meta => vec![Span::styled(
+                                dl.text.clone(),
+                                Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC),
+                            )],
+                            _ => {
+                                let base = match tint {
+                                    Some(bg) => Style::default().bg(bg),
+                                    None => Style::default(),
+                                };
+                                let mut spans: Vec<Span<'static>> = Vec::new();
+                                if let Some(rest) = dl.text.strip_prefix('+').or_else(|| dl.text.strip_prefix('-')) {
+                                    let sign_color = match dl.kind {
+                                        LineKind::Add => Color::Green,
+                                        _ => Color::Red,
+                                    };
+                                    spans.push(Span::styled(
+                                        dl.text[..1].to_string(),
+                                        base.fg(sign_color).add_modifier(Modifier::BOLD),
+                                    ));
+                                    spans.extend(crate::syntax::highlight_line(rest, lang, &mut syn_state, base));
+                                } else {
+                                    spans.extend(crate::syntax::highlight_line(&dl.text, lang, &mut syn_state, base));
                                 }
-                                LineKind::Ctx => Style::default().fg(Color::DarkGray),
-                            };
-                            lines.push(Line::from(Span::styled(format!("│{seg}"), style)));
+                                spans
+                            }
+                        };
+                        for seg in crate::markdown::wrap_styled(&content, width.saturating_sub(4) as usize) {
+                            let mut row = vec![Span::styled(bar.to_string(), bar_style)];
+                            row.extend(seg.spans);
+                            lines.push(Line::from(row));
                         }
                     }
                     lines.push(Line::from(Span::styled("└─", Style::default().fg(Color::Cyan))));
@@ -1041,7 +1178,7 @@ impl Tui {
         // Hints strip under the composer.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " enter send · esc interrupt · tab mode · ctrl+o expand · ! shell · ctrl+c quit ",
+                " enter send · ↑↓ history · pgup/pgdn scroll · tab mode · esc interrupt · ctrl+c quit ",
                 Style::default().fg(Color::DarkGray),
             ))),
             hints_area,
@@ -1260,6 +1397,7 @@ fn fmt_elapsed(secs: u64) -> String {
 
 /// Fixed dashboard column width on wide terminals.
 const DASH_WIDTH: u16 = 28;
+
 
     /// Centered approval dialog: detail + y/a/n options.
     fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
@@ -1675,6 +1813,7 @@ const DASH_WIDTH: u16 = 28;
             {
                 let input = self.input.trim().to_string();
                 self.input.clear();
+                self.record_history(&input);
                 if input.is_empty() { Action::None } else { Action::Submit(input) }
             }
             // Shift+Enter / Alt+Enter insert a newline instead of submitting.
@@ -1734,6 +1873,7 @@ const DASH_WIDTH: u16 = 28;
             KeyCode::Esc => {
                 // Close an open @-token first, then release scroll, then
                 // clear the input — and always signal interrupt.
+                self.history_pos = None;
                 if self.at_token_present() {
                     if let Some(i) = self.input.rfind('@') {
                         self.input.truncate(i);
@@ -1746,10 +1886,18 @@ const DASH_WIDTH: u16 = 28;
                 }
                 Action::Interrupt
             }
-            KeyCode::Up if self.scrollable() => { self.scroll += 3; Action::None }
-            KeyCode::Down => { self.scroll = self.scroll.saturating_sub(3); Action::None }
-            KeyCode::PageUp if self.scrollable() => { self.scroll += 20; Action::None }
-            KeyCode::PageDown => { self.scroll = self.scroll.saturating_sub(20); Action::None }
+            // Scrolling lives on PageUp/PageDown only — the arrow keys are
+            // fully reserved for prompt-history recall.
+            KeyCode::Up => {
+                self.history_up();
+                Action::None
+            }
+            KeyCode::Down => {
+                self.history_down();
+                Action::None
+            }
+            KeyCode::PageUp if self.scrollable() => { self.page_up(20); Action::None }
+            KeyCode::PageDown => { self.page_down(20); Action::None }
             _ => Action::None,
         }
     }
@@ -1819,10 +1967,14 @@ pub fn enter_tui() -> std::io::Result<()> {
     // Bracketed paste makes terminals deliver multi-line clipboard content as
     // ONE paste event instead of a stream of Enter presses — without it,
     // pasting anything multi-line instantly submitted the composer.
+    // Mouse capture makes touch/swipe gestures arrive as wheel events so
+    // fingers scroll the transcript while physical ↑/↓ stay on history
+    // (crucial on Termux, where swipes are otherwise sent as arrow keys).
     crossterm::execute!(
         stdout,
         EnterAlternateScreen,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
     Ok(())
 }
@@ -1832,6 +1984,7 @@ pub fn leave_tui() {
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     );
@@ -1891,6 +2044,17 @@ where
                 // Multi-line clipboard content arrives as one event thanks to
                 // bracketed paste — insert it verbatim, never auto-submit.
                 tui.insert_paste(&text);
+                let _ = on_action(tui, Action::None);
+            }
+            crossterm::event::Event::Mouse(me) => {
+                // Finger swipes / touch scrolling arrive as wheel events
+                // (mouse capture is on). Modals ignore them; the transcript
+                // scrolls a few lines per wheel tick.
+                match me.kind {
+                    MouseEventKind::ScrollUp => tui.page_up(3),
+                    MouseEventKind::ScrollDown => tui.page_down(3),
+                    _ => {}
+                }
                 let _ = on_action(tui, Action::None);
             }
             crossterm::event::Event::Resize(_, _) => {}
@@ -2312,6 +2476,76 @@ mod tests {
         t.input = "fix the bug".into();
         assert!(matches!(t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
     }
+
+    fn submit(t: &mut Tui, text: &str) {
+        t.input = text.into();
+        assert!(matches!(t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
+    }
+
+    #[test]
+    fn up_down_recall_prompts_and_restore_draft() {
+        let mut t = Tui::new();
+        submit(&mut t, "first prompt");
+        submit(&mut t, "second prompt");
+        // Empty composer + ↑ recalls newest.
+        t.input.clear();
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(t.input, "second prompt");
+        // ↑ again walks older.
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(t.input, "first prompt");
+        // ↓ walks newer…
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(t.input, "second prompt");
+        // …and past the newest exits history (empty draft).
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(t.input, "");
+        assert!(t.history_pos.is_none());
+    }
+
+    #[test]
+    fn history_skips_consecutive_duplicates_and_caps_size() {
+        let mut t = Tui::new();
+        submit(&mut t, "same");
+        submit(&mut t, "same");
+        submit(&mut t, "other");
+        assert_eq!(t.history, vec!["same".to_string(), "other".to_string()]);
+        for i in 0..(HISTORY_MAX + 20) {
+            t.record_history(&format!("p{i}"));
+        }
+        assert_eq!(t.history.len(), HISTORY_MAX);
+    }
+
+    #[test]
+    fn arrows_are_history_only_scrolling_on_page_keys() {
+        let mut t = Tui::new();
+        submit(&mut t, "old prompt");
+        // ↑ recalls even when the composer has text — arrows are dedicated
+        // to history (typed draft is saved for ↓).
+        t.input = "half-typed".into();
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(t.input, "old prompt");
+        // ↓ past the newest restores the saved draft.
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(t.input, "half-typed");
+        // Arrows never scroll; PageUp/PageDown do.
+        t.on_key(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(t.scroll, 20);
+        t.on_key(key(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(t.scroll, 0);
+    }
+
+    #[test]
+    fn seed_history_merges_persisted_entries() {
+        let mut t = Tui::new();
+        submit(&mut t, "live one");
+        t.seed_history(vec!["from disk".into(), "older".into()]);
+        assert_eq!(t.history.len(), 3);
+        assert_eq!(t.history.last().map(String::as_str), Some("live one"));
+        t.input.clear();
+        t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(t.input, "live one", "session entries stay newest");
+    }
     fn line_texts(t: &Tui, width: u16) -> Vec<String> {
         let mut probe = clone_shallow(t);
         probe.ensure_render_cache(width);
@@ -2378,21 +2612,25 @@ mod tests {
         assert!(joined.contains("┌─ src/lib.rs (+1 −1)"), "{joined}");
         assert!(joined.contains("│-b"), "{joined}");
         assert!(joined.contains("│+c"), "{joined}");
-        // Colors are attached to the right kinds.
+        // Colors are attached to the right kinds: the bar keeps its
+        // kind color while the content row is syntax-highlighted.
         let mut probe = clone_shallow(&t);
         probe.ensure_render_cache(60);
-        let add_span = probe
+        let add_line = probe
             .cached_lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content == "│+c"))
-            .unwrap();
-        assert_eq!(add_span.spans[0].style.fg, Some(Color::Green));
-        let del_span = probe
+            .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "+" && l.spans[2].content == "c")
+            .unwrap_or_else(|| panic!("no +c diff line"));
+        assert_eq!(add_line.spans[0].style.fg, Some(Color::Green), "add bar green");
+        assert_eq!(add_line.spans[1].style.fg, Some(Color::Green), "+ sign stays green");
+        assert_eq!(add_line.spans[2].style.bg, Some(ADD_BG), "add tint behind content");
+        let del_line = probe
             .cached_lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content == "│-b"))
+            .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "-" && l.spans[2].content == "b")
             .unwrap();
-        assert_eq!(del_span.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(del_line.spans[0].style.fg, Some(Color::Red), "del bar red");
+        assert_eq!(del_line.spans[2].style.bg, Some(DEL_BG), "del tint behind content");
     }
 
     #[test]

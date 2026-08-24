@@ -147,16 +147,26 @@ fn uuid_short() -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_sync {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serializes tests that mutate process-wide env vars — cargo runs test
+    /// threads in parallel and env races made this suite flaky.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_env() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // Shared with every other env-flipping test (see repl::history).
+        let guard = test_sync::env_lock();
         let dir = std::env::temp_dir().join(format!(
             "lc-sessions-test-{}-{}",
             std::process::id(),

@@ -15,23 +15,30 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
     let w = width.max(10);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
+    let mut code_lang = "";
+    let mut syn_state = crate::syntax::SynState::default();
 
     for raw in text.split('\n') {
         let line = raw.trim_end();
         let trimmed = line.trim();
 
-        if trimmed.starts_with("```") {
+        if let Some(tag) = trimmed.strip_prefix("```") {
+            if !in_code {
+                // Opening fence — remember the language tag (```rust …).
+                code_lang = crate::syntax::lang_of(tag.trim());
+            }
             in_code = !in_code;
+            syn_state = crate::syntax::SynState::default();
             out.push(rule_line(w));
             continue;
         }
         if in_code {
-            for seg in hard_split(line, w.saturating_sub(3)) {
-                out.push(Line::from(Span::styled(
-                    format!("  {seg}"),
-                    Style::default().fg(CODE_FG).bg(CODE_BG),
-                )));
-            }
+            // Syntax-highlighted code row(s), padded and hard-split.
+            let inner_w = w.saturating_sub(3);
+            let base = Style::default().fg(CODE_FG).bg(CODE_BG);
+            let mut spans = vec![Span::styled("  ".to_string(), base)];
+            spans.extend(crate::syntax::highlight_line(line, code_lang, &mut syn_state, base));
+            out.extend(hard_split_spans(spans, inner_w));
             continue;
         }
 
@@ -176,7 +183,8 @@ fn flush(spans: &mut Vec<Span<'static>>, buf: &mut String, bold: bool, italic: b
     }
     let mut style = Style::default();
     if code {
-        style = style.fg(CODE_FG);
+        // Inline code renders as a chip: tinted text on a darker plate.
+        style = style.fg(CODE_FG).bg(CODE_BG);
     } else {
         style = style.fg(Color::White);
         if bold {
@@ -239,18 +247,26 @@ fn split_keep_spaces(s: &str) -> Vec<String> {
     out
 }
 
-/// Character-based hard split for code blocks (no word wrapping).
-fn hard_split(s: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![s.to_string()];
+/// Hard-split styled spans into rows of at most `width` display columns,
+/// preserving per-span styles across the split.
+fn hard_split_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut cur_w = 0usize;
+    for span in spans {
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+            if cur_w + cw > width && width > 0 {
+                rows.push(Vec::new());
+                cur_w = 0;
+            }
+            rows.last_mut()
+                .unwrap()
+                .push(Span::styled(ch.to_string(), span.style));
+            cur_w += cw;
+        }
     }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
-        return vec![s.to_string()];
-    }
-    chars
-        .chunks(width)
-        .map(|c| c.iter().collect())
+    rows.into_iter()
+        .map(Line::from)
         .collect()
 }
 

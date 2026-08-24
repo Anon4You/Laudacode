@@ -9,6 +9,7 @@ mod patch;
 mod permissions;
 mod repl;
 mod session;
+mod syntax;
 mod tools;
 mod tui;
 

@@ -92,8 +92,8 @@ laudacode                 # first run: no wizard — just type /provider
 ```
 
 `/provider` opens a fully interactive menu (**add · use · edit · list**):
-choose **add** → pick a preset (**tokenrouter**, openai, openrouter, groq,
-deepseek, together, ollama, lmstudio) → paste your API key → pick a model
+choose **add** → pick a preset (**openrouter**, tokenrouter, openai,
+groq, deepseek, together, ollama, lmstudio) → paste your API key → pick a model
 from the live catalog. Nothing is saved until a real test request proves
 the key and model work. The CLI flow is still there too — same rule: a provider is only saved
 after a live test request proves the key and model work.
@@ -128,13 +128,8 @@ Config file at `~/.config/laudacode/config.toml`
 (or `.json`; override location with `LAUDACODE_CONFIG`):
 
 ```toml
-active_provider = "tokenrouter"
+active_provider = "openrouter"
 approval_mode   = "suggest"
-
-[providers.tokenrouter]
-base_url = "https://api.tokenrouter.com/v1"
-api_key  = "tr-..."
-model    = "gpt-4o-mini"
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -155,10 +150,12 @@ OpenRouter, Groq, DeepSeek, Ollama, LM Studio).
 
 ## Approval modes
 
+Default mode is **BUILD** (`auto-edit`).
+
 | `--mode` value          | TUI label  | File edits | Shell commands | Dangerous commands |
 |--------------------------|------------|------------|----------------|--------------------|
 | `suggest` (alias `ask`)  | PLAN       | ask        | ask            | ask                |
-| `auto-edit`              | BUILD      | ✅ auto    | ask            | ask                |
+| `auto-edit` *(default)*  | BUILD      | ✅ auto    | ask            | ask                |
 | `full-auto` (alias `yolo`)| FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
 
 You can also answer `[a]always` on any prompt to auto-approve the rest of the
