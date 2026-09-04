@@ -1,8 +1,10 @@
-use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -77,6 +79,8 @@ fn banner_colors() -> Vec<Color> {
 
 /// Total header height: 13 braille-art rows (branding is embedded in the art).
 const HEADER_HEIGHT: u16 = 13;
+/// Height of the slim one-line wordmark header used on short/narrow windows.
+const HEADER_COMPACT: u16 = 1;
 
 /// One entry in the transcript (the scrolling history above the composer).
 #[derive(Debug, Clone)]
@@ -294,6 +298,11 @@ pub struct Tui {
     /// Byte index of the editing caret in [`Tui::input`]. Left/Right move it;
     /// typed characters insert here instead of always appending.
     cursor: usize,
+    /// Geometry of the last drawn frames, used to map touch/mouse taps back
+    /// onto widgets (composer caret, picker rows, transcript).
+    last_transcript: Option<Rect>,
+    last_composer: Option<Rect>,
+    last_picker: Option<Rect>,
 }
 
 /// Identity + counters rendered in the wide-terminal side dashboard.
@@ -447,6 +456,9 @@ impl Tui {
             history_pos: None,
             history_draft: String::new(),
             cursor: 0,
+            last_transcript: None,
+            last_composer: None,
+            last_picker: None,
         }
     }
 
@@ -1098,6 +1110,64 @@ impl Tui {
         }
     }
 
+    /// Height of the header to reserve — 0 = none.
+    ///   full 13-row art  → wide AND tall enough
+    ///   compact 1-line   → some width but little height (mobile portrait)
+    pub fn header_height(total_w: u16, total_h: u16, show_banner: bool) -> u16 {
+        if !show_banner {
+            return 0;
+        }
+        if total_w >= 60 && total_h >= 23 {
+            HEADER_HEIGHT
+        } else if total_w >= 40 && total_h >= 10 {
+            HEADER_COMPACT
+        } else {
+            0
+        }
+    }
+
+    /// Height of the compact summary bar shown when the side dashboard can't
+    /// fit (narrow window) but there's still room for a single info line.
+    pub fn compact_summary_h(total_w: u16, total_h: u16, no_dashboard: bool) -> u16 {
+        if no_dashboard && total_w >= 48 && total_h >= 14 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Build the hint strip, dropping low-priority chips until it fits
+    /// `width` columns. Chips are ordered most-important first so a narrow
+    /// Termux window never clips a one-line hint awkwardly.
+    fn hint_line(width: u16) -> String {
+        const CHIPS: &[&str] = &[
+            "enter send",
+            "esc interrupt",
+            "↑↓ history",
+            "tab mode",
+            "←→ edit",
+            "ctrl+c quit",
+            "pgup/pgdn scroll",
+        ];
+        let w = width as usize;
+        if w < 12 {
+            return " esc".to_string();
+        }
+        let mut out = String::with_capacity(w);
+        out.push(' ');
+        for (i, chip) in CHIPS.iter().enumerate() {
+            let sep = if i == 0 { "" } else { " · " };
+            let added = format!("{sep}{chip}");
+            if out.chars().count() + added.chars().count() > w.saturating_sub(1) {
+                break;
+            }
+            out.push_str(&added);
+        }
+        if out.trim_end() == "" {
+            out = " esc".into();
+        }
+        out
+    }
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
 
@@ -1139,51 +1209,100 @@ impl Tui {
         // The composer grows with the draft instead of clipping long prompts.
         let comp_h = self.composer_height(area.width, area.height);
 
-        // Header (brand banner) is shown when there's room for it — the art
-        // is 13 rows and up to 59 columns wide (embedded wordmark text).
-        let show_header = self.show_banner && area.height >= 23 && area.width >= 60;
-        let chunks = if show_header {
-            Layout::vertical([
-                Constraint::Length(HEADER_HEIGHT), // banner
-                Constraint::Min(1),                // transcript
-                Constraint::Length(comp_h),        // composer (auto-expands)
-                Constraint::Length(1),             // hints
-                Constraint::Length(1),             // footer
-            ])
-            .split(area)
+        // Adaptive header: full 13-row banner when there's room; a slim
+        // one-line wordmark when the window is short/narrow; nothing on tiny
+        // screens. This keeps the transcript front-and-center on mobile.
+        let header_rows = Self::header_height(area.width, area.height, self.show_banner);
+        let has_header = header_rows > 0;
+        // When no side dashboard fits (narrow window), show a compact summary
+        // bar above the composer so identity/tokens/plan stay glanceable.
+        let compact_h = Self::compact_summary_h(area.width, area.height, dash_area.is_none());
+        let has_compact = compact_h > 0;
+
+        let mut constraints = Vec::with_capacity(6);
+        if has_header {
+            constraints.push(Constraint::Length(header_rows));
+        }
+        constraints.push(Constraint::Min(1));
+        if has_compact {
+            constraints.push(Constraint::Length(compact_h));
+        }
+        constraints.push(Constraint::Length(comp_h));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+        let chunks = Layout::vertical(constraints).split(area);
+        let mut idx = 0usize;
+        let header = if has_header {
+            let h = chunks[idx];
+            idx += 1;
+            Some(h)
         } else {
-            Layout::vertical([
-                Constraint::Min(1),      // transcript
-                Constraint::Length(comp_h),
-                Constraint::Length(1),   // hints
-                Constraint::Length(1),   // footer
-            ])
-            .split(area)
+            None
         };
-        let (header, transcript_area, composer_area, hints_area, footer_area) = if show_header {
-            (Some(chunks[0]), chunks[1], chunks[2], chunks[3], chunks[4])
+        let transcript_area = chunks[idx];
+        idx += 1;
+        let compact_area = if has_compact {
+            let c = chunks[idx];
+            idx += 1;
+            Some(c)
         } else {
-            (None, chunks[0], chunks[1], chunks[2], chunks[3])
+            None
         };
+        let composer_area = chunks[idx];
+        idx += 1;
+        let hints_area = chunks[idx];
+        idx += 1;
+        let footer_area = chunks[idx];
 
         if let Some(h) = header {
-            let grad = banner_colors();
-            let banner_lines: Vec<Line> = BANNER
-                .lines()
-                .zip(grad.iter())
-                .map(|(row, color)| {
-                    Line::from(Span::styled(
-                        row.to_string(),
-                        Style::default().fg(*color).add_modifier(Modifier::BOLD),
-                    ))
-                })
-                .collect();
-            f.render_widget(Paragraph::new(banner_lines), h);
-            // Ambient particles live inside the banner band only.
-            self.fx.set_area(h.width, h.height);
-            if !self.is_busy() {
-                self.fx.render(f.buffer_mut(), h);
+            if header_rows == HEADER_COMPACT {
+                // Slim wordmark line — mode chip + version, one row.
+                let line = Line::from(vec![
+                    Span::styled(
+                        " LaudaCode ",
+                        Style::default()
+                            .fg(banner_colors()[0])
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" v{} · {}", env!("CARGO_PKG_VERSION"), self.mode.label()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                f.render_widget(Paragraph::new(line), h);
+            } else {
+                let grad = banner_colors();
+                let banner_lines: Vec<Line> = BANNER
+                    .lines()
+                    .zip(grad.iter())
+                    .map(|(row, color)| {
+                        Line::from(Span::styled(
+                            row.to_string(),
+                            Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                        ))
+                    })
+                    .collect();
+                f.render_widget(Paragraph::new(banner_lines), h);
+                // Ambient particles live inside the banner band only.
+                self.fx.set_area(h.width, h.height);
+                if !self.is_busy() {
+                    self.fx.render(f.buffer_mut(), h);
+                }
             }
+        }
+
+        // Record widget geometry so touch/mouse taps can be mapped back.
+        self.last_transcript = Some(transcript_area);
+        self.last_composer = Some(composer_area);
+
+        // Compact summary bar (narrow screens only — fills in for the side
+        // dashboard): model · provider · session · tokens · plan.
+        if let Some(c) = compact_area {
+            let line = self.compact_summary(c.width);
+            f.render_widget(
+                Paragraph::new(Line::from(line)).alignment(ratatui::layout::Alignment::Left),
+                c,
+            );
         }
 
         // Transcript
@@ -1261,12 +1380,12 @@ impl Tui {
             self.draw_at_popup(f, area, composer_area);
         }
 
-        // Hints strip under the composer.
+        // Hints strip under the composer — adapts to width so it never clips
+        // awkwardly on narrow Termux screens: priority chips first, trimmed
+        // to what fits, or a minimal row on the smallest widths.
+        let hint = Self::hint_line(hints_area.width);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " enter send · ←→ edit · ↑↓ history · pgup/pgdn scroll · tab mode · esc interrupt · ctrl+c quit ",
-                Style::default().fg(Color::DarkGray),
-            ))),
+            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
             hints_area,
         );
 
@@ -1343,6 +1462,40 @@ impl Tui {
         if let Some(dash_rect) = dash_area {
             self.draw_dashboard(f, dash_rect);
         }
+    }
+
+    /// Compact one-line summary for narrow windows (no side dashboard).
+    /// Prioritizes the most glanceable info, truncated to `width`.
+    fn compact_summary(&self, width: u16) -> Vec<Span<'static>> {
+        let w = width as usize;
+        let mut parts: Vec<String> = Vec::new();
+        if !self.dash.session_id.is_empty() {
+            parts.push(self.dash.session_id.clone());
+        }
+        if !self.dash.model.is_empty() {
+            parts.push(self.dash.model.clone());
+        }
+        if !self.dash.provider.is_empty() {
+            parts.push(self.dash.provider.clone());
+        }
+        if self.dash.tot_tokens > 0 {
+            parts.push(format!("{} tok", Self::fmt_tokens(self.dash.tot_tokens)));
+        }
+        if self.dash.plan_total > 0 {
+            parts.push(format!("plan {}/{}", self.dash.plan_done, self.dash.plan_total));
+        }
+        let joined = parts.join(" · ");
+        let mut spans = vec![
+            Span::styled(" ", Style::default().fg(Color::DarkGray)),
+            Span::styled("LaudaCode", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+        ];
+        let budget = w.saturating_sub(14);
+        if budget >= 4 {
+            let shown = Self::truncate_to(joined, budget);
+            spans.push(Span::styled(shown, Style::default().fg(Color::Gray)));
+        }
+        spans
     }
 
     /// Persistent right-side panel: session identity + live counters.
@@ -1731,6 +1884,7 @@ const DASH_WIDTH: u16 = 40;
     }
 
     fn draw_picker(&mut self, f: &mut Frame, area: Rect, p: &mut Picker) {
+        self.last_picker = Some(area);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(format!(" {} ", p.title), Style::default().fg(Color::Cyan)))
@@ -2028,6 +2182,108 @@ const DASH_WIDTH: u16 = 40;
         true
     }
 
+    /// Convert touch/mouse events into UI actions. Returns an `Action` for the
+    /// host to run (e.g. confirming a tapped picker row), or `None` when the
+    /// event was consumed purely by the TUI (scrolling, caret placement).
+    pub fn on_mouse(&mut self, me: MouseEvent) -> Option<Action> {
+        // Touch swipes and mouse wheels both arrive as scroll events.
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                self.page_up(3);
+                return None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.page_down(3);
+                return None;
+            }
+            MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft => return None,
+            _ => {}
+        }
+
+        // Only act on the completion of a tap (button release) so a simple
+        // tap on a row both selects and confirms it.
+        if me.kind != MouseEventKind::Up(MouseButton::Left) {
+            return None;
+        }
+        let pos = Position::new(me.column, me.row);
+
+        // Tapping inside an open picker selects + confirms that row.
+        if self.picker.is_some() {
+            if let Some(area) = self.last_picker {
+                if area.contains(pos) {
+                    return self.picker_tap_row(me.row, area);
+                }
+            }
+        }
+
+        // Tapping inside the composer repositions the editing caret.
+        if let Some(c) = self.last_composer {
+            if c.contains(pos) {
+                self.caret_to_tap(c, me.column, me.row);
+                return None;
+            }
+        }
+
+        None
+    }
+
+    /// Tap-to-choose for the open picker: the tapped row (0-based item index)
+    /// is selected and confirmed, matching what `Enter` does.
+    fn picker_tap_row(&mut self, row: u16, area: Rect) -> Option<Action> {
+        let tapped = {
+            let p = self.picker.as_mut()?;
+            let idxs = p.filtered();
+            if idxs.is_empty() {
+                return None;
+            }
+            // Items live below the top border + filter row and above the
+            // footer row: border(1) + filter(1) + footer(1).
+            let max = area.height.saturating_sub(3) as usize;
+            if max == 0 {
+                return None;
+            }
+            let sel_pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
+            let start = sel_pos.saturating_sub(max / 2);
+            let ri = row.saturating_sub(area.y + 2) as usize;
+            if ri >= max || start + ri >= idxs.len() {
+                return None;
+            }
+            (p.items[idxs[start + ri]].clone(), p.title.clone().to_lowercase())
+        };
+        self.picker = None;
+        Some(Action::OpenSlash(format!("{}:{}", tapped.1, tapped.0)))
+    }
+
+    /// Place the editing caret nearest the tapped point inside the composer.
+    fn caret_to_tap(&mut self, composer: Rect, col: u16, row: u16) {
+        if self.pending_approval.is_some() || self.input.is_empty() {
+            return;
+        }
+        let inner_w = composer.width.saturating_sub(2).max(10) as usize;
+        let segs = wrap_composer(&self.input, inner_w);
+        let screen_inner_top = composer.y as usize + 1;
+        let rel_row = row as usize;
+        if rel_row < screen_inner_top {
+            return;
+        }
+        let text_row = rel_row - screen_inner_top;
+        // Jump to the end when the tap lands below the wrapped text.
+        if text_row >= segs.len() {
+            self.cursor = self.input.chars().count();
+            return;
+        }
+        let tap_col = col.saturating_sub(composer.x + 1) as usize;
+        let mut char_idx = 0usize;
+        for (r, seg) in segs.iter().enumerate() {
+            if r == text_row {
+                char_idx += seg.chars().take(tap_col.min(seg.chars().count())).count();
+                break;
+            }
+            char_idx += seg.chars().count();
+        }
+        self.cursor = char_idx.min(self.input.chars().count());
+    }
+
     fn on_picker_key(&mut self, key: KeyEvent) -> Action {
         let mut action = Action::None;
         {
@@ -2172,15 +2428,20 @@ where
                 let _ = on_action(tui, Action::None);
             }
             crossterm::event::Event::Mouse(me) => {
-                // Finger swipes / touch scrolling arrive as wheel events
-                // (mouse capture is on). Modals ignore them; the transcript
-                // scrolls a few lines per wheel tick.
-                match me.kind {
-                    MouseEventKind::ScrollUp => tui.page_up(3),
-                    MouseEventKind::ScrollDown => tui.page_down(3),
-                    _ => {}
+                // Touch swipes scroll the transcript; taps choose picker rows
+                // or reposition the composer caret (see on_mouse).
+                if let Some(action) = tui.on_mouse(me) {
+                    match action {
+                        Action::None => {}
+                        other => {
+                            if !on_action(tui, other) {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let _ = on_action(tui, Action::None);
                 }
-                let _ = on_action(tui, Action::None);
             }
             crossterm::event::Event::Resize(_, _) => {}
             _ => {}
@@ -2303,6 +2564,10 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
     #[test]
     fn exit_alias_is_suggested() {
         let mut tui = Tui::new();
@@ -2394,6 +2659,105 @@ mod tests {
         assert_eq!(Tui::dash_width(88, 38), None, "too short — no dashboard");
         assert_eq!(Tui::dash_width(100, 30), None, "short terminal keeps old layout");
         assert_eq!(Tui::dash_width(220, 60), Some(40));
+    }
+
+    #[test]
+    fn header_height_scales_down_on_small_screens() {
+        // Full 13-row banner only when wide AND tall.
+        assert_eq!(Tui::header_height(120, 30, true), HEADER_HEIGHT);
+        assert_eq!(Tui::header_height(120, 22, true), HEADER_COMPACT, "too short for art");
+        assert_eq!(Tui::header_height(59, 50, true), HEADER_COMPACT, "too narrow for art");
+        assert_eq!(Tui::header_height(120, 9, true), 0, "way too short");
+        assert_eq!(Tui::header_height(39, 20, true), 0, "too narrow");
+        // Toggling the banner off always yields no header.
+        assert_eq!(Tui::header_height(120, 50, false), 0);
+    }
+
+    #[test]
+    fn compact_summary_shows_when_no_dashboard() {
+        // No dashboard (narrow) + enough room → compact bar appears.
+        assert_eq!(Tui::compact_summary_h(80, 30, true), 1);
+        // With a dashboard present, never double up.
+        assert_eq!(Tui::compact_summary_h(100, 50, false), 0);
+        // Too narrow / too short → no bar.
+        assert_eq!(Tui::compact_summary_h(40, 30, true), 0);
+        assert_eq!(Tui::compact_summary_h(80, 12, true), 0);
+    }
+
+    #[test]
+    fn hint_line_never_exceeds_width() {
+        for w in [6u16, 12, 20, 40, 80] {
+            let h = Tui::hint_line(w);
+            assert!(h.chars().count() <= w as usize, "hint too wide at {w}: {h:?}");
+        }
+        // Narrow width yields a tiny fallback, not an empty line.
+        assert!(!Tui::hint_line(10).is_empty());
+        // Wide enough shows the first (priority) chip "enter send".
+        assert!(Tui::hint_line(60).starts_with(" enter send"));
+    }
+
+    #[test]
+    fn mouse_scroll_moves_transcript() {
+        let mut t = Tui::new();
+        for _ in 0..50 {
+            t.push(Entry::Info("line".into()));
+        }
+        t.scroll = 10;
+        // ScrollDown moves toward the newest content (decreases offset).
+        t.on_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert!(t.scroll < 10, "scroll down should move toward newest");
+        // ScrollUp scrolls back toward older content.
+        t.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(t.scroll, 10, "scroll up undoes the scroll");
+        // Horizontal wheel events are ignored without side effects.
+        t.on_mouse(mouse(MouseEventKind::ScrollRight, 0, 0));
+        t.on_mouse(mouse(MouseEventKind::ScrollLeft, 0, 0));
+        assert_eq!(t.scroll, 10, "horizontal scroll must do nothing");
+    }
+
+    #[test]
+    fn picker_tap_confirms_tapped_row_and_closes() {
+        let mut t = Tui::new();
+        t.open_picker("theme", vec!["lauda".into(), "dracula".into(), "nord".into()]);
+        // Imitate a drawn picker filling a 50x10 screen; item rows begin at
+        // area.y + 2 (top border + filter row).
+        let area = Rect::new(0, 0, 50, 10);
+        t.last_picker = Some(area);
+        // Tap the third row (index 2 → "nord").
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, area.y + 2 + 2));
+        match action {
+            Some(Action::OpenSlash(cmd)) => assert_eq!(cmd, "theme:nord"),
+            other => panic!("expected OpenSlash, got {other:?}"),
+        }
+        assert!(t.picker.is_none(), "picker must close after a tap choice");
+    }
+
+    #[test]
+    fn picker_tap_ignores_taps_outside_rows() {
+        let mut t = Tui::new();
+        t.open_picker("theme", vec!["lauda".into(), "dracula".into()]);
+        let area = Rect::new(0, 0, 50, 10);
+        t.last_picker = Some(area);
+        // Tap in the footer row (below the item list) → no selection.
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 9));
+        assert!(action.is_none());
+        assert!(t.picker.is_some(), "picker stays open on invalid row tap");
+    }
+
+    #[test]
+    fn composer_tap_moves_caret_near_tapped_point() {
+        let mut t = Tui::new();
+        t.input = "hello world".into();
+        t.cursor = t.input.chars().count();
+        t.last_composer = Some(Rect::new(0, 20, 40, 3));
+        // Tap the first character cell (x=1, inner row 0 → y=21).
+        t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 21));
+        assert!(t.cursor == 0, "caret should jump to start, got {}", t.cursor);
+        // Tapping an empty composer changes nothing.
+        t.input.clear();
+        t.cursor = 0;
+        t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 21));
+        assert_eq!(t.cursor, 0);
     }
 
     #[test]

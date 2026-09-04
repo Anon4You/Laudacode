@@ -2060,13 +2060,23 @@ impl App {
 /// Apply one worker event to the transcript.
 fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
     match ev {
-        WorkerEvent::Ev(AgentEvent::Content(d)) => tui.push_stream_text(&d),
-        WorkerEvent::Ev(AgentEvent::Reasoning(d)) => tui.push_reasoning_text(&d),
+        WorkerEvent::Ev(AgentEvent::Content(d)) => {
+            tui.set_busy(true, "streaming");
+            tui.push_stream_text(&d);
+        }
+        WorkerEvent::Ev(AgentEvent::Reasoning(d)) => {
+            tui.set_busy(true, "reasoning");
+            tui.push_reasoning_text(&d);
+        }
         WorkerEvent::Ev(AgentEvent::ToolStart { name, summary }) => {
             tui.clear_status();
+            tui.set_busy(true, format!("running {name}"));
             tui.push(Entry::ToolCall { name, summary });
         }
         WorkerEvent::Ev(AgentEvent::ToolDone { name, ok, preview }) => {
+            if ok {
+                tui.set_busy(true, "working");
+            }
             tui.push(Entry::ToolResult { name, ok, preview });
         }
         WorkerEvent::Ev(AgentEvent::ToolEdit { name, files }) => {
@@ -2274,29 +2284,27 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "help" => {
             tui.push(Entry::Info(
                 "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
-                 /model        pick a model from the provider's live list\n\
-                 /approvals    switch approval mode via picker (or Tab)\n\
-                 /agents       list the specialist sub-agent team\n\
-                                   /provider     menu: add · use · edit · list\n\
-                 /compact      summarize history to free context\n\
-                 /clear        reset conversation\n\
-                 /retry        re-run the previous task\n\
-                 /resume       restore a previous session by id\n\
-                 /session      rename · search · list · delete sessions\n\
-                 /image <path> attach an image to your next message\n\
-                 /export       save the transcript as markdown\n\
-                 /status       provider · model · session info\n\
-                 /diff         show uncommitted git changes\n\
-                 /review       have the reviewer specialist analyze uncommitted changes\n\
-                 /undo         revert file changes from the last turn\n\
-                 /init         analyze the project and write AGENTS.md\n\
-                 /your-cmd     custom commands from .laudacode/commands/*.md\n\
-                 @file         mention a file in your prompt\n\
-                 #note         save a memory into AGENTS.md\n\
-                 !<command>    run a shell command locally (no agent)\n\
-                 ctrl+o        expand recent tool output\n\
-                 /quit         exit Laudacode\n\
-                 Esc           interrupt the agent / release scroll"
+                 SESSION\n\
+                   /model        pick a model                                    /status    provider · model · info\n\
+                   /approvals    switch approval mode (or Tab)                  /session   rename · search · list\n\
+                   /agents       list the specialist sub-agent team             /resume    restore a previous session\n\
+                   /compact      summarize history to free context              /export    save transcript as markdown\n\
+                   /retry        re-run the previous task                       /image     attach an image\n\
+                   /clear        reset conversation                             /quit      exit Laudacode\n\
+                 FILES & DIFF\n\
+                   /diff         show uncommitted git changes\n\
+                   /review       specialist review of uncommitted changes\n\
+                   /undo [N]     revert file changes from the last N turns\n\
+                   /init         analyze the project and write AGENTS.md\n\
+                 PROVIDER\n\
+                   /provider     menu: add · use · edit · list\n\
+                 INPUT & KEYS\n\
+                   @file         attach a file (contents inlined)\n\
+                   #note         save a memory into AGENTS.md\n\
+                   !<command>    run a shell command locally (no agent)\n\
+                   /your-cmd     custom commands from .laudacode/commands/*.md\n\
+                   ctrl+o        expand recent tool output      esc   interrupt / release scroll\n\
+                   enter send · tab mode · ↑↓ history · ctrl+c quit"
                     .into(),
             ));
         }
@@ -2653,6 +2661,7 @@ pub const PROVIDER_PRESETS: &[(&str, &str)] = &[
     ("ollama", "http://localhost:11434/v1"),
     ("ollamacloud", "https://ollama.com/v1"),
     ("lmstudio", "http://localhost:1234/v1"),
+    ("custom", ""),
 ];
 
 /// Split a `"{key} · {base_url}"` picker label back into its parts.
@@ -3143,6 +3152,10 @@ mod tests {
         assert!(
             PROVIDER_PRESETS.iter().any(|(k, _)| *k == "tokenrouter"),
             "tokenrouter stays available"
+        );
+        assert!(
+            PROVIDER_PRESETS.iter().any(|(k, u)| *k == "custom" && u.is_empty()),
+            "a custom (bring-your-own-base-url) preset must be offered in the TUI"
         );
         // Every preset label round-trips through the picker parser.
         for (k, u) in PROVIDER_PRESETS {

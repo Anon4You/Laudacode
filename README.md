@@ -35,6 +35,9 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - 📁 **`@file` attachment** — mention a file in any prompt and its contents are inlined automatically; `@dir/` picks files via a picker
 - ↩️ **Multi-turn undo** — `/undo N` reverts file changes from the last N agent turns
 - 🔎 **Session cost tracking** — cumulative tokens + estimated USD cost in `/status` and the dashboard
+- 📱 **Adaptive mobile UI** — full banner art collapses to a slim one-line header on small Termux screens; a compact summary bar and auto-trimmed hints keep things usable in portrait
+- 👆 **Touch-native** — swipe to scroll, tap picker rows to choose, tap the composer to move the caret; fully navigable by touch on Termux
+- 🛠️ **Live activity feedback** — footer indicator shows what the agent is doing (`reasoning`, `streaming`, `running <tool>`) plus elapsed time
 - 📄 **AGENTS.md support** — project instructions auto-loaded into context (`/init` generates one)
 - 👤 **Profiles** — named presets in `[profiles.<name>]`, activated with `--profile`
 - 💾 **Session persistence** — autosaved; resume with `--continue` or `/resume`
@@ -217,6 +220,12 @@ Input prefixes:
 
 Keys: type `/` for autocomplete, `↑/↓` + `Tab`/`Enter` to complete,
 `Ctrl+O` expands recent tool output, `Esc` interrupts the agent.
+
+**Touch / mouse** — fully touch-navigable: swipe or wheel to scroll the
+transcript, **tap a picker row** to choose it (models, themes, sessions,
+providers…), and **tap inside the composer** to move the caret to that
+position. `Ctrl+B` toggles the banner and the hint strip under the composer
+adapts to narrow windows automatically.
 
 ## Why Rust?
 
