@@ -249,7 +249,7 @@ pub enum WorkerEvent {
     Error(String),
     /// Conversation was replaced (resume) — TUI must clear its transcript
     /// and replay the restored messages under the new session identity.
-    Reload { text: String, entries: Vec<Entry>, session_id: String },
+    Reload { text: String, entries: Vec<Entry>, session_id: String, session_name: Option<String> },
     /// Final state sent right before the worker exits, so the shell
     /// goodbye can offer an exact `--resume <id>` command.
     SessionSummary { id: String, messages: usize },
@@ -258,6 +258,10 @@ pub enum WorkerEvent {
     /// The active endpoint changed (model switch, provider switch or a fresh
     /// `/provider add`) — the dashboard must re-render model/provider.
     ProviderSwitched { provider: String, model: String },
+    /// The current session got (re)named — dashboard shows it live.
+    SessionName(String),
+    /// A session was deleted — a status line can confirm it.
+    SessionDeleted(String),
     /// Authenticated catalog fetch failed during `/provider add` — the UI
     /// switches to manual model-name capture instead of a picker.
     SetupModelsFailed,
@@ -279,12 +283,20 @@ pub enum WorkerCmd {
     ShowProvider,
     Status,
     Diff,
+    /// Run the reviewer specialist over uncommitted git changes.
+    Review,
     /// Open the /resume picker with recent sessions.
     ListSessions,
     /// Revert file changes made during the most recent agent turn.
-    Undo,
+    Undo(usize),
     /// Replace the live conversation with a stored session id.
     ResumeSession(String),
+    /// Rename the current session.
+    RenameSession(String),
+    /// List sessions matching a keyword (id or name) as a picker.
+    ListSessionsByKeyword(String),
+    /// Actually delete a session by id or name.
+    DeleteSession(String),
     /// Attach a local image to the next submitted prompt.
     QueueImage(String),
     /// Authenticated model-catalog fetch for `/provider add` (key already
@@ -324,6 +336,15 @@ pub enum ProviderMenu {
 /// reality (hidden/experimental models like `stealth/ox-alpha` work by id
 /// long before they appear in /models), so typing an id must always win.
 pub const MANUAL_MODEL_ITEM: &str = "(+ type a model name instead)";
+
+/// Rough session cost in USD from cumulative prompt/completion tokens.
+/// Heuristic ~ GPT-4o-mini-class pricing: $0.15 / 1M input, $0.60 / 1M output.
+pub fn estimate_cost(prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    const IN_PER_1M: f64 = 0.15;
+    const OUT_PER_1M: f64 = 0.60;
+    (prompt_tokens as f64 / 1_000_000.0) * IN_PER_1M
+        + (completion_tokens as f64 / 1_000_000.0) * OUT_PER_1M
+}
 
 #[derive(Clone)]
 struct WorkerBridge {
@@ -648,8 +669,19 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     Some(u) => format!("ctx {} tok · out {} tok", u.prompt_tokens, u.completion_tokens),
                     None => "no requests yet".to_string(),
                 };
+                let (tp, tc) = a.tot_usage;
+                let est = estimate_cost(tp, tc);
+                let total = if tp + tc == 0 {
+                    "no tokens yet".to_string()
+                } else {
+                    format!(
+                        "~{:.3}k tok · est ${:.4}",
+                        (tp + tc) as f64 / 1000.0,
+                        est
+                    )
+                };
                 let lines = format!(
-                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nsession  : {} · {} messages\nusage    : {}\ncwd      : {}\nconfig   : {}",
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nsession  : {} · {} messages\nusage    : {}\ntotal    : {}\ncwd      : {}\nconfig   : {}",
                     app.active.name,
                     app.active.base_url,
                     a.model,
@@ -658,6 +690,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     app.session.id,
                     a.messages.len(),
                     usage,
+                    total,
                     app.cwd.display(),
                     Config::toml_path().display(),
                 );
@@ -684,7 +717,59 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 }
                 let _ = ev_tx.send(WorkerEvent::Busy(false));
             }
-            WorkerCmd::Undo => match app.agent.undo_last_turn() {
+            WorkerCmd::Review => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                let out = rt.block_on(tools::run_shell(
+                    "git --no-pager diff --stat HEAD 2>&1 | tail -20; \
+                     echo; git --no-pager diff -U3 HEAD 2>&1 | head -c 12000",
+                    &app.cwd,
+                ));
+                let diff = match &out {
+                    Ok(o) if o.contains("[exit: 0]") => {
+                        o.split_once('\n').map(|(_, r)| r).unwrap_or(o).trim_end_matches("[commit: ")
+                    }
+                    _ => "",
+                };
+                if diff.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "no uncommitted changes to review".into(),
+                    ));
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
+                } else {
+                    let task = format!(
+                        "Review these uncommitted changes and report issues as \
+                         CRITICAL / WARNING / NIT lines with file:line references. \
+                         If the changes look clean, say so explicitly.\n\n{diff}"
+                    );
+                    let sink: Box<dyn crate::agent::UiSink> =
+                        Box::new(SubBridge {
+                            inner: WorkerBridge {
+                                tx: ev_tx.clone(),
+                                approve_rx: approve_rx.clone(),
+                                cancel: cancel.clone(),
+                            },
+                            prefix: "[review] ".to_string(),
+                        });
+                    let client = app.agent.client.clone();
+                    let model = app.agent.model.clone();
+                    let cwd = app.agent.cwd.clone();
+                    let mode = app.agent.mode;
+                    let report = rt.block_on(crate::agents::run_sub_agent(
+                        &client,
+                        &model,
+                        &cwd,
+                        mode,
+                        "reviewer",
+                        &task,
+                        sink,
+                    ));
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "review complete:\n{report}"
+                    )));
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
+                }
+            }
+            WorkerCmd::Undo(n) => match app.agent.undo_turns(n) {
                 Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Info(msg)); }
                 Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
             },
@@ -695,8 +780,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 } else {
                     let items = recent
                         .into_iter()
-                        .map(|(id, created, preview)| {
-                            format!("{id} · {} · {preview}", fmt_unix_date(created))
+                        .map(|(id, name, created, preview)| {
+                            let label = name
+                                .map(|n| format!("{id} · {n}"))
+                                .unwrap_or_else(|| id.clone());
+                            format!("{label} · {} · {preview}", fmt_unix_date(created))
                         })
                         .collect();
                     let _ = ev_tx.send(WorkerEvent::Pick {
@@ -705,8 +793,67 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     });
                 }
             }
+            WorkerCmd::ListSessionsByKeyword(kw) => {
+                let hits = Session::find_by_keyword(&kw, 20);
+                if hits.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        format!("no sessions match '{kw}'"),
+                    ));
+                } else {
+                    let items = hits
+                        .into_iter()
+                        .map(|(s, preview)| {
+                            let label = s
+                                .name
+                                .map(|n| format!("{} · {n}", s.id))
+                                .unwrap_or_else(|| s.id.clone());
+                            format!(
+                                "{label} · {} · {preview}",
+                                fmt_unix_date(s.created_unix)
+                            )
+                        })
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "resume".into(),
+                        items,
+                    });
+                }
+            }
+            WorkerCmd::DeleteSession(id) => {
+                let real = id.split(" · ").next().unwrap_or(&id).to_string();
+                match Session::delete(&real) {
+                    Ok(Some(removed)) => {
+                        let _ = ev_tx.send(WorkerEvent::SessionDeleted(removed));
+                    }
+                    Ok(None) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(
+                            format!("no session '{real}' to delete"),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::RenameSession(name) => match app.session.set_name(name) {
+                Ok(()) => {
+                    let _ = ev_tx.send(WorkerEvent::SessionName(
+                        app.session.name.clone().unwrap_or_default(),
+                    ));
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        if let Some(n) = &app.session.name {
+                            format!("session named '{n}'")
+                        } else {
+                            "session name cleared".into()
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
             WorkerCmd::ResumeSession(id) => {
-                // The picker sends "id · date · preview" — take the id part.
+                // Picker items are "id · name · date · preview" — id is first.
                 let real_id = id.split(" · ").next().unwrap_or(&id).to_string();
                 match resume_session(&mut app, &real_id) {
                     Ok((msg, entries)) => {
@@ -714,6 +861,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                             text: msg,
                             entries,
                             session_id: app.session.id.clone(),
+                            session_name: app.session.name.clone(),
                         });
                     }
                     Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
@@ -881,6 +1029,9 @@ fn run_agent_turn(
         });
     }
     app.persist();
+    let _ = ev_tx.send(WorkerEvent::SessionName(
+        app.session.name.clone().unwrap_or_default(),
+    ));
     let _ = ev_tx.send(WorkerEvent::Busy(false));
 }
 
@@ -1127,8 +1278,15 @@ pub fn render_command_template(tpl: &str, args: &str, cwd: &std::path::Path) -> 
     }
 
     // File references: @relative/path (until whitespace)
-    let mut rendered = String::with_capacity(out.len());
-    let mut rest = out.as_str();
+    expand_at_files(&out, cwd)
+}
+
+/// Inline `@relative/path` file references in a prompt (capped at 8 KiB each).
+/// Used by command templates AND ordinary user prompts, so `@src/main.rs`
+/// attaches the file's contents instead of sending the literal token.
+pub fn expand_at_files(text: &str, cwd: &std::path::Path) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    let mut rest = text;
     while let Some(at) = rest.find('@') {
         let boundary = at == 0 || !{
             let prev = rest[..at].chars().last().unwrap_or(' ');
@@ -1372,6 +1530,66 @@ impl App {
                         let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
                         tui.set_status("restoring session");
                         let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
+                    } else if let Some(what) = sel.strip_prefix("session_menu:") {
+                        // `/session` root menu: rename · search · list · delete.
+                        match what.split(" · ").next().unwrap_or("") {
+                            "rename" => {
+                                tui.pending_session = Some(tuiapp::SessionAction::Rename);
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    "Rename session",
+                                    "Enter a new name for the current session. Leave blank to clear.",
+                                    false,
+                                ));
+                                tui.set_status("enter a session name");
+                            }
+                            "search" => {
+                                tui.pending_session = Some(tuiapp::SessionAction::Search);
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    "Search sessions",
+                                    "Type a keyword to match against session names and ids.",
+                                    false,
+                                ));
+                                tui.set_status("search sessions by keyword");
+                            }
+                            "list" => {
+                                tui.set_status("loading sessions");
+                                let _ = ui_cmd.send(WorkerCmd::ListSessions);
+                            }
+                            "delete" => {
+                                let items = Session::list_recent(30)
+                                    .into_iter()
+                                    .map(|(id, name, created, preview)| {
+                                        let label = name
+                                            .map(|n| format!("{id} · {n}"))
+                                            .unwrap_or_else(|| id.clone());
+                                        format!("{label} · {} · {preview}", fmt_unix_date(created))
+                                    })
+                                    .collect::<Vec<_>>();
+                                if items.is_empty() {
+                                    tui.push(Entry::Info("no saved sessions to delete".into()));
+                                } else {
+                                    tui.open_picker("session_delete_list", items);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(id) = sel.strip_prefix("session_delete_list:") {
+                        let real = id.split(" · ").next().unwrap_or(id).to_string();
+                        tui.pending_delete = Some(real);
+                        tui.open_picker(
+                            "session_delete_confirm",
+                            vec!["YES, delete it".to_string(), "no, keep it".to_string()],
+                        );
+                    } else if let Some(choice) = sel.strip_prefix("session_delete_confirm:") {
+                        if choice.trim_start().to_lowercase().starts_with("yes") {
+                            if let Some(id) = tui.pending_delete.take() {
+                                tui.set_status("deleting session");
+                                let _ = ui_cmd.send(WorkerCmd::DeleteSession(id));
+                            }
+                        } else {
+                            tui.pending_delete = None;
+                            tui.set_status("delete cancelled");
+                        }
                     } else if let Some(image) = sel.strip_prefix("image:") {
                         let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
                     } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
@@ -1409,17 +1627,30 @@ impl App {
                             _ => {}
                         }
                     } else if let Some(label) = sel.strip_prefix("provider_add:") {
-                        // Add step 1: preset picked → API-key dialog opens.
+                        // Add step 1: preset picked. Custom providers first ask
+                        // for a base URL; everything else goes straight to the
+                        // API-key dialog.
                         match parse_preset_label(label) {
                             Some((key, base_url)) => {
-                                tui.pending_setup =
-                                    Some(tuiapp::ProviderSetup::add(&key, &base_url));
-                                tui.open_input_modal(tuiapp::InputModal::new(
-                                    format!("API key — {key}"),
-                                    format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
-                                    true,
-                                ));
-                                tui.set_status(format!("{key}: enter API key"));
+                                let ps = tuiapp::ProviderSetup::add(&key, &base_url);
+                                if ps.need_base_url {
+                                    tui.pending_setup = Some(ps);
+                                    tui.open_input_modal(tuiapp::InputModal::new(
+                                        "Base URL — custom",
+                                        "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
+                                        false,
+                                    ));
+                                    tui.set_status("custom: enter base URL");
+                                } else {
+                                    tui.pending_setup =
+                                        Some(tuiapp::ProviderSetup::add(&key, &base_url));
+                                    tui.open_input_modal(tuiapp::InputModal::new(
+                                        format!("API key — {key}"),
+                                        format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
+                                        true,
+                                    ));
+                                    tui.set_status(format!("{key}: enter API key"));
+                                }
                             }
                             None => tui.push(Entry::Error("bad provider preset".into())),
                         }
@@ -1536,7 +1767,12 @@ impl App {
                         tui.push(Entry::User(format!("⏳ {text}")));
                         tui.dash.messages += 1;
                         tui.set_status("queued");
-                        let _ = ui_cmd.send(WorkerCmd::Submit(text));
+                        let prompt = if text.starts_with('/') {
+                            text
+                        } else {
+                            expand_at_files(&text, &project_cwd)
+                        };
+                        let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
                     } else {
                         let mut prompt = text.clone();
                         // Custom commands take priority over built-ins.
@@ -1560,16 +1796,57 @@ impl App {
                             tui.dash.messages += 1;
                         }
                         tui.set_status("thinking");
-                        let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
+                        // Custom commands already inline @files inside
+                        // render_command_template; memory notes and shell
+                        // passthrough keep their literal text.
+                        let expanded = if !prompt.starts_with('/')
+                            && !prompt.starts_with('#')
+                            && !prompt.starts_with('!')
+                        {
+                            expand_at_files(&prompt, &project_cwd)
+                        } else {
+                            prompt
+                        };
+                        let _ = ui_cmd.send(WorkerCmd::Submit(expanded));
                     }
                 }
                 KeyAction::InputSubmit(value) => {
-                    // Answer from the centered input dialog (API key / model).
-                    if value.trim().is_empty() {
+                    // Answer from the centered input dialog (API key / model / session).
+                    if let Some(action) = tui.pending_session.take() {
+                        match action {
+                            tuiapp::SessionAction::Rename => {
+                                let _ = ui_cmd.send(WorkerCmd::RenameSession(value));
+                            }
+                            tuiapp::SessionAction::Search => {
+                                let kw = value.trim().to_string();
+                                if kw.is_empty() {
+                                    tui.set_status("empty keyword — cancelled");
+                                } else {
+                                    tui.set_status(format!("searching sessions: '{kw}'"));
+                                    let _ =
+                                        ui_cmd.send(WorkerCmd::ListSessionsByKeyword(kw));
+                                }
+                            }
+                        }
+                    } else if value.trim().is_empty() {
                         tui.set_status("empty input — cancelled");
                         tui.pending_setup = None;
                     } else if let Some(ps) = tui.pending_setup.as_mut() {
                         match (&ps.kind, &ps.api_key) {
+                            (tuiapp::SetupKind::Add, None) if ps.need_base_url => {
+                                // Custom provider: first submit was the base URL.
+                                let base_url = value.clone();
+                                let key_name = ps.name.clone();
+                                ps.base_url = value;
+                                ps.need_base_url = false;
+                                tui.push(Entry::User(format!("base_url: {base_url}")));
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("API key — {key_name}"),
+                                    "Paste your API key (blank only if the server is local) and press Enter.",
+                                    true,
+                                ));
+                                tui.set_status(format!("{key_name}: enter API key"));
+                            }
                             (tuiapp::SetupKind::Add, None) => {
                                 // Key answered → prove it via authenticated catalog.
                                 ps.api_key = Some(value.clone());
@@ -1742,6 +2019,26 @@ impl App {
     }
 
     fn persist(&mut self) {
+        // Auto-title the session from its first assistant reply (if the user
+        // hasn't named it via /session rename).
+        if self.session.name.is_none() {
+            let title = self.agent.messages.iter()
+                .filter(|m| m.role == "assistant")
+                .filter_map(|m| m.content.clone())
+                .find(|c| !c.trim().is_empty())
+                .map(|c| {
+                    c.split_whitespace()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+            if let Some(t) = title {
+                let cleaned: String = t.chars().take(48).collect();
+                if !cleaned.is_empty() {
+                    self.session.name = Some(cleaned);
+                }
+            }
+        }
         self.session.messages = self.agent.messages.clone();
         if let Err(e) = self.session.save() {
             eprintln!("{}", format!("warn: could not save session: {e}").dark_grey());
@@ -1799,7 +2096,7 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
         WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
-        WorkerEvent::Reload { text, entries, session_id } => {
+        WorkerEvent::Reload { text, entries, session_id, session_name } => {
             let count = entries.len();
             tui.entries.clear();
             for e in entries {
@@ -1807,11 +2104,18 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
             }
             tui.push(Entry::Info(text));
             tui.dash.session_id = crate::tui::shorten_session_id(&session_id);
+            tui.dash.set_name(session_name.as_deref().unwrap_or_default());
             tui.dash.messages = count;
         }
         // Consumed by tui_main after the loop ends; never reaches the UI.
         WorkerEvent::SessionSummary { .. } => {}
         WorkerEvent::Pick { title, items } => tui.open_picker(title, items),
+        WorkerEvent::SessionName(name) => {
+            tui.dash.set_name(&name);
+        }
+        WorkerEvent::SessionDeleted(id) => {
+            tui.push(Entry::Info(format!("session '{id}' deleted")));
+        }
         WorkerEvent::ProviderSwitched { provider, model } => {
             tui.dash.set_endpoint(&provider, &model);
             tui.needs_setup = false;
@@ -1978,10 +2282,12 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                  /clear        reset conversation\n\
                  /retry        re-run the previous task\n\
                  /resume       restore a previous session by id\n\
+                 /session      rename · search · list · delete sessions\n\
                  /image <path> attach an image to your next message\n\
                  /export       save the transcript as markdown\n\
                  /status       provider · model · session info\n\
                  /diff         show uncommitted git changes\n\
+                 /review       have the reviewer specialist analyze uncommitted changes\n\
                  /undo         revert file changes from the last turn\n\
                  /init         analyze the project and write AGENTS.md\n\
                  /your-cmd     custom commands from .laudacode/commands/*.md\n\
@@ -2082,6 +2388,84 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.set_status("loading sessions");
             let _ = cmd.send(WorkerCmd::ListSessions);
         }
+        "session" => {
+            // `/session` groups every session-management action under one roof.
+            match arg.first().copied() {
+                None => {
+                    tui.open_picker(
+                        "session_menu",
+                        vec![
+                            "rename · name this session".to_string(),
+                            "search · find sessions by keyword".to_string(),
+                            "list · show all saved sessions".to_string(),
+                            "delete · remove a session".to_string(),
+                        ],
+                    );
+                }
+                Some("rename") => {
+                    if let Some(name) = arg.get(1) {
+                        let _ = cmd.send(WorkerCmd::RenameSession((*name).to_string()));
+                    } else {
+                        tui.pending_session = Some(tuiapp::SessionAction::Rename);
+                        tui.open_input_modal(tuiapp::InputModal::new(
+                            "Rename session",
+                            "Enter a new name for the current session. Leave blank to clear.",
+                            false,
+                        ));
+                        tui.set_status("enter a session name");
+                    }
+                }
+                Some("search" | "find") => {
+                    if let Some(kw) = arg.get(1) {
+                        tui.set_status(format!("searching sessions: '{kw}'"));
+                        let _ = cmd.send(WorkerCmd::ListSessionsByKeyword((*kw).to_string()));
+                    } else {
+                        tui.pending_session = Some(tuiapp::SessionAction::Search);
+                        tui.open_input_modal(tuiapp::InputModal::new(
+                            "Search sessions",
+                            "Type a keyword to match against session names and ids.",
+                            false,
+                        ));
+                        tui.set_status("search sessions by keyword");
+                    }
+                }
+                Some("list" | "ls" | "show") => {
+                    tui.set_status("loading sessions");
+                    let _ = cmd.send(WorkerCmd::ListSessions);
+                }
+                Some("delete" | "rm" | "del") => {
+                    if let Some(id) = arg.get(1) {
+                        // Direct delete with an explicit id/name needs confirmation.
+                        tui.pending_delete = Some((*id).to_string());
+                        tui.open_picker(
+                            "session_delete_confirm",
+                            vec!["YES, delete it".to_string(), "no, keep it".to_string()],
+                        );
+                    } else {
+                        // No id given — list sessions to delete.
+                        let items = Session::list_recent(30)
+                            .into_iter()
+                            .map(|(id, name, created, preview)| {
+                                let label = name
+                                    .map(|n| format!("{id} · {n}"))
+                                    .unwrap_or_else(|| id.clone());
+                                format!("{label} · {} · {preview}", fmt_unix_date(created))
+                            })
+                            .collect::<Vec<_>>();
+                        if items.is_empty() {
+                            tui.push(Entry::Info("no saved sessions to delete".into()));
+                        } else {
+                            tui.open_picker("session_delete_list", items);
+                        }
+                    }
+                }
+                Some(other) => {
+                    tui.push(Entry::Error(format!(
+                        "unknown /session subcommand '{other}' — use rename · search · list · delete"
+                    )));
+                }
+            }
+        }
         "image" => match arg.first() {
             Some(path) => {
                 let _ = cmd.send(WorkerCmd::QueueImage((*path).to_string()));
@@ -2102,6 +2486,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.set_status("computing diff");
             let _ = cmd.send(WorkerCmd::Diff);
         }
+        "review" => {
+            tui.set_status("reviewing uncommitted changes");
+            let _ = cmd.send(WorkerCmd::Review);
+        }
         "theme" => {
             let items = crate::theme::names().into_iter().map(String::from).collect();
             tui.open_picker("theme", items);
@@ -2114,8 +2502,18 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.open_picker("effect", items);
         }
         "undo" => {
-            tui.set_status("reverting last turn");
-            let _ = cmd.send(WorkerCmd::Undo);
+            // /undo reverts the last turn; /undo N reverts N turns back.
+            let n = arg
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+            tui.set_status(if n == 1 {
+                "reverting last turn".to_string()
+            } else {
+                format!("reverting last {n} turns")
+            });
+            let _ = cmd.send(WorkerCmd::Undo(n));
         }
         other => {
             tui.push(Entry::Error(format!("unknown command '/{other}' — try /help")));
@@ -2253,6 +2651,7 @@ pub const PROVIDER_PRESETS: &[(&str, &str)] = &[
     ("deepseek", "https://api.deepseek.com/v1"),
     ("together", "https://api.together.xyz/v1"),
     ("ollama", "http://localhost:11434/v1"),
+    ("ollamacloud", "https://ollama.com/v1"),
     ("lmstudio", "http://localhost:1234/v1"),
 ];
 
@@ -2296,7 +2695,7 @@ pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
 /// Local servers are skipped. Nothing is written by this function.
 pub fn verify_provider_creds(p: &Provider) -> Result<()> {
     let local = p.base_url.contains("localhost") || p.base_url.contains("127.0.0.1");
-    if local {
+    if local || p.api_key.is_empty() {
         return Ok(());
     }
     println!("· verifying key and model with a live test request…");
@@ -2517,6 +2916,7 @@ pub fn add_provider_flow(
         ("deepseek", "https://api.deepseek.com/v1"),
         ("together", "https://api.together.xyz/v1"),
         ("ollama", "http://localhost:11434/v1"),
+    ("ollamacloud", "https://ollama.com/v1"),
         ("lmstudio", "http://localhost:1234/v1"),
         ("custom", ""),
     ];
@@ -2526,14 +2926,21 @@ pub fn add_provider_flow(
     }
     let choice = prompt_line("preset number", "1")?;
     let idx: usize = choice.trim().parse().unwrap_or(1);
-    let (base_default, is_local) = match presets.get(idx.saturating_sub(1)) {
-        Some((_, u)) => (*u, u.contains("localhost")),
-        None => ("", false),
+    let (base_default, preset_name) = match presets.get(idx.saturating_sub(1)) {
+        Some((name, u)) => (*u, *name),
+        None => ("", ""),
     };
 
     let base_url = prompt_line("base_url", base_default)?;
     let model = prompt_line("model", "")?;
-    let api_key = if is_local {
+    let is_local =
+        base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    // Ollama/LM Studio always allow a blank key; for anything else (including
+    // a custom provider) the key is only optional when the base URL is local.
+    let allow_blank_key = preset_name == "ollama"
+        || preset_name == "lmstudio"
+        || is_local;
+    let api_key = if allow_blank_key {
         prompt_line("api_key (blank for none)", "")?
     } else {
         prompt_hidden("api_key")?
@@ -2692,6 +3099,33 @@ mod tests {
     }
 
     #[test]
+    fn expand_at_files_inlines_contents_and_skips_unknown() {
+        let dir = std::env::temp_dir().join(format!("lc-expand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "Hello file").unwrap();
+
+        // Known path inlined between markers.
+        let out = expand_at_files("read @a.txt now", &dir);
+        assert!(out.contains("--- a.txt ---"), "{out}");
+        assert!(out.contains("Hello file"), "{out}");
+        assert!(!out.contains("@a.txt"), "{out}");
+
+        // Unknown path left untouched.
+        let out2 = expand_at_files("see @missing.txt maybe", &dir);
+        assert!(out2.contains("@missing.txt"), "{out2}");
+        assert!(!out2.contains("--- missing.txt ---"), "{out2}");
+
+        // No @ at all passes through unchanged.
+        assert_eq!(expand_at_files("no tokens here", &dir), "no tokens here");
+
+        // Embedded in a word is not expanded (email-like).
+        let out3 = expand_at_files("user@example.com", &dir);
+        assert!(out3.contains("user@example.com"), "{out3}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn header_parsing() {
         let m = parse_headers("X-A: 1 , , X-B: two words ");
         assert_eq!(m.get("X-A").map(String::as_str), Some("1"));
@@ -2835,5 +3269,19 @@ mod tests {
         }
         // A real-looking OpenRouter key must not be flagged.
         assert!(!placeholder_key("sk-or-v1-abc123def4567890"));
+    }
+
+    #[test]
+    fn estimate_cost_scales_with_tokens() {
+        // Zero usage costs nothing.
+        assert_eq!(estimate_cost(0, 0), 0.0);
+        // 1M input-only at $0.15.
+        let c = estimate_cost(1_000_000, 0);
+        assert!((c - 0.15).abs() < 1e-9, "{c}");
+        // 1M output-only at $0.60.
+        let c = estimate_cost(0, 1_000_000);
+        assert!((c - 0.60).abs() < 1e-9, "{c}");
+        // Monotonic: more tokens → strictly higher cost.
+        assert!(estimate_cost(10_000, 10_000) > estimate_cost(1_000, 1_000));
     }
 }

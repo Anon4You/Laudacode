@@ -36,7 +36,7 @@ pub struct Cli {
     #[arg(short = 'c', long, global = true)]
     pub continue_last: bool,
 
-    /// Resume a saved session by its unique id (shown when you exit)
+    /// Resume a saved session by its unique id or assigned name
     #[arg(
         long,
         global = true,

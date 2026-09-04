@@ -19,6 +19,16 @@ pub struct Provider {
     pub reasoning_effort: Option<String>,
 }
 
+impl Provider {
+    /// Whether this provider can function without an API key (local servers,
+    /// and generic custom endpoints).
+    pub fn key_is_optional(&self) -> bool {
+        self.base_url.contains("localhost")
+            || self.base_url.contains("127.0.0.1")
+            || self.base_url.is_empty()
+    }
+}
+
 /// Named preset of defaults, activated with `--profile <name>`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
@@ -259,7 +269,7 @@ impl Config {
                  or configure the provider."
             );
         }
-        if p.api_key.is_empty() {
+        if p.api_key.is_empty() && !p.key_is_optional() {
             bail!(
                 "no API key for '{name}'. Set OPENAI_API_KEY, use --api-key, \
                  or configure the provider."

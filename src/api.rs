@@ -294,8 +294,10 @@ impl ChatClient {
 
     fn headers(&self) -> Result<HeaderMap> {
         let mut map = HeaderMap::new();
-        let auth = format!("Bearer {}", self.api_key);
-        map.insert("authorization", HeaderValue::from_str(&auth)?);
+        if !self.api_key.is_empty() {
+            let auth = format!("Bearer {}", self.api_key);
+            map.insert("authorization", HeaderValue::from_str(&auth)?);
+        }
         map.insert("content-type", HeaderValue::from_static("application/json"));
         for (k, v) in &self.extra_headers {
             match (HeaderName::try_from(k.as_str()), HeaderValue::from_str(v)) {

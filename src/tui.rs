@@ -137,6 +137,13 @@ pub enum SetupKind {
     EditKey,
 }
 
+/// Which `/session` input-modal a submitted value belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    Rename,
+    Search,
+}
+
 /// Metadata for a running `/provider add|edit` flow — tells the app what an
 /// [`Action::InputSubmit`] from the modal belongs to.
 pub struct ProviderSetup {
@@ -146,15 +153,20 @@ pub struct ProviderSetup {
     pub base_url: String,
     /// Set once the key modal has been answered (Add only).
     pub api_key: Option<String>,
+    /// True when a custom provider still needs its base_url entered first.
+    pub need_base_url: bool,
 }
 
 impl ProviderSetup {
     pub fn add(key: &str, base_url: &str) -> Self {
+        // A custom preset ships with no base_url — collect it as a first step.
+        let need_base_url = base_url.trim().is_empty();
         Self {
             kind: SetupKind::Add,
             name: key.to_string(),
-            base_url: base_url.to_string(),
+            base_url: if need_base_url { "https://".to_string() } else { base_url.to_string() },
             api_key: None,
+            need_base_url,
         }
     }
 
@@ -164,6 +176,7 @@ impl ProviderSetup {
             name: name.to_string(),
             base_url: String::new(),
             api_key: None,
+            need_base_url: false,
         }
     }
 }
@@ -247,6 +260,10 @@ pub struct Tui {
     pub subtitle: String,
     /// Provider being edited via the `/provider edit` sub-menus.
     pub edit_target: Option<String>,
+    /// In-flight `/session rename|search` waiting on an input-modal answer.
+    pub pending_session: Option<SessionAction>,
+    /// Session id/name staged for deletion, awaiting confirm.
+    pub pending_delete: Option<String>,
     /// Highlighted row in the @-file popup.
     at_sel: usize,
     /// Ctrl+O output-expansion overlay (last tool results in full).
@@ -274,6 +291,9 @@ pub struct Tui {
     history_pos: Option<usize>,
     /// In-progress draft saved when history browsing starts, restored by ↓.
     history_draft: String,
+    /// Byte index of the editing caret in [`Tui::input`]. Left/Right move it;
+    /// typed characters insert here instead of always appending.
+    cursor: usize,
 }
 
 /// Identity + counters rendered in the wide-terminal side dashboard.
@@ -281,12 +301,16 @@ pub struct Tui {
 pub struct Dash {
     /// Short display form of the unique session id.
     pub session_id: String,
+    /// Friendly session name (from first response or /session rename).
+    pub session_name: String,
     pub model: String,
     pub provider: String,
     /// Working directory, home-shortened, for display.
     pub cwd: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Cumulative tokens/requests across the whole session (not just last).
+    pub tot_tokens: u64,
     pub requests: usize,
     pub messages: usize,
     pub plan_done: usize,
@@ -302,6 +326,10 @@ impl Dash {
         self.messages = messages;
     }
 
+    pub fn set_name(&mut self, name: &str) {
+        self.session_name = name.to_string();
+    }
+
     /// Reflect a live model/provider switch in the dashboard immediately.
     pub fn set_endpoint(&mut self, provider: &str, model: &str) {
         self.provider = provider.to_string();
@@ -311,6 +339,7 @@ impl Dash {
     pub fn record_usage(&mut self, prompt: u64, completion: u64) {
         self.prompt_tokens = prompt;
         self.completion_tokens = completion;
+        self.tot_tokens += prompt + completion;
         self.requests += 1;
     }
 
@@ -345,9 +374,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/retry", "re-run the previous task"),
     ("/export", "save transcript as markdown"),
     ("/resume", "resume a previous session by id"),
+    ("/session", "rename · search · list · delete sessions"),
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
     ("/diff", "show uncommitted git changes"),
+    ("/review", "reviewer analyzes uncommitted changes"),
     ("/undo", "revert file changes from the last turn"),
     ("/init", "create an AGENTS.md project brief"),
     ("/quit", "exit Laudacode"),
@@ -398,6 +429,8 @@ impl Tui {
             needs_setup: false,
             subtitle: String::new(),
             edit_target: None,
+            pending_session: None,
+            pending_delete: None,
             session_started: Instant::now(),
             at_sel: 0,
             overlay: false,
@@ -413,6 +446,7 @@ impl Tui {
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
+            cursor: 0,
         }
     }
 
@@ -537,7 +571,6 @@ impl Tui {
     /// Never triggers submission — the user sends with Enter afterwards.
     pub fn insert_paste(&mut self, text: &str) {
         if self.input_modal.is_some() {
-            // Pasting a key/model lands directly in the modal's field.
             if let Some(m) = &mut self.input_modal {
                 m.value.push_str(text.trim_end_matches(['\r', '\n']));
             }
@@ -547,7 +580,7 @@ impl Tui {
             return; // modals take over all input
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.input.push_str(&normalized);
+        self.insert_str(&normalized);
         self.slash_sel = 0;
         self.at_sel = 0;
     }
@@ -687,6 +720,7 @@ impl Tui {
         self.input.push_str(path);
         self.input.push(' ');
         self.at_sel = 0;
+        self.cursor_end();
     }
 
     fn move_at_sel(&mut self, delta: isize) {
@@ -697,6 +731,61 @@ impl Tui {
         let cur = self.at_sel.min(n - 1) as isize;
         let next = ((cur + delta).rem_euclid(n as isize)) as usize;
         self.at_sel = next;
+    }
+
+    // ---- Cursor (caret) editing helpers ---------------------------------
+
+    /// Byte offset of the N-th char in `s` (0-indexed char count).
+    fn char_byte_offset(s: &str, char_idx: usize) -> usize {
+        s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+    }
+
+    fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn cursor_left(&mut self) {
+        if self.cursor > 0 { self.cursor -= 1; }
+    }
+
+    fn cursor_right(&mut self) {
+        if self.cursor < self.input.chars().count() { self.cursor += 1; }
+    }
+
+    /// Insert `c` at the caret and advance past it.
+    fn insert_char(&mut self, c: char) {
+        let byte_at = Self::char_byte_offset(&self.input, self.cursor);
+        let tail: String = self.input[byte_at..].to_string();
+        self.input.truncate(byte_at);
+        self.input.push(c);
+        self.input.push_str(&tail);
+        self.cursor += 1;
+    }
+
+    /// Insert a string at the caret and advance past it.
+    fn insert_str(&mut self, s: &str) {
+        let byte_at = Self::char_byte_offset(&self.input, self.cursor);
+        let tail: String = self.input[byte_at..].to_string();
+        self.input.truncate(byte_at);
+        self.input.push_str(s);
+        self.input.push_str(&tail);
+        self.cursor += s.chars().count();
+    }
+
+    /// Delete the char immediately before the caret.
+    fn backspace_at(&mut self) -> bool {
+        if self.cursor == 0 || self.input.is_empty() { return false; }
+        let byte_at = Self::char_byte_offset(&self.input, self.cursor);
+        let prev_byte = Self::char_byte_offset(&self.input, self.cursor - 1);
+        let tail: String = self.input[byte_at..].to_string();
+        self.input.truncate(prev_byte);
+        self.input.push_str(&tail);
+        self.cursor -= 1;
+        true
     }
 
     /// Append streamed assistant text, merging into the last Assistant entry.
@@ -788,6 +877,7 @@ impl Tui {
         let idx = matches[self.slash_sel.min(matches.len() - 1)];
         self.input = format!("{} ", self.slash_entries()[idx].cmd);
         self.slash_sel = 0;
+        self.cursor_end();
     }
 
     fn move_slash_sel(&mut self, delta: isize) {
@@ -1152,10 +1242,10 @@ impl Tui {
             .block(Block::default().borders(Borders::ALL).style(comp_style));
         f.render_widget(composer, composer_area);
         if cursor_ok && !self.input.is_empty() {
-            // No cursor navigation exists — the caret is always at the end,
-            // i.e. after the last visual row of the wrapped draft.
+            // Place the caret at `self.cursor` (char count from start).
             let inner_w = composer_area.width.saturating_sub(2).max(10) as usize;
-            let segs = wrap_composer(&self.input, inner_w);
+            let prefix: String = self.input.chars().take(self.cursor).collect();
+            let segs = wrap_composer(&prefix, inner_w);
             let last = segs.last().map(String::as_str).unwrap_or("");
             let col = UnicodeWidthStr::width(last) as u16;
             let row = composer_area.y
@@ -1174,7 +1264,7 @@ impl Tui {
         // Hints strip under the composer.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " enter send · ↑↓ history · pgup/pgdn scroll · tab mode · esc interrupt · ctrl+c quit ",
+                " enter send · ←→ edit · ↑↓ history · pgup/pgdn scroll · tab mode · esc interrupt · ctrl+c quit ",
                 Style::default().fg(Color::DarkGray),
             ))),
             hints_area,
@@ -1279,6 +1369,9 @@ impl Tui {
             ])
         };
         v.push(row("session", self.dash.session_id.clone(), Color::White));
+        if !self.dash.session_name.is_empty() {
+            v.push(row("name", self.dash.session_name.clone(), Color::Cyan));
+        }
         v.push(row("model", self.dash.model.clone(), Color::Gray));
         v.push(row("provider", self.dash.provider.clone(), Color::Gray));
         v.push(Line::from(Span::styled(
@@ -1324,6 +1417,11 @@ impl Tui {
         v.push(Line::from(vec![
             Span::styled(format!(" {:<9}", "out"), Style::default().fg(Color::DarkGray)),
             Span::styled(Self::fmt_tokens(self.dash.completion_tokens), Style::default().fg(Color::Gray)),
+            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
+        ]));
+        v.push(Line::from(vec![
+            Span::styled(format!(" {:<9}", "total"), Style::default().fg(Color::DarkGray)),
+            Span::styled(Self::fmt_tokens(self.dash.tot_tokens), Style::default().fg(Color::LightCyan)),
             Span::styled(" tok", Style::default().fg(Color::DarkGray)),
         ]));
 
@@ -1392,7 +1490,7 @@ fn fmt_elapsed(secs: u64) -> String {
 }
 
 /// Fixed dashboard column width on wide terminals.
-const DASH_WIDTH: u16 = 28;
+const DASH_WIDTH: u16 = 40;
 
 
     /// Centered approval dialog: detail + y/a/n options.
@@ -1689,6 +1787,15 @@ const DASH_WIDTH: u16 = 28;
 
     /// Handle one terminal event. Returns the action the host should take.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // When input was set directly (e.g. tests), cursor may still be 0
+        // while input is non-empty. Move to end in that case.
+        let char_count = self.input.chars().count();
+        if self.cursor == 0 && char_count > 0 {
+            self.cursor = char_count;
+        } else {
+            self.cursor = self.cursor.min(char_count);
+        }
+
         // Ctrl+O output overlay takes over all keys.
         if self.overlay {
             return match key.code {
@@ -1809,12 +1916,13 @@ const DASH_WIDTH: u16 = 28;
             {
                 let input = self.input.trim().to_string();
                 self.input.clear();
+                self.cursor_home();
                 self.record_history(&input);
                 if input.is_empty() { Action::None } else { Action::Submit(input) }
             }
             // Shift+Enter / Alt+Enter insert a newline instead of submitting.
             KeyCode::Enter => {
-                self.input.push('\n');
+                self.insert_char('\n');
                 Action::None
             }
             KeyCode::BackTab => Action::CycleMode,
@@ -1837,6 +1945,7 @@ const DASH_WIDTH: u16 = 28;
                             }
                             if !self.input.is_empty() {
                                 self.input.clear();
+                                self.cursor_home();
                                 self.last_ctrl_c = None;
                                 return Action::None;
                             }
@@ -1853,16 +1962,29 @@ const DASH_WIDTH: u16 = 28;
                         _ => Action::None,
                     }
                 } else {
-                    self.input.push(c);
+                    self.insert_char(c);
                     self.slash_sel = 0;
                     self.at_sel = 0;
                     Action::None
                 }
             }
             KeyCode::Backspace => {
-                if self.input.pop().is_some() {
+                if self.backspace_at() {
                     self.slash_sel = 0;
                     self.at_sel = 0;
+                }
+                Action::None
+            }
+            KeyCode::Left => {
+                // Move the caret backward one char (unless a popup owns keys).
+                if !self.at_popup_active() && !self.slash_popup_active() {
+                    self.cursor_left();
+                }
+                Action::None
+            }
+            KeyCode::Right => {
+                if !self.at_popup_active() && !self.slash_popup_active() {
+                    self.cursor_right();
                 }
                 Action::None
             }
@@ -1873,12 +1995,14 @@ const DASH_WIDTH: u16 = 28;
                 if self.at_token_present() {
                     if let Some(i) = self.input.rfind('@') {
                         self.input.truncate(i);
+                        self.cursor_home();
                         self.at_sel = 0;
                     }
                 } else if self.scroll > 0 {
                     self.scroll = 0;
                 } else {
                     self.input.clear();
+                    self.cursor_home();
                 }
                 Action::Interrupt
             }
@@ -1886,10 +2010,12 @@ const DASH_WIDTH: u16 = 28;
             // fully reserved for prompt-history recall.
             KeyCode::Up => {
                 self.history_up();
+                self.cursor_end();
                 Action::None
             }
             KeyCode::Down => {
                 self.history_down();
+                self.cursor_end();
                 Action::None
             }
             KeyCode::PageUp if self.scrollable() => { self.page_up(20); Action::None }
@@ -2263,11 +2389,11 @@ mod tests {
     fn dashboard_appears_only_on_wide_terminals() {
         // Needs BOTH ≥88 columns and ≥39 rows (Termux landscape is ~39 tall).
         assert_eq!(Tui::dash_width(87, 50), None);
-        assert_eq!(Tui::dash_width(88, 50), Some(28));
-        assert_eq!(Tui::dash_width(147, 39), Some(28), "Termux landscape");
+        assert_eq!(Tui::dash_width(88, 50), Some(40));
+        assert_eq!(Tui::dash_width(147, 39), Some(40), "Termux landscape");
         assert_eq!(Tui::dash_width(88, 38), None, "too short — no dashboard");
         assert_eq!(Tui::dash_width(100, 30), None, "short terminal keeps old layout");
-        assert_eq!(Tui::dash_width(220, 60), Some(28));
+        assert_eq!(Tui::dash_width(220, 60), Some(40));
     }
 
     #[test]
@@ -2322,14 +2448,16 @@ mod tests {
         assert_eq!(filter_slash_commands("/pro"), vec![3]); // /provider
         assert_eq!(filter_slash_commands("/appro"), vec![2]); // /approvals
         assert_eq!(filter_slash_commands("/resum"), vec![8]); // /resume
-        assert_eq!(filter_slash_commands("/imag"), vec![9]); // /image
+        assert_eq!(filter_slash_commands("/imag"), vec![10]); // /image
         assert_eq!(filter_slash_commands("/RETRY"), vec![6]);
-        assert_eq!(filter_slash_commands("/quit"), vec![14]);
+        assert_eq!(filter_slash_commands("/quit"), vec![16]);
         // Newer commands are discoverable too.
-        assert_eq!(filter_slash_commands("/status"), vec![10]);
-        assert_eq!(filter_slash_commands("/diff"), vec![11]);
-        assert_eq!(filter_slash_commands("/undo"), vec![12]);
-                assert!(filter_slash_commands("/zzz").is_empty());
+        assert_eq!(filter_slash_commands("/status"), vec![11]);
+        assert_eq!(filter_slash_commands("/diff"), vec![12]);
+        assert_eq!(filter_slash_commands("/review"), vec![13]);
+        assert_eq!(filter_slash_commands("/undo"), vec![14]);
+        assert_eq!(filter_slash_commands("/session"), vec![9]);
+        assert!(filter_slash_commands("/zzz").is_empty());
     }
 
     #[test]

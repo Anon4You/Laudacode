@@ -31,7 +31,7 @@ pub static TEAM: &[AgentSpec] = &[
         prompt: "You are the PLANNER. Produce a concise, ordered implementation plan: \
                  exact files to touch, functions to add/change, risks, and a test strategy. \
                  Do NOT write full implementations.",
-        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url"],
+        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url", "web_search"],
         read_only: true,
     },
     AgentSpec {
@@ -40,7 +40,7 @@ pub static TEAM: &[AgentSpec] = &[
         prompt: "You are the RESEARCHER. Answer the question with precise references \
                  (file:line) or fetched documentation excerpts. Be exhaustive about \
                  relevant facts, brief about everything else.",
-        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url"],
+        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url", "web_search"],
         read_only: true,
     },
     AgentSpec {

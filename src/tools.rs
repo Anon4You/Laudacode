@@ -19,6 +19,7 @@ pub enum Action {
     ApplyPatch { patch: String },
     RunCommand { command: String },
     FetchUrl { url: String },
+    WebSearch { query: String, max_results: usize },
     Grep { pattern: String, path: Option<String>, ignore_case: bool, context: Option<u32> },
     Glob { pattern: String, path: Option<String> },
     UpdatePlan { todos: Vec<TodoItem> },
@@ -80,6 +81,17 @@ struct CmdArgs {
 #[derive(Deserialize)]
 struct FetchArgs {
     url: String,
+}
+
+#[derive(Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default = "default_max_results")]
+    max_results: Option<usize>,
+}
+
+fn default_max_results() -> Option<usize> {
+    Some(5)
 }
 
 #[derive(Deserialize)]
@@ -154,6 +166,13 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                 let a: FetchArgs = serde_json::from_value(v)?;
                 Ok(Action::FetchUrl { url: a.url })
             }
+            "web_search" => {
+                let a: WebSearchArgs = serde_json::from_value(v)?;
+                Ok(Action::WebSearch {
+                    query: a.query,
+                    max_results: a.max_results.unwrap_or(5),
+                })
+            }
             "grep" => {
                 let a: GrepArgs = serde_json::from_value(v)?;
                 Ok(Action::Grep { pattern: a.pattern, path: a.path, ignore_case: a.ignore_case, context: a.context })
@@ -218,6 +237,7 @@ impl Action {
             },
             Action::RunCommand { command } => format!("$ {command}"),
             Action::FetchUrl { url } => format!("fetch {url}"),
+            Action::WebSearch { query, .. } => format!("web search: {query}"),
             Action::Grep { pattern, path, ignore_case, context } => {
                 let where_ = path.as_deref().unwrap_or(".");
                 let mut flags = String::new();
@@ -250,6 +270,7 @@ impl Action {
                 | Action::Glob { .. }
                 | Action::UpdatePlan { .. }
                 | Action::FetchUrl { .. }
+                | Action::WebSearch { .. }
         )
     }
 
@@ -258,6 +279,7 @@ impl Action {
             Action::ListDir { .. }
             | Action::ReadFile { .. }
             | Action::FetchUrl { .. }
+            | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
             | Action::UpdatePlan { .. } => Danger::Safe,
@@ -453,6 +475,7 @@ impl Action {
             }
             Action::RunCommand { command } => run_shell(command, cwd).await,
             Action::FetchUrl { url } => fetch_url(url).await,
+            Action::WebSearch { query, max_results } => web_search(query, *max_results).await,
             Action::Grep { pattern, path, ignore_case, context } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
                 run_grep(&root, pattern, *ignore_case, context.unwrap_or(0))
@@ -845,6 +868,167 @@ async fn fetch_url(url: &str) -> Result<String> {
     Ok(header + out.trim())
 }
 
+/// Web search via DuckDuckGo's HTML endpoint (no API key, no new dependencies).
+/// Returns a list of result titles + URLs so the agent can follow up with
+/// `fetch_url` for the pages that matter.
+async fn web_search(query: &str, max_results: usize) -> Result<String> {
+    use futures_util::StreamExt;
+    let url = "https://html.duckduckgo.com/html/?q=".to_string()
+        + &urlencoding(query);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("laudacode/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(45))
+        .build()?;
+    let resp = client.get(&url).send().await.context("search request failed")?;
+    let status = resp.status();
+    let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading search response")?;
+        if body.len() as u64 + chunk.len() as u64 > FETCH_MAX_BYTES {
+            bail!("search response exceeded {FETCH_MAX_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let html = String::from_utf8_lossy(&body).into_owned();
+    let results = parse_ddg_results(&html, max_results);
+    if results.is_empty() {
+        return Ok(format!("[web_search] no results for \"{query}\" [HTTP {status}]"));
+    }
+    let mut out = String::new();
+    for (i, (title, link)) in results.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, link));
+    }
+    Ok(format!("[web_search: {query}] [HTTP {status}]\n{out}").trim().to_string())
+}
+
+/// Naive DuckDuckGo HTML result parser: extracts `result__a` anchors.
+fn parse_ddg_results(html: &str, max_results: usize) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let bytes: Vec<char> = html.chars().collect();
+    let mut i = 0usize;
+    let mut count = 0usize;
+    while i < bytes.len() {
+        // Scan for `<a ... class="result__a"` anchors.
+        if bytes.get(i).copied() == Some('<') {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != '>' {
+                j += 1;
+            }
+            let tag: String = bytes[i + 1..j.min(bytes.len())].iter().collect();
+            if tag.to_lowercase().contains("result__a") {
+                // Extract href.
+                let href = extract_attr(&tag, "href").unwrap_or_default();
+                // Find the closing </a> and take the inner text.
+                let mut k = j + 1;
+                while k + 3 < bytes.len()
+                    && !(bytes[k] == '<'
+                        && bytes.get(k + 1).copied() == Some('/')
+                        && bytes.get(k + 2).map(|c| c.to_ascii_lowercase()) == Some('a')
+                        && bytes.get(k + 3).copied() == Some('>'))
+                {
+                    k += 1;
+                }
+                let inner: String = bytes[j + 1..k.min(bytes.len())].iter().collect();
+                let title = strip_html(&inner);
+                if !title.trim().is_empty() && !href.is_empty() {
+                    results.push((title.trim().to_string(), href));
+                    count += 1;
+                    if count >= max_results {
+                        break;
+                    }
+                }
+                i = k;
+                continue;
+            }
+            i = j.saturating_add(1);
+            continue;
+        }
+        i += 1;
+    }
+    results
+}
+
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let name = name.to_lowercase();
+    let pos = lower.find(&name)?;
+    let after = lower[pos + name.len()..].trim_start();
+    let rest2 = after.strip_prefix('=')?.trim_start();
+    let val = if let Some(r) = rest2.strip_prefix('"') {
+        let end = r.find('"')?;
+        r[..end].to_string()
+    } else {
+        let end = rest2.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest2.len());
+        rest2[..end].trim().to_string()
+    };
+    // DuckDuckGo returns redirect URLs wrapped in //duckduckgo.com/l/?uddg=...
+    let full = if val.starts_with("//") {
+        format!("https:{val}")
+    } else {
+        val
+    };
+    Some(full_redirect(&full))
+}
+
+fn full_redirect(url: &str) -> String {
+    if let Some(idx) = url.find("uddg=") {
+        let enc = &url[idx + 5..];
+        let bytes = enc.split('&').next().unwrap_or(enc);
+        if let Some(dec) = urlencoding_decode(bytes) {
+            return dec;
+        }
+    }
+    url.to_string()
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn urlencoding_decode(s: &str) -> Option<String> {
+    let bytes: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == '%' {
+            let hi = bytes.get(i + 1)?.to_digit(16)? as u8;
+            let lo = bytes.get(i + 2)?.to_digit(16)? as u8;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(c as u8);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&").replace("&#x27;", "'").replace("&quot;", "\"")
+}
+
 /// Minimal HTML → text conversion (no regex dependency).
 fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
@@ -1149,6 +1333,21 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
+                name: "web_search",
+                description: "Search the web and get a list of result titles + URLs for a query. Returns 1-10 top results (no API key needed). Use fetch_url on a result URL to read the full page.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search terms"},
+                        "max_results": {"type": "integer", "description": "Max results to return (1-10, default 5)"}
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
                 name: "grep",
                 description: "Search file contents with a literal string (not regex) across the project. Skips binaries, .git, target/, node_modules/. Returns file:line: match.",
                 parameters: json!({
@@ -1419,5 +1618,51 @@ mod tests {
         let long = truncate(&"x".repeat(MAX_TOOL_OUTPUT + 10));
         assert!(long.ends_with("[output truncated]"));
         assert!(long.chars().count() <= MAX_TOOL_OUTPUT + 20);
+    }
+
+    #[test]
+    fn web_search_parses_action_with_default_and_explicit_max() {
+        match parse_tool_action("web_search", r#"{"query":"rust async"}"#).unwrap() {
+            Action::WebSearch { query, max_results } => {
+                assert_eq!(query, "rust async");
+                assert_eq!(max_results, 5);
+            }
+            other => panic!("wrong action: {other:?}"),
+        }
+        match parse_tool_action("web_search", r#"{"query":"q","max_results":3}"#).unwrap() {
+            Action::WebSearch { query, max_results } => {
+                assert_eq!(query, "q");
+                assert_eq!(max_results, 3);
+            }
+            other => panic!("wrong action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_search_url_helpers_roundtrip() {
+        assert_eq!(urlencoding("a b&c"), "a%20b%26c");
+        assert_eq!(urlencoding_decode("a%20b%26c").unwrap(), "a b&c");
+        // DDG redirect unwrapping.
+        assert_eq!(
+            full_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc&rut=xyz"),
+            "https://example.com/doc"
+        );
+        assert_eq!(strip_html("<a class=\"result__a\">Title &amp; More</a>"), "Title & More");
+    }
+
+    #[test]
+    fn web_search_parses_ddg_html_results() {
+        let html = r#"<div class="result">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F1&rut=a">First Result</a>
+          <a class="result__a" href="https://example.org/2">Second Result</a>
+          <a class="result__a" href="https://example.net/3">Third Result</a>
+        </div>"#;
+        let results = parse_ddg_results(html, 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "First Result");
+        assert_eq!(results[0].1, "https://example.com/1");
+        assert_eq!(results[1].0, "Second Result");
+        let empty = parse_ddg_results("<html><body>no anchors</body></html>", 5);
+        assert!(empty.is_empty());
     }
 }

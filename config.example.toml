@@ -39,6 +39,11 @@ base_url = "http://localhost:11434/v1"
 api_key  = "ollama"
 model    = "qwen2.5-coder:7b"
 
+[providers.ollamacloud]
+base_url = "https://ollama.com/v1"
+api_key  = "ollama-xxxxxxxxxxxxxxxx"
+model    = "qwen3-coder:32b"
+
 # Custom headers per provider (e.g. OpenRouter ranking headers):
 # [providers.openrouter.headers]
 # "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"

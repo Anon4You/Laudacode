@@ -150,10 +150,13 @@ fn interactive(cli: &Cli) -> Result<()> {
 
     if let Some(id) = cli.resume.as_deref() {
         if id.trim().is_empty() {
-            bail!("usage: laudacode --resume <SESSION_ID>  (ids are shown when you exit, or pick one with /resume)");
+            bail!("usage: laudacode --resume <SESSION_ID_OR_NAME>  (ids are shown when you exit, or pick one with /resume)");
         }
-        let sess = Session::load(id)
-            .with_context(|| format!("no such session '{id}' — recent ids are listed by /resume in the TUI"))?;
+        let sess = Session::resolve(id).with_context(|| {
+            format!(
+                "no session '{id}' — pass its id or friendly name; recent ones are listed by /resume in the TUI"
+            )
+        })?;
         app.restore_session(sess);
     } else if cli.continue_last {
         if let Some(sess) = Session::latest() {

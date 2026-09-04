@@ -14,6 +14,8 @@ pub struct Session {
     #[serde(default)]
     pub created_unix: u64,
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub messages: Vec<Message>,
 }
 
@@ -26,8 +28,16 @@ impl Session {
         Self {
             id: format!("{}-{}", now, uuid_short()),
             created_unix: now,
+            name: None,
             messages: Vec::new(),
         }
+    }
+
+    /// Assign (or replace) the session's friendly name and persist it.
+    pub fn set_name(&mut self, name: String) -> Result<()> {
+        let name = name.trim().to_string();
+        self.name = if name.is_empty() { None } else { Some(name) };
+        self.save()
     }
 
     /// Restore a session's conversation (skipping its system prompt —
@@ -58,6 +68,94 @@ impl Session {
         serde_json::from_str(&raw).with_context(|| format!("parsing session '{id}'"))
     }
 
+    /// Look up a session whose friendly `name` matches (case-insensitive).
+    pub fn load_by_name(name: &str) -> Option<Self> {
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        for entry in fs::read_dir(Self::dir()).ok()?.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&p).ok()?;
+            if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
+                if sess
+                    .name
+                    .as_deref()
+                    .map(|n| n.to_lowercase() == needle)
+                    .unwrap_or(false)
+                {
+                    return Some(sess);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a session from either its unique id or its friendly name.
+    pub fn resolve(id_or_name: &str) -> Option<Self> {
+        if let Ok(s) = Self::load(id_or_name) {
+            return Some(s);
+        }
+        Self::load_by_name(id_or_name)
+    }
+
+    /// Delete a session by id or name. Returns what was removed.
+    pub fn delete(id_or_name: &str) -> Result<Option<String>> {
+        // Prefer an exact id match on disk, then a name match.
+        let target = if Self::path_for(id_or_name).exists() {
+            id_or_name.to_string()
+        } else {
+            match Self::load_by_name(id_or_name) {
+                Some(s) => s.id,
+                None => return Ok(None),
+            }
+        };
+        let path = Self::path_for(&target);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        Ok(Some(target))
+    }
+
+    /// Sessions whose id or name contain `kw` (case-insensitive), newest
+    /// first, paired with a preview of the first user prompt.
+    pub fn find_by_keyword(kw: &str, limit: usize) -> Vec<(Session, String)> {
+        let kw = kw.trim().to_lowercase();
+        let mut hits: Vec<(u64, Session, String)> = Vec::new();
+        for entry in fs::read_dir(Self::dir()).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(s) = fs::read_to_string(&p) {
+                if let Ok(sess) = serde_json::from_str::<Session>(&s) {
+                    let id_matches = sess.id.to_lowercase().contains(&kw);
+                    let name_matches = sess
+                        .name
+                        .as_deref()
+                        .map(|n| n.to_lowercase().contains(&kw))
+                        .unwrap_or(false);
+                    if kw.is_empty() || id_matches || name_matches {
+                        let preview = sess
+                            .messages
+                            .iter()
+                            .find(|m| m.role == "user")
+                            .and_then(|m| m.content.clone())
+                            .map(|c| c.replace('\n', " ").chars().take(48).collect::<String>())
+                            .unwrap_or_else(|| "(no prompt)".into());
+                        hits.push((sess.created_unix, sess, preview));
+                    }
+                }
+            }
+        }
+        hits.sort_by_key(|a| std::cmp::Reverse(a.0));
+        hits.truncate(limit);
+        hits.into_iter().map(|(_, s, p)| (s, p)).collect()
+    }
+
     pub fn save(&self) -> Result<()> {
         let dir = Self::dir();
         fs::create_dir_all(&dir).context("creating sessions dir")?;
@@ -78,8 +176,9 @@ impl Session {
 
     /// Most recent sessions, newest first, with a short preview of the first
     /// user prompt for the /resume picker. Skips unreadable entries silently.
-    pub fn list_recent(limit: usize) -> Vec<(String, u64, String)> {
-        let mut out: Vec<(u64, String, String)> = Vec::new();
+    /// Entry: `(id, name, created_unix, preview)`.
+    pub fn list_recent(limit: usize) -> Vec<(String, Option<String>, u64, String)> {
+        let mut out: Vec<(u64, String, Option<String>, String)> = Vec::new();
         for entry in fs::read_dir(Self::dir()).into_iter().flatten().flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -94,13 +193,13 @@ impl Session {
                         .and_then(|m| m.content.clone())
                         .map(|c| c.replace('\n', " ").chars().take(64).collect::<String>())
                         .unwrap_or_else(|| "(no prompt)".into());
-                    out.push((sess.created_unix, sess.id, preview));
+                    out.push((sess.created_unix, sess.id, sess.name, preview));
                 }
             }
         }
         out.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         out.truncate(limit);
-        out.into_iter().map(|(t, id, p)| (id, t, p)).collect()
+        out.into_iter().map(|(t, id, name, p)| (id, name, t, p)).collect()
     }
 
     /// Load the most recent session (for `--continue`). Ties on created_unix
@@ -196,8 +295,8 @@ mod tests {
         assert!(loaded.messages.iter().any(|m| m.content.as_deref() == Some("hello world")));
         // …and appears in the recent list for /resume.
         let recent = Session::list_recent(10);
-        assert!(recent.iter().any(|(id, _, _)| *id == s.id));
-        assert!(recent[0].2.contains("hello world"), "preview should show prompt");
+        assert!(recent.iter().any(|(id, _, _, _)| *id == s.id));
+        assert!(recent[0].3.contains("hello world"), "preview should show prompt");
 
         // Nothing leaked into the default location.
         assert!(!dirs::data_dir()

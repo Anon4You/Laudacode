@@ -22,8 +22,8 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 
 - ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, perfect for Android/Termux
 - 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
-- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `grep`, `glob`, `update_plan`
-- 🌐 **Web fetch built in** — the agent can pull documentation from the internet
+- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `update_plan`
+- 🌐 **Web built in** — fetch documentation **and search the web** (`web_search`, DuckDuckGo) from the agent
 - 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
 - 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
 - 📡 **Streaming responses** with reasoning-model support (dimmed "thinking" indicator)
@@ -31,7 +31,10 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - ✨ **Ambient effects** — cherry petals 🌸, rain, snow, matrix rain, lightning ⚡, stars, fireflies, bubbles, embers, confetti, meteor comets, aurora (`/effect`, rendered in the banner only)
 - 🌈 **Syntax highlighting** — code blocks and diffs colored per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
 - ⌨️ **Prompt history** — ↑/↓ recall with draft restore; persisted across sessions
-- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`… plus `@file` mentions, `#note` memories and `!<cmd>` shell passthrough
+- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`… plus `@file` mentions, `#note` memories and `!<cmd>` shell passthrough
+- 📁 **`@file` attachment** — mention a file in any prompt and its contents are inlined automatically; `@dir/` picks files via a picker
+- ↩️ **Multi-turn undo** — `/undo N` reverts file changes from the last N agent turns
+- 🔎 **Session cost tracking** — cumulative tokens + estimated USD cost in `/status` and the dashboard
 - 📄 **AGENTS.md support** — project instructions auto-loaded into context (`/init` generates one)
 - 👤 **Profiles** — named presets in `[profiles.<name>]`, activated with `--profile`
 - 💾 **Session persistence** — autosaved; resume with `--continue` or `/resume`
@@ -97,7 +100,7 @@ laudacode                 # first run: no wizard — just type /provider
 
 `/provider` opens a fully interactive menu (**add · use · edit · list**):
 choose **add** → pick a preset (**openrouter**, tokenrouter, openai,
-groq, deepseek, together, ollama, lmstudio) → paste your API key → pick a model
+groq, deepseek, together, ollama, ollamacloud, lmstudio) → paste your API key → pick a model
 from the live catalog. Nothing is saved until a real test request proves
 the key and model work. The CLI flow is still there too — same rule: a provider is only saved
 after a live test request proves the key and model work.
@@ -150,7 +153,7 @@ model    = "llama-3.3-70b-versatile"
 ```
 
 See [`config.example.toml`](config.example.toml) for presets (OpenAI,
-OpenRouter, Groq, DeepSeek, Ollama, LM Studio).
+OpenRouter, Groq, DeepSeek, Ollama, Ollama Cloud, LM Studio).
 
 ## Approval modes
 
@@ -191,8 +194,10 @@ laudacode provider add|list|use|edit|remove <name>
 | `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
 | `/theme`             | switch color theme (live preview)            |
 | `/effect`            | ambient effects (petals · rain · lightning…) |
-| `/status`            | current provider/model/session               |
+| `/status`            | provider/model/session + token & cost totals |
 | `/diff`              | git diff of working tree                     |
+| `/review`            | AI review of the current git diff            |
+| `/undo [N]`          | revert file changes from the last N turns    |
 | `/init`              | generate AGENTS.md for this project          |
 | `/compact`           | summarize history to free context window     |
 | `/clear`             | fresh conversation                           |
@@ -206,7 +211,7 @@ Input prefixes:
 
 | Prefix      | Effect                                        |
 |-------------|-----------------------------------------------|
-| `@file`     | mention a file in your prompt                 |
+| `@file`     | attach a file — its contents are inlined into the prompt |
 | `#note`     | save a memory into AGENTS.md                  |
 | `!<command>`| run a shell command locally (no agent)        |
 

@@ -74,6 +74,8 @@ pub struct Agent {
     pub mode: ApprovalMode,
     pub messages: Vec<Message>,
     pub last_usage: Option<Usage>,
+    /// Cumulative (prompt, completion) tokens across the whole session.
+    pub tot_usage: (u64, u64),
     /// Authoritative todo list mirrored from update_plan calls.
     pub todos: Vec<tools::TodoItem>,
     /// Per-tool allow/ask/deny rules from config.
@@ -100,6 +102,7 @@ impl Agent {
             mode,
             messages: vec![Message::system(system)],
             last_usage: None,
+            tot_usage: (0, 0),
             todos: vec![],
             permissions,
             undo_stack: vec![],
@@ -108,38 +111,56 @@ impl Agent {
         }
     }
 
-    /// Revert every file touched during the most recent agent turn.
-    /// Safe to call once per turn; a second call reports already-undone.
-    pub fn undo_last_turn(&mut self) -> Result<String> {
-        let seq = self
-            .undo_stack
-            .last()
-            .map(|(s, _, _)| *s)
-            .context("nothing to undo — no file changes recorded yet")?;
-        anyhow::ensure!(
-            self.last_undone != Some(seq),
-            "that turn was already reverted"
-        );
-        let mut restored = 0usize;
-        while let Some((s, path, prev)) = self.undo_stack.pop() {
-            if s != seq {
-                self.undo_stack.push((s, path, prev));
-                break;
-            }
-            match prev {
-                Some(content) => {
-                    std::fs::write(&path, content.as_bytes())
-                        .with_context(|| format!("restoring {}", path.display()))?;
-                }
-                None => {
-                    // File did not exist before — remove what the agent added.
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-            restored += 1;
+    /// Revert file changes from the last `n` distinct agent turns (most recent
+    /// first). Returns a summary of how many files were restored per turn.
+    pub fn undo_turns(&mut self, n: usize) -> Result<String> {
+        if n == 0 {
+            anyhow::bail!("nothing to undo — pass a positive count (e.g. /undo 2)");
         }
-        self.last_undone = Some(seq);
-        Ok(format!("reverted {restored} file(s) from turn #{seq}"))
+        let mut seen: Vec<(u64, usize)> = Vec::new(); // (seq, files_restored)
+        while seen.len() < n {
+            let seq = match self.undo_stack.last().map(|(s, _, _)| *s) {
+                Some(s) => s,
+                None => break,
+            };
+            anyhow::ensure!(
+                self.last_undone != Some(seq),
+                "turn #{seq} was already reverted"
+            );
+            let mut restored = 0usize;
+            while let Some((s, path, prev)) = self.undo_stack.pop() {
+                if s != seq {
+                    self.undo_stack.push((s, path, prev));
+                    break;
+                }
+                match prev {
+                    Some(content) => {
+                        std::fs::write(&path, content.as_bytes())
+                            .with_context(|| format!("restoring {}", path.display()))?;
+                    }
+                    None => {
+                        // File did not exist before — remove what the agent added.
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                restored += 1;
+            }
+            seen.push((seq, restored));
+        }
+        if seen.is_empty() {
+            anyhow::bail!("nothing to undo — no file changes recorded yet");
+        }
+        self.last_undone = seen.last().map(|(s, _)| *s);
+        let summary: Vec<String> = seen
+            .iter()
+            .map(|(s, files)| format!("turn #{s} ({files} file(s))"))
+            .collect();
+        if seen.len() == 1 {
+            let (s, files) = seen[0];
+            Ok(format!("reverted {files} file(s) from turn #{s}"))
+        } else {
+            Ok(format!("reverted {} turn(s): {}", seen.len(), summary.join(", ")))
+        }
     }
 
     /// Record the pre-image of every path an action is about to touch.
@@ -149,6 +170,7 @@ impl Agent {
             Action::ListDir { .. }
             | Action::ReadFile { .. }
             | Action::FetchUrl { .. }
+            | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
             | Action::RunCommand { .. }
@@ -234,13 +256,14 @@ impl Agent {
     fn build_system_prompt(cwd: &std::path::Path) -> String {
         let overview = tools::project_overview(cwd);
         let agents_md = load_agents_md(cwd);
+        let termux = std::env::var("TERMUX_VERSION").is_ok();
         format!(
             r#"You are Laudacode, an expert AI coding agent running in the user's terminal.
 You help with software engineering: writing code, explaining, debugging, refactoring, fetching docs from the web, running commands, and orchestrating specialist sub-agents.
 
 Environment:
 - Working directory (your workspace): {cwd}
-- OS: {os} (may be Android/Termux — prefer portable, POSIX-friendly commands; `sh` is available)
+- OS: {os}{termux_note}
 - Today: {date}
 
 Note: reads may touch any path, but writes/edits OUTSIDE the workspace require
@@ -256,12 +279,17 @@ Working rules:
 1. Inspect BEFORE editing: grep/glob/list_dir/read_file first; read_file returns numbered lines and pages via offset/limit — never guess contents.
 2. Prefer apply_patch for code edits — atomic multi-file add/update/rename/delete. Use edit_file only for one tiny single-file tweak. Anchor Update hunks with unique '@@ context' lines or '*** End of File'.
 3. Use update_plan for any multi-step task: exactly one step in_progress at a time; replace the whole list each call.
-4. Use fetch_url for external docs/API references instead of guessing URLs or APIs. Do not invent libraries the project does not use.
+4. Use fetch_url for external docs/API references instead of guessing URLs or APIs. Use web_search when you need to find something on the web; follow promising result URLs with fetch_url. Do not invent libraries the project does not use.
 5. Delegate to specialists when work splits into independent chunks (research two areas in parallel, reviewer + tester after coding). Give each task precise, self-contained instructions; skip delegation for trivial single-file tweaks.
 6. If a tool errors, read the message, fix the cause, retry differently — never repeat the identical failing call.
 7. Keep replies concise markdown with language-tagged code blocks; finish with 1-3 bullets summarizing what changed."#,
             cwd = cwd.display(),
             os = std::env::consts::OS,
+            termux_note = if termux {
+                " — Termux/Android detected: commands run via `sh -c` (not bash). Prefer `command -v` over `which`, and use `$TMPDIR` instead of `/tmp`."
+            } else {
+                ""
+            },
             date = chrono_today(),
             overview = overview,
             agents_md = agents_md,
@@ -433,6 +461,8 @@ Working rules:
 
             if let Some(u) = turn.usage {
                 self.last_usage = Some(u);
+                self.tot_usage.0 += u.prompt_tokens;
+                self.tot_usage.1 += u.completion_tokens;
             }
 
             if is_cancelled(cancel) {
@@ -634,6 +664,7 @@ fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
         Action::Grep { pattern, .. } => vec![("read", pattern.clone())],
         Action::Glob { pattern, .. } => vec![("read", pattern.clone())],
         Action::FetchUrl { url } => vec![("webfetch", url.clone())],
+        Action::WebSearch { query, .. } => vec![("webfetch", query.clone())],
         Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
             vec![("edit", path.clone())]
         }
@@ -844,14 +875,67 @@ mod tests {
         assert!(!dir.join("src/doomed.rs").exists());
 
         // Undo reverts all three.
-        let msg = agent.undo_last_turn().unwrap();
+        let msg = agent.undo_turns(1).unwrap();
         assert!(msg.contains("reverted 3 file(s)"), "{msg}");
         assert_eq!(std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(), "original\n");
         assert!(!dir.join("src/new_file.rs").exists(), "created file removed");
         assert_eq!(std::fs::read_to_string(dir.join("src/doomed.rs")).unwrap(), "bye\n");
 
         // Second undo of the same turn is refused.
-        assert!(agent.undo_last_turn().is_err());
+        assert!(agent.undo_turns(1).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undo_turns_reverts_multiple_sessions_in_order() {
+        use crate::api::ChatClient;
+        let dir = std::env::temp_dir().join(format!("lc-undon-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "v0\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "v0\n").unwrap();
+
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None)
+            .expect("client");
+        let mut agent = Agent::new(
+            client,
+            String::new(),
+            dir.clone(),
+            ApprovalMode::FullAuto,
+            crate::permissions::Permissions::default(),
+        );
+
+        // Turn 1 edits a.rs.
+        agent.turn_seq += 1;
+        assert!(agent.perform_action_sync(&tools::Action::EditFile {
+            path: "src/a.rs".into(),
+            old: "v0".into(),
+            new: "v1".into(),
+        }));
+        // Turn 2 edits b.rs (and re-edits a.rs via a new snapshot).
+        agent.turn_seq += 1;
+        assert!(agent.perform_action_sync(&tools::Action::EditFile {
+            path: "src/b.rs".into(),
+            old: "v0".into(),
+            new: "v1".into(),
+        }));
+
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v1\n");
+        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v1\n");
+
+        // /undo 1 reverts only the most recent turn (b.rs).
+        let msg = agent.undo_turns(1).unwrap();
+        assert!(msg.contains("turn #"), "{msg}");
+        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v0\n");
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v1\n");
+
+        // /undo 1 reverts the remaining turn (a.rs).
+        let msg2 = agent.undo_turns(1).unwrap();
+        assert!(msg2.contains("turn #"), "{msg2}");
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v0\n");
+        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v0\n");
+
+        // Stack exhausted.
+        assert!(agent.undo_turns(1).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
