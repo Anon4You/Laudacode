@@ -275,6 +275,8 @@ pub enum WorkerCmd {
     Clear,
     ListModels,
     SetModel(String),
+    /// Set or clear the reasoning-effort hint (None = model default).
+    SetReasoning(Option<String>),
     UseProvider(String),
     SetApprovalMode(ApprovalMode),
     Export,
@@ -543,6 +545,31 @@ fn worker_main(
                     model,
                 });
             }
+            WorkerCmd::SetReasoning(effort) => {
+                // Persist on the stored provider (source of truth), mirror on
+                // the live ActiveProvider and hot-swap the client so the very
+                // next request uses the new hint.
+                let name = app.active.name.clone();
+                let headers = app.active.headers.clone();
+                let send_reasoning = app.active.name == "openrouter"
+                    || app.active.base_url.contains("openrouter");
+                if let Some(p) = app.config.providers.get_mut(&name) {
+                    p.reasoning_effort = effort.clone();
+                }
+                app.active.reasoning_effort = effort.clone();
+                let mut active = app.active.clone();
+                active.headers = headers;
+                if let Ok(client) = rebuild_client_from(&active, send_reasoning) {
+                    app.agent.client = client;
+                }
+                let res = app.config.save();
+                let shown = effort.unwrap_or_else(|| "model default".into());
+                let msg = match res {
+                    Ok(()) => format!("reasoning effort set to {shown}"),
+                    Err(e) => format!("reasoning set to {shown} (save failed: {e:#})"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
+            }
             WorkerCmd::SetApprovalMode(mode) => {
                 app.agent.mode = mode;
             }
@@ -681,12 +708,13 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     )
                 };
                 let lines = format!(
-                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nsession  : {} · {} messages\nusage    : {}\ntotal    : {}\ncwd      : {}\nconfig   : {}",
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages\nusage    : {}\ntotal    : {}\ncwd      : {}\nconfig   : {}",
                     app.active.name,
                     app.active.base_url,
                     a.model,
                     src("api_key"),
                     mode,
+                    app.active.reasoning_effort.as_deref().unwrap_or("model default"),
                     app.session.id,
                     a.messages.len(),
                     usage,
@@ -882,7 +910,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             WorkerCmd::SetupListModels { base_url, api_key } => {
                 // Authenticated catalog peek — this doubles as proof that
                 // the freshly typed key actually works before we save it.
-                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), false, None);
+                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), false, None, "openai");
                 match probe.and_then(|c| rt.block_on(c.list_models())) {
                     Ok(models) => {
                         let _ = ev_tx.send(WorkerEvent::Pick {
@@ -953,7 +981,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let _ = ev_tx.send(WorkerEvent::Error(format!("provider '{name}' not found")));
                     continue;
                 };
-                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, false, None);
+                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, false, None, &p.kind);
                 match client.and_then(|c| rt.block_on(c.list_models())) {
                     Ok(models) => {
                         let mut items = with_manual_model_entry(models);
@@ -1430,7 +1458,10 @@ impl App {
             String::new()
         };
         // No wizard on first run — the user connects from inside the TUI.
-        let needs_setup = self.active.api_key.is_empty() || self.active.model.is_empty();
+        // Keyless built-in free providers (e.g. the stock aitopia default) need
+        // no setup — only keyed providers missing a key/model must be steered.
+        let needs_setup = !is_free_kind(&self.active.kind)
+            && (self.active.api_key.is_empty() || self.active.model.is_empty());
         tui.needs_setup = needs_setup;
         // ↑/↓ recall of prompts from previous sessions too.
         tui.seed_history(load_prompt_history());
@@ -1454,7 +1485,7 @@ impl App {
         if needs_setup {
             let presets = PROVIDER_PRESETS
                 .iter()
-                .map(|(k, _)| *k)
+                .map(|p| p.name)
                 .collect::<Vec<_>>()
                 .join(", ");
             tui.push(Entry::Info(format!(
@@ -1594,6 +1625,8 @@ impl App {
                         let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
                     } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
                         apply_mode_by_label(tui, &ui_cmd, mode_label);
+                    } else if let Some(effort) = sel.strip_prefix("reasoning:") {
+                        apply_reasoning_by_label(tui, &ui_cmd, effort);
                     } else if let Some(name) = sel.strip_prefix("theme:") {
                         if crate::theme::set(name) {
                             tui.set_status(format!("theme: {name}"));
@@ -1612,7 +1645,7 @@ impl App {
                             "add" => {
                                 let items = PROVIDER_PRESETS
                                     .iter()
-                                    .map(|(k, u)| format!("{k} · {u}"))
+                                    .map(|p| format!("{} · {}", p.name, p.base_url))
                                     .collect();
                                 tui.open_picker("provider_add", items);
                             }
@@ -1629,27 +1662,55 @@ impl App {
                     } else if let Some(label) = sel.strip_prefix("provider_add:") {
                         // Add step 1: preset picked. Custom providers first ask
                         // for a base URL; everything else goes straight to the
-                        // API-key dialog.
+                        // API-key dialog. Keyless free providers (aitopia,
+                        // powerbrain) are saved immediately with
+                        // their bundled default model.
                         match parse_preset_label(label) {
                             Some((key, base_url)) => {
-                                let ps = tuiapp::ProviderSetup::add(&key, &base_url);
-                                if ps.need_base_url {
-                                    tui.pending_setup = Some(ps);
-                                    tui.open_input_modal(tuiapp::InputModal::new(
-                                        "Base URL — custom",
-                                        "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
-                                        false,
-                                    ));
-                                    tui.set_status("custom: enter base URL");
+                                // Keyless free providers skip the key/model
+                                // dialogs and save immediately with their
+                                // bundled default model.
+                                let free = match find_preset(&key) {
+                                    Some(p) if is_free_kind(p.kind) => {
+                                        let model = p.model;
+                                        if model.is_empty() {
+                                            tui.push(Entry::Error("free provider preset missing a model".into()));
+                                            true
+                                        } else {
+                                            tui.set_status(format!("saving {key}…"));
+                                            let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                                name: key.clone(),
+                                                base_url: base_url.clone(),
+                                                model: model.to_string(),
+                                                api_key: String::new(),
+                                            });
+                                            true
+                                        }
+                                    }
+                                    _ => false,
+                                };
+                                if free {
+                                    // Handled above — nothing more to collect.
                                 } else {
-                                    tui.pending_setup =
-                                        Some(tuiapp::ProviderSetup::add(&key, &base_url));
-                                    tui.open_input_modal(tuiapp::InputModal::new(
-                                        format!("API key — {key}"),
-                                        format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
-                                        true,
-                                    ));
-                                    tui.set_status(format!("{key}: enter API key"));
+                                    let ps = tuiapp::ProviderSetup::add(&key, &base_url);
+                                    if ps.need_base_url {
+                                        tui.pending_setup = Some(ps);
+                                        tui.open_input_modal(tuiapp::InputModal::new(
+                                            "Base URL — custom",
+                                            "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
+                                            false,
+                                        ));
+                                        tui.set_status("custom: enter base URL");
+                                    } else {
+                                        tui.pending_setup =
+                                            Some(tuiapp::ProviderSetup::add(&key, &base_url));
+                                        tui.open_input_modal(tuiapp::InputModal::new(
+                                            format!("API key — {key}"),
+                                            format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
+                                            true,
+                                        ));
+                                        tui.set_status(format!("{key}: enter API key"));
+                                    }
                                 }
                             }
                             None => tui.push(Entry::Error("bad provider preset".into())),
@@ -1959,6 +2020,7 @@ impl App {
             &active.headers,
             active.name == "openrouter" || active.base_url.contains("openrouter"),
             active.reasoning_effort.clone(),
+            &active.kind,
         )?;
         let permissions = config.permission.clone();
         // Install user-defined specialists from [agents.*] before any
@@ -1980,12 +2042,13 @@ impl App {
             name: "unconfigured".into(),
             base_url: String::new(),
             api_key: String::new(),
+            kind: String::new(),
             model: String::new(),
             headers: Default::default(),
             sources: Default::default(),
             reasoning_effort: None,
         };
-        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, false, None)?;
+        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, false, None, "openai")?;
         let agent = Agent::new(
             client,
             String::new(),
@@ -2275,6 +2338,43 @@ fn apply_mode_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
     tui.push(Entry::Info(format!("approval mode set to {}", mode.label())));
 }
 
+/// Translate a `/reasoning` picker label to the `reasoning_effort` value it
+/// represents. `normal`/`default` clear the hint (model's built-in behavior);
+/// `bogus` labels return `None` without an error message.
+fn reasoning_label_to_effort(label: &str) -> Option<String> {
+    match label.to_lowercase().as_str() {
+        "normal (model default)" | "normal" | "default (model default)" | "default" => None,
+        "low" => Some("low".into()),
+        "medium" => Some("medium".into()),
+        "high" => Some("high".into()),
+        "max" => Some("max".into()),
+        _ => None,
+    }
+}
+
+/// All labels the `/reasoning` picker offers.
+const REASONING_CHOICES: &[&str] =
+    &["normal (model default)", "default (model default)", "low", "medium", "high", "max"];
+
+/// True when the label is one of the picker's own entries (used to tell a
+/// valid "clear the hint" choice apart from an unknown label).
+fn is_reasoning_choice(label: &str) -> bool {
+    REASONING_CHOICES.iter().any(|c| c.eq_ignore_ascii_case(label))
+}
+
+/// Translate a `/reasoning` picker label into a `SetReasoning` worker
+/// command. `normal`/`default` clear the hint (the model's built-in
+/// behavior); the rest map to the OpenAI `reasoning_effort` levels.
+fn apply_reasoning_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
+    if !is_reasoning_choice(label) {
+        tui.push(Entry::Error(format!("unknown reasoning level '{label}'")));
+        return;
+    }
+    let effort = reasoning_label_to_effort(label);
+    let _ = cmd.send(WorkerCmd::SetReasoning(effort.clone()));
+    tui.set_status(effort.map(|e| format!("reasoning: {e}")).unwrap_or_else(|| "reasoning: model default".into()));
+}
+
 /// Slash-command dispatch inside the TUI — forwards to the worker./// Returns false when the loop should quit.
 fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
     let mut parts = line.split_whitespace();
@@ -2286,7 +2386,8 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
                  SESSION\n\
                    /model        pick a model                                    /status    provider · model · info\n\
-                   /approvals    switch approval mode (or Tab)                  /session   rename · search · list\n\
+                   /reasoning    thinking depth (normal·low·med·high·max)      /approvals switch approval mode (or Tab)\n\
+                   /agents       list the specialist sub-agent team             /session   rename · search · list\n\
                    /agents       list the specialist sub-agent team             /resume    restore a previous session\n\
                    /compact      summarize history to free context              /export    save transcript as markdown\n\
                    /retry        re-run the previous task                       /image     attach an image\n\
@@ -2352,7 +2453,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             Some("add" | "setup") => {
                 let items = PROVIDER_PRESETS
                     .iter()
-                    .map(|(k, u)| format!("{k} · {u}"))
+                    .map(|p| format!("{} · {}", p.name, p.base_url))
                     .collect();
                 tui.open_picker("provider_add", items);
             }
@@ -2387,6 +2488,21 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "model" => {
             tui.set_status("fetching models");
             let _ = cmd.send(WorkerCmd::ListModels);
+        }
+        "reasoning" | "effort" | "thinking" => {
+            // Static picker, same shape as /approvals; the choice comes
+            // back as OpenSlash("reasoning:<label>").
+            tui.open_picker(
+                "reasoning",
+                vec![
+                    "normal (model default)".into(),
+                    "default (model default)".into(),
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "max".into(),
+                ],
+            );
         }
         "retry" => {
             tui.set_status("retrying");
@@ -2651,18 +2767,52 @@ fn trim_history_file(path: &PathBuf) {
 /// Known OpenAI-compatible endpoints surfaced by `/provider add` (TUI) and
 /// the interactive `laudacode provider add` flow. OpenRouter first — it is
 /// the default recommendation (widest model catalog).
-pub const PROVIDER_PRESETS: &[(&str, &str)] = &[
-    ("openrouter", "https://openrouter.ai/api/v1"),
-    ("tokenrouter", "https://api.tokenrouter.com/v1"),
-    ("openai", "https://api.openai.com/v1"),
-    ("groq", "https://api.groq.com/openai/v1"),
-    ("deepseek", "https://api.deepseek.com/v1"),
-    ("together", "https://api.together.xyz/v1"),
-    ("ollama", "http://localhost:11434/v1"),
-    ("ollamacloud", "https://ollama.com/v1"),
-    ("lmstudio", "http://localhost:1234/v1"),
-    ("custom", ""),
+/// A built-in provider preset offered by the `/provider add` pickers.
+pub struct ProviderPreset {
+    /// Identifier used as the provider name / picker label.
+    pub name: &'static str,
+    /// Default base URL (empty for "custom").
+    pub base_url: &'static str,
+    /// Transport kind: "openai" or a keyless built-in ("aitopia",
+    /// "powerbrain").
+    pub kind: &'static str,
+    /// Default model id (empty = the user must supply one).
+    pub model: &'static str,
+}
+
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset { name: "openrouter", base_url: "https://openrouter.ai/api/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "tokenrouter", base_url: "https://api.tokenrouter.com/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "openai", base_url: "https://api.openai.com/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "anthropic", base_url: "https://api.anthropic.com/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "groq", base_url: "https://api.groq.com/openai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "deepseek", base_url: "https://api.deepseek.com/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "together", base_url: "https://api.together.xyz/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "xai", base_url: "https://api.x.ai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "mistral", base_url: "https://api.mistral.ai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "cerebras", base_url: "https://api.cerebras.ai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "moonshot", base_url: "https://api.moonshot.ai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "zai", base_url: "https://api.z.ai/api/paas/v4", kind: "openai", model: "" },
+    ProviderPreset { name: "novita", base_url: "https://api.novita.ai/v3/openai", kind: "openai", model: "" },
+    ProviderPreset { name: "chutes", base_url: "https://llm.chutes.ai/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "ollama", base_url: "http://localhost:11434/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "ollamacloud", base_url: "https://ollama.com/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "lmstudio", base_url: "http://localhost:1234/v1", kind: "openai", model: "" },
+    ProviderPreset { name: "aitopia", base_url: "https://extensions.aitopia.ai/ai/send", kind: "aitopia", model: "AITOPIA" },
+    ProviderPreset { name: "powerbrain", base_url: "https://powerbrainai.com/app/backend/api/api.php", kind: "powerbrain", model: "gpt-5" },
+    ProviderPreset { name: "custom", base_url: "", kind: "openai", model: "" },
 ];
+
+/// Look up a built-in preset by name, if any.
+pub fn find_preset(name: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|p| p.name == name)
+}
+
+/// True for the keyless built-in free providers (no API key, no OpenAI wire
+/// format). Empty kind means OpenAI-compatible.
+pub fn is_free_kind(kind: &str) -> bool {
+    kind != "openai"
+}
 
 /// Split a `"{key} · {base_url}"` picker label back into its parts.
 fn parse_preset_label(label: &str) -> Option<(String, String)> {
@@ -2689,13 +2839,22 @@ fn with_manual_model_entry(mut models: Vec<String>) -> Vec<String> {
     models
 }
 
+/// Rebuild the live client for an already-resolved provider, deciding the
+/// OpenRouter "reasoning" passthrough flag from the endpoint itself.
 pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
+    rebuild_client_from(active, active.name == "openrouter" || active.base_url.contains("openrouter"))
+}
+
+/// Same, with an explicit OpenRouter flag (used when the provider record
+/// and the resolved view must stay independent).
+fn rebuild_client_from(active: &ActiveProvider, openrouter: bool) -> Result<ChatClient> {
     ChatClient::new(
         &active.base_url,
         &active.api_key,
         &active.headers,
-        active.base_url.contains("openrouter"),
+        openrouter,
         active.reasoning_effort.clone(),
+        &active.kind,
     )
 }
 
@@ -2712,6 +2871,7 @@ pub fn verify_provider_creds(p: &Provider) -> Result<()> {
         name: "verify".into(),
         base_url: p.base_url.clone(),
         api_key: p.api_key.clone(),
+        kind: p.kind.clone(),
         model: p.model.clone(),
         headers: p.headers.clone(),
         sources: Default::default(),
@@ -2757,15 +2917,20 @@ fn finish_provider_setup(
 ) -> Result<String> {
     let sanitized = sanitize_name(name)?;
     let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    // Presets carry the transport kind + default model; anything not in the
+    // table (or typed in by hand) is treated as OpenAI-compatible (keyed).
+    let kind = find_preset(name).map(|p| p.kind).unwrap_or("openai").to_string();
+    let free = is_free_kind(&kind);
     anyhow::ensure!(
-        !api_key.trim().is_empty() || is_local,
-        "API key required for {base_url} (local servers may leave it blank)"
+        !api_key.trim().is_empty() || is_local || free,
+        "API key required for {base_url} (local servers and the built-in free providers may leave it blank)"
     );
     anyhow::ensure!(!model.trim().is_empty(), "model name required");
 
     let p = Provider {
         base_url: base_url.to_string(),
         api_key: api_key.trim().to_string(),
+        kind,
         model: model.trim().to_string(),
         headers: if base_url.contains("openrouter") {
             parse_headers("HTTP-Referer: https://github.com/Anon4You/Laudacode, X-Title: Laudacode")
@@ -2775,13 +2940,13 @@ fn finish_provider_setup(
         reasoning_effort: None,
     };
 
-    // Prove the key AND the chosen model with a real 1-token completion
-    // BEFORE saving anything — a public /models endpoint can't tell a good
-    // key from a bad one, so this is the check that prevents broken setups.
+    // Prove the key AND the chosen model with a real completion BEFORE saving
+    // anything — a public /models endpoint can't tell a good key from a bad
+    // one. Keyless free providers are verified through their own transport.
     if !is_local {
-        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, false, None)?;
+        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, false, None, &p.kind)?;
         rt.block_on(probe.probe_chat(&p.model)).with_context(|| {
-            format!("'{sanitized}' was NOT saved — nothing changed. Fix the key/model and retry /provider add")
+            format!("'{sanitized}' was NOT saved — nothing changed. Fix the model and retry /provider add")
         })?;
     }
 
@@ -2874,7 +3039,7 @@ fn finish_edit_api_key(
             (p.base_url.clone(), p.model.clone(), p.headers.clone())
         };
         if !is_local {
-            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, false, None)?;
+            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, false, None, "openai")?;
             rt.block_on(probe.probe_chat(&model)).with_context(|| {
                 "key rejected — old key kept unchanged"
             })?;
@@ -2917,36 +3082,27 @@ pub fn add_provider_flow(
         bail!("provider '{name}' already exists (use /provider edit {name})");
     }
 
-    let presets: &[(&str, &str)] = &[
-        ("openrouter", "https://openrouter.ai/api/v1"),
-        ("tokenrouter", "https://api.tokenrouter.com/v1"),
-        ("openai", "https://api.openai.com/v1"),
-        ("groq", "https://api.groq.com/openai/v1"),
-        ("deepseek", "https://api.deepseek.com/v1"),
-        ("together", "https://api.together.xyz/v1"),
-        ("ollama", "http://localhost:11434/v1"),
-    ("ollamacloud", "https://ollama.com/v1"),
-        ("lmstudio", "http://localhost:1234/v1"),
-        ("custom", ""),
-    ];
+    let presets: &[ProviderPreset] = PROVIDER_PRESETS;
     println!("{}", "pick a preset:".dark_grey());
-    for (i, (pname, url)) in presets.iter().enumerate() {
-        println!("  {}) {:<11} {}", i + 1, pname, url.dark_grey());
+    for (i, p) in presets.iter().enumerate() {
+        println!("  {}) {:<11} {}", i + 1, p.name, p.base_url.dark_grey());
     }
     let choice = prompt_line("preset number", "1")?;
     let idx: usize = choice.trim().parse().unwrap_or(1);
-    let (base_default, preset_name) = match presets.get(idx.saturating_sub(1)) {
-        Some((name, u)) => (*u, *name),
-        None => ("", ""),
+    let (base_default, preset_name, preset_kind, preset_model) = match presets.get(idx.saturating_sub(1)) {
+        Some(p) => (p.base_url, p.name, p.kind, p.model),
+        None => ("", "", "openai", ""),
     };
 
     let base_url = prompt_line("base_url", base_default)?;
-    let model = prompt_line("model", "")?;
+    let model = prompt_line("model", preset_model)?;
     let is_local =
         base_url.contains("localhost") || base_url.contains("127.0.0.1");
-    // Ollama/LM Studio always allow a blank key; for anything else (including
+    // Keyless presets (aitopia/powerbrain), Ollama/LM Studio and
+    // any local server always allow a blank key; for anything else (including
     // a custom provider) the key is only optional when the base URL is local.
-    let allow_blank_key = preset_name == "ollama"
+    let allow_blank_key = is_free_kind(preset_kind)
+        || preset_name == "ollama"
         || preset_name == "lmstudio"
         || is_local;
     let api_key = if allow_blank_key {
@@ -2958,7 +3114,8 @@ pub fn add_provider_flow(
     let headers = prompt_line("extra headers (Key: Value, …)", "")?;
     let header_map = parse_headers(&headers);
 
-    let p = Provider { base_url, api_key, model, headers: header_map, reasoning_effort: None };
+    let kind = if is_free_kind(preset_kind) { preset_kind.to_string() } else { "openai".to_string() };
+    let p = Provider { base_url, api_key, kind, model, headers: header_map, reasoning_effort: None };
     // Prove the key/model before touching the config file.
     verify_provider_creds(&p)?;
     cfg.providers.insert(name.clone(), p);
@@ -2988,6 +3145,7 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
     let updated = Provider {
         base_url,
         model,
+        kind: p.kind.clone(),
         api_key: if api_key_in.is_empty() { p.api_key.clone() } else { api_key_in },
         headers: parse_headers(&headers),
         reasoning_effort: p.reasoning_effort.clone(),
@@ -3146,21 +3304,42 @@ mod tests {
 
     #[test]
     fn openrouter_preset_is_first_and_labels_roundtrip() {
-        let (name, url) = PROVIDER_PRESETS.first().expect("presets non-empty");
-        assert_eq!(*name, "openrouter");
-        assert_eq!(*url, "https://openrouter.ai/api/v1");
+        let first = PROVIDER_PRESETS.first().expect("presets non-empty");
+        assert_eq!(first.name, "openrouter");
+        assert_eq!(first.base_url, "https://openrouter.ai/api/v1");
         assert!(
-            PROVIDER_PRESETS.iter().any(|(k, _)| *k == "tokenrouter"),
+            PROVIDER_PRESETS.iter().any(|p| p.name == "tokenrouter"),
             "tokenrouter stays available"
         );
         assert!(
-            PROVIDER_PRESETS.iter().any(|(k, u)| *k == "custom" && u.is_empty()),
+            PROVIDER_PRESETS.iter().any(|p| p.name == "custom" && p.base_url.is_empty()),
             "a custom (bring-your-own-base-url) preset must be offered in the TUI"
         );
+        // New presets are all https (except the local servers + custom).
+        for p in PROVIDER_PRESETS {
+            let local_or_custom = p.name == "custom" || p.base_url.contains("localhost");
+            assert!(
+                local_or_custom || p.base_url.starts_with("https://"),
+                "preset {} must use https: {}", p.name, p.base_url
+            );
+        }
+        // The major additions the user asked for are present.
+        for k in ["anthropic", "xai", "mistral", "cerebras", "moonshot", "zai", "novita", "chutes"] {
+            assert!(
+                PROVIDER_PRESETS.iter().any(|p| p.name == k),
+                "preset {k} missing"
+            );
+        }
+        // The keyless free providers are wired up correctly.
+        for k in ["aitopia", "powerbrain"] {
+            let p = find_preset(k).expect("free preset present");
+            assert!(is_free_kind(p.kind), "{k} must be a free kind");
+            assert!(!p.model.is_empty(), "{k} needs a default model");
+        }
         // Every preset label round-trips through the picker parser.
-        for (k, u) in PROVIDER_PRESETS {
-            let parsed = parse_preset_label(&format!("{k} · {u}")).unwrap();
-            assert_eq!(parsed, (k.to_string(), u.to_string()));
+        for p in PROVIDER_PRESETS {
+            let parsed = parse_preset_label(&format!("{} · {}", p.name, p.base_url)).unwrap();
+            assert_eq!(parsed, (p.name.to_string(), p.base_url.to_string()));
         }
         assert!(parse_preset_label("no separator here").is_none());
     }
@@ -3173,10 +3352,32 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_labels_map_to_effort_levels() {
+        // The picker offers: normal · default · low · medium · high · max.
+        for label in ["normal (model default)", "default (model default)"] {
+            assert_eq!(reasoning_label_to_effort(label), None);
+        }
+        for (label, want) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+        ] {
+            assert_eq!(
+                reasoning_label_to_effort(label).as_deref(),
+                Some(want),
+                "label {label}"
+            );
+        }
+        assert!(reasoning_label_to_effort("bogus").is_none());
+    }
+
+    #[test]
     fn cli_verification_skips_local_servers_without_network() {
         let p = Provider {
             base_url: "http://localhost:11434/v1".into(),
             api_key: String::new(),
+            kind: "openai".into(),
             model: "qwen2.5-coder:7b".into(),
             headers: Default::default(),
             reasoning_effort: None,

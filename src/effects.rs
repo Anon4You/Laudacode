@@ -4,7 +4,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 /// Available ambient effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -371,15 +371,17 @@ impl Engine {
                     if let Some(cell) = buf.cell_mut((col, row)) {
                         if step == 0 {
                             cell.set_symbol("★");
-                            cell.set_style(
-                                Style::default().fg(Color::Rgb(255, 245, 200)).add_modifier(Modifier::BOLD),
-                            );
+                            let head = crate::theme::get().warning;
+                            cell.set_style(Style::default().fg(head).add_modifier(Modifier::BOLD));
                         } else {
                             cell.set_symbol("·");
+                            // Trail fades bright → mid → dim, all from the
+                            // palette so /theme recolors comets too.
+                            let th = crate::theme::get();
                             let fade = match step {
-                                1 => Color::Rgb(255, 220, 150),
-                                2 => Color::Rgb(200, 170, 120),
-                                _ => Color::DarkGray,
+                                1 => th.warning,
+                                2 => th.gray,
+                                _ => th.dim,
                             };
                             cell.set_style(Style::default().fg(fade));
                         }
@@ -389,10 +391,13 @@ impl Engine {
         }
         // Aurora: silky color curtains washing across the band.
         if self.kind == EffectKind::Aurora {
+            // Curtains are built from the theme's dark surface family so the
+            // wash never drowns the banner text and follows /theme.
+            let th = crate::theme::get();
             let palette = [
-                [Color::Rgb(24, 90, 82), Color::Rgb(60, 140, 110), Color::Rgb(30, 70, 96)],
-                [Color::Rgb(52, 34, 96), Color::Rgb(110, 70, 160), Color::Rgb(36, 40, 88)],
-                [Color::Rgb(20, 96, 60), Color::Rgb(56, 150, 92), Color::Rgb(26, 62, 52)],
+                [th.add_bg, th.code_bg, th.surface],
+                [th.code_bg, th.surface, th.bar_empty],
+                [th.surface, th.add_bg, th.code_bg],
             ];
             for xx in area.x..area.x + area.width {
                 let wave = ((xx as i32 * 7 + self.frame as i32 * 3) as f32).sin();
@@ -407,7 +412,7 @@ impl Engine {
         }
         // Lightning bolt + flash wash.
         if self.flashing() {
-            let wash = Style::default().bg(Color::Rgb(38, 44, 66));
+            let wash = Style::default().bg(crate::theme::get().overlay);
             for yy in area.y..area.y + area.height {
                 for xx in area.x..area.x + area.width {
                     if let Some(cell) = buf.cell_mut((xx, yy)) {
@@ -420,11 +425,8 @@ impl Engine {
                 let row = area.y + (*by).min(area.height.saturating_sub(1));
                 if let Some(cell) = buf.cell_mut((col, row)) {
                     cell.set_symbol(if self.frame % 2 == 0 { "/" } else { "\\" });
-                    cell.set_style(
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    let bolt = crate::theme::get().text;
+                    cell.set_style(Style::default().fg(bolt).add_modifier(Modifier::BOLD));
                 }
             }
         }
@@ -446,66 +448,41 @@ impl Engine {
     }
 
     fn glyph_style(&self, variant: u8) -> Style {
+        // Every glyph color comes from the active theme, so /theme recolors
+        // the ambient effects along with the rest of the chrome. Slots are
+        // picked per effect to keep the hue identity: petals ride the accent
+        // family, rain the blue-ish slots, matrix the greens, and so on.
+        let th = crate::theme::get();
         let c = match self.kind {
-            EffectKind::Petals => [
-                Color::Rgb(255, 183, 197),
-                Color::Rgb(255, 158, 189),
-                Color::Rgb(255, 210, 225),
-                Color::Rgb(230, 150, 175),
-            ][variant as usize],
-            EffectKind::Rain => [
-                Color::Rgb(110, 150, 210),
-                Color::Rgb(90, 125, 185),
-                Color::DarkGray,
-                Color::Rgb(130, 170, 225),
-            ][variant as usize],
-            EffectKind::Snow => [
-                Color::Rgb(235, 242, 255),
-                Color::Rgb(215, 228, 250),
-                Color::Gray,
-                Color::White,
-            ][variant as usize],
+            EffectKind::Petals => [th.accent, th.accent2, th.warning, th.bullet][variant as usize],
+            EffectKind::Rain => [th.user, th.heading, th.dim, th.accent2][variant as usize],
+            EffectKind::Snow => [th.text, th.gray, th.gray, th.text][variant as usize],
             EffectKind::Matrix => {
                 if variant == 0 {
-                    Color::Rgb(180, 255, 160)
+                    th.success
                 } else {
-                    Color::Rgb(60, 200, 90)
+                    th.string
                 }
             }
             EffectKind::Stars => {
                 if self.frame % 12 < 6 {
-                    Color::Rgb(255, 240, 200)
+                    th.warning
                 } else {
-                    Color::DarkGray
+                    th.dim
                 }
             }
             EffectKind::Fireflies => {
                 // Pulsing glow: alternate bright/dim with the frame phase.
                 if (self.frame + variant as u64) % 8 < 3 {
-                    Color::Rgb(230, 255, 140)
+                    th.success
                 } else {
-                    Color::Rgb(120, 150, 60)
+                    th.dim
                 }
             }
-            EffectKind::Bubbles => [
-                Color::Rgb(150, 220, 255),
-                Color::Rgb(120, 190, 235),
-                Color::Rgb(180, 225, 250),
-                Color::Gray,
-            ][variant as usize],
-            EffectKind::Embers => [
-                Color::Rgb(255, 160, 70),
-                Color::Rgb(255, 110, 50),
-                Color::Rgb(200, 90, 40),
-                Color::Rgb(255, 205, 120),
-            ][variant as usize],
-            EffectKind::Confetti => [
-                Color::Rgb(120, 220, 232),
-                Color::Rgb(255, 121, 198),
-                Color::Rgb(166, 226, 46),
-                Color::Rgb(250, 189, 47),
-            ][variant as usize],
-            _ => Color::Gray,
+            EffectKind::Bubbles => [th.accent2, th.user, th.text, th.gray][variant as usize],
+            EffectKind::Embers => [th.warning, th.error, th.mac, th.warning][variant as usize],
+            EffectKind::Confetti => [th.user, th.bullet, th.string, th.warning][variant as usize],
+            _ => th.gray,
         };
         Style::default().fg(c)
     }
@@ -514,6 +491,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[test]
     fn parse_maps_names_and_defaults_to_off() {
@@ -666,6 +644,50 @@ mod tests {
             .count();
         assert!(tinted > 0, "aurora wash must tint the band");
     }
+
+    #[test]
+    fn glyph_colors_follow_the_active_theme() {
+        // The ambient effects must paint from the theme palette, never
+        // hardcoded Rgbs — /theme recolors the banner band too.
+        for kind in [
+            EffectKind::Petals,
+            EffectKind::Rain,
+            EffectKind::Snow,
+            EffectKind::Matrix,
+            EffectKind::Stars,
+            EffectKind::Fireflies,
+            EffectKind::Bubbles,
+            EffectKind::Embers,
+            EffectKind::Confetti,
+        ] {
+            let mut e = Engine::new(kind);
+            e.set_area(40, 6);
+            let area = Rect::new(0, 0, 40, 6);
+            let mut buf = Buffer::empty(area);
+            e.render(&mut buf, area);
+            let used = buf
+                .content()
+                .iter()
+                .filter(|c| c.symbol() != " ")
+                .filter_map(|c| c.style().fg)
+                .collect::<Vec<_>>();
+            assert!(!used.is_empty(), "{kind:?} painted no glyphs");
+            let known = crate::theme::get();
+            for color in used {
+                let themed = [
+                    known.accent, known.accent2, known.warning, known.bullet,
+                    known.user, known.heading, known.dim, known.gray,
+                    known.text, known.success, known.string, known.error, known.mac,
+                ]
+                .contains(&color);
+                assert!(
+                    themed,
+                    "{kind:?} painted non-theme color {color:?} — effects must draw from the palette"
+                );
+            }
+        }
+    }
+
     #[test]
     fn switching_kinds_respawns_population() {
         let mut e = Engine::new(EffectKind::Rain);

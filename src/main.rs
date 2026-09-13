@@ -10,6 +10,7 @@ mod patch;
 mod permissions;
 mod repl;
 mod session;
+mod skills;
 mod syntax;
 mod theme;
 mod tools;
@@ -190,7 +191,7 @@ fn provider_cli(cmd: ProviderCmd) -> Result<()> {
                         Some(n) => config::sanitize_name(&n)?,
                         None => bail!("--name required when using flags"),
                     };
-                    let p = config::Provider { base_url: b, api_key: k, model: m, headers: Default::default(), reasoning_effort: None };
+                    let p = config::Provider { base_url: b, api_key: k, kind: "openai".into(), model: m, headers: Default::default(), reasoning_effort: None };
                     // Prove the key/model before touching the config.
                     repl::verify_provider_creds(&p)?;
                     cfg.providers.insert(n.clone(), p);

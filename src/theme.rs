@@ -1,5 +1,5 @@
-//! UI themes — one struct describing every palette slot, six built-ins,
-//! swappable at runtime via `/theme`.
+//! UI themes — one struct describing every palette slot (syntax, chrome and
+//! banner), twelve built-ins, swappable at runtime via `/theme`.
 
 use ratatui::style::Color;
 
@@ -39,6 +39,27 @@ pub struct Theme {
     pub op: Color,
     /// Banner gradient stops: top / middle / bottom.
     pub banner: [Color; 3],
+    // Chrome slots — the structural surfaces the TUI is built from. Keeping
+    // these in the palette means `/theme` restyles every panel, popup and
+    // status bar at once instead of leaving hardcoded greys behind.
+    /// Box-drawing borders of unfocused panels/modals/popups.
+    pub border: Color,
+    /// Border of the focused widget (composer, live picker, dimmed modal).
+    pub border_focus: Color,
+    /// Selected-row background (picker, popup, list highlight).
+    pub surface: Color,
+    /// Selected-row foreground — must contrast with [`Theme::surface`].
+    pub surface_fg: Color,
+    /// Key cap on a key-hint chip, e.g. the `enter` in "enter send".
+    pub hint_key: Color,
+    /// Label part of a key-hint chip, e.g. the `send` above.
+    pub hint_text: Color,
+    /// Filled cells of a context/progress meter.
+    pub bar_fill: Color,
+    /// Empty cells of a context/progress meter.
+    pub bar_empty: Color,
+    /// Scrim painted behind a floating popup (dims the transcript).
+    pub overlay: Color,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -76,6 +97,15 @@ pub static LAUDA: Theme = Theme {
     mac: Color::LightRed,
     op: Color::Cyan,
     banner: [Color::LightGreen, Color::LightCyan, Color::Blue],
+    border: rgb(85, 88, 112),
+    border_focus: Color::LightGreen,
+    surface: rgb(42, 52, 60),
+    surface_fg: Color::White,
+    hint_key: Color::LightGreen,
+    hint_text: rgb(120, 124, 148),
+    bar_fill: Color::LightGreen,
+    bar_empty: rgb(60, 62, 82),
+    overlay: Color::Black,
 };
 
 /// Sakura — soft rose and plum, made for the petals effect.
@@ -109,6 +139,15 @@ pub static CHERRY: Theme = Theme {
     mac: rgb(255, 158, 120),
     op: rgb(255, 173, 205),
     banner: [rgb(255, 158, 189), rgb(255, 199, 216), rgb(186, 142, 255)],
+    border: rgb(150, 96, 122),
+    border_focus: rgb(255, 158, 189),
+    surface: rgb(70, 40, 54),
+    surface_fg: rgb(255, 236, 242),
+    hint_key: rgb(255, 158, 189),
+    hint_text: rgb(150, 116, 132),
+    bar_fill: rgb(255, 158, 189),
+    bar_empty: rgb(80, 48, 62),
+    overlay: Color::Black,
 };
 
 /// Deep blue night sky.
@@ -142,6 +181,15 @@ pub static MIDNIGHT: Theme = Theme {
     mac: rgb(255, 145, 165),
     op: rgb(112, 214, 255),
     banner: [rgb(90, 130, 255), rgb(126, 192, 255), rgb(60, 68, 130)],
+    border: rgb(56, 72, 110),
+    border_focus: rgb(126, 192, 255),
+    surface: rgb(38, 52, 88),
+    surface_fg: rgb(230, 238, 250),
+    hint_key: rgb(126, 192, 255),
+    hint_text: rgb(110, 122, 150),
+    bar_fill: rgb(126, 222, 168),
+    bar_empty: rgb(42, 54, 84),
+    overlay: Color::Black,
 };
 
 /// Cool blue-slate nordic palette.
@@ -175,6 +223,15 @@ pub static NORD: Theme = Theme {
     mac: rgb(191, 97, 106),
     op: rgb(136, 192, 208),
     banner: [rgb(163, 190, 140), rgb(136, 192, 208), rgb(94, 129, 172)],
+    border: rgb(86, 96, 116),
+    border_focus: rgb(136, 192, 208),
+    surface: rgb(66, 76, 96),
+    surface_fg: rgb(236, 239, 244),
+    hint_key: rgb(136, 192, 208),
+    hint_text: rgb(120, 130, 150),
+    bar_fill: rgb(163, 190, 140),
+    bar_empty: rgb(62, 70, 88),
+    overlay: Color::Black,
 };
 
 /// Purple-forward classic.
@@ -208,6 +265,15 @@ pub static DRACULA: Theme = Theme {
     mac: rgb(255, 85, 85),
     op: rgb(255, 184, 108),
     banner: [rgb(255, 121, 198), rgb(189, 147, 249), rgb(139, 233, 253)],
+    border: rgb(88, 92, 128),
+    border_focus: rgb(189, 147, 249),
+    surface: rgb(58, 60, 88),
+    surface_fg: rgb(248, 248, 242),
+    hint_key: rgb(139, 233, 253),
+    hint_text: rgb(130, 140, 175),
+    bar_fill: rgb(80, 250, 123),
+    bar_empty: rgb(58, 60, 82),
+    overlay: Color::Black,
 };
 
 /// High-contrast retro warm.
@@ -241,6 +307,15 @@ pub static MONOKAI: Theme = Theme {
     mac: rgb(253, 151, 31),
     op: rgb(253, 151, 31),
     banner: [rgb(249, 38, 114), rgb(253, 151, 31), rgb(166, 226, 46)],
+    border: rgb(96, 94, 80),
+    border_focus: rgb(166, 226, 46),
+    surface: rgb(62, 62, 52),
+    surface_fg: rgb(248, 248, 240),
+    hint_key: rgb(166, 226, 46),
+    hint_text: rgb(140, 136, 118),
+    bar_fill: rgb(166, 226, 46),
+    bar_empty: rgb(58, 58, 48),
+    overlay: Color::Black,
 };
 
 /// Warm sun-baked classic.
@@ -274,6 +349,15 @@ pub static SOLARIZED: Theme = Theme {
     mac: rgb(220, 50, 47),
     op: rgb(147, 161, 161),
     banner: [rgb(181, 137, 0), rgb(42, 161, 152), rgb(38, 139, 210)],
+    border: rgb(88, 110, 117),
+    border_focus: rgb(38, 139, 210),
+    surface: rgb(20, 62, 74),
+    surface_fg: rgb(238, 232, 213),
+    hint_key: rgb(38, 139, 210),
+    hint_text: rgb(110, 130, 136),
+    bar_fill: rgb(42, 161, 152),
+    bar_empty: rgb(30, 66, 76),
+    overlay: Color::Black,
 };
 
 /// Retro-groove warm browns and neons.
@@ -307,6 +391,15 @@ pub static GRUVBOX: Theme = Theme {
     mac: rgb(211, 134, 155),
     op: rgb(142, 192, 124),
     banner: [rgb(250, 189, 47), rgb(184, 187, 38), rgb(131, 165, 152)],
+    border: rgb(124, 111, 100),
+    border_focus: rgb(184, 187, 38),
+    surface: rgb(66, 60, 52),
+    surface_fg: rgb(235, 219, 178),
+    hint_key: rgb(250, 189, 47),
+    hint_text: rgb(150, 136, 120),
+    bar_fill: rgb(184, 187, 38),
+    bar_empty: rgb(60, 54, 46),
+    overlay: Color::Black,
 };
 
 /// Neon dusk city lights.
@@ -340,6 +433,15 @@ pub static TOKYO: Theme = Theme {
     mac: rgb(247, 118, 142),
     op: rgb(125, 207, 255),
     banner: [rgb(255, 123, 173), rgb(187, 154, 247), rgb(122, 162, 247)],
+    border: rgb(60, 70, 110),
+    border_focus: rgb(122, 162, 247),
+    surface: rgb(44, 52, 90),
+    surface_fg: rgb(226, 230, 245),
+    hint_key: rgb(125, 207, 255),
+    hint_text: rgb(112, 122, 165),
+    bar_fill: rgb(115, 218, 202),
+    bar_empty: rgb(40, 48, 82),
+    overlay: Color::Black,
 };
 
 /// Muted deep-forest greens.
@@ -373,6 +475,15 @@ pub static EVERFOREST: Theme = Theme {
     mac: rgb(214, 153, 164),
     op: rgb(115, 170, 140),
     banner: [rgb(215, 153, 33), rgb(167, 192, 128), rgb(115, 170, 140)],
+    border: rgb(90, 99, 88),
+    border_focus: rgb(167, 192, 128),
+    surface: rgb(56, 62, 52),
+    surface_fg: rgb(211, 216, 190),
+    hint_key: rgb(167, 192, 128),
+    hint_text: rgb(120, 128, 108),
+    bar_fill: rgb(167, 192, 128),
+    bar_empty: rgb(52, 58, 48),
+    overlay: Color::Black,
 };
 
 /// Glowing coal-bed reds and oranges.
@@ -406,6 +517,15 @@ pub static EMBER: Theme = Theme {
     mac: rgb(255, 80, 60),
     op: rgb(255, 170, 120),
     banner: [rgb(255, 210, 130), rgb(255, 149, 60), rgb(200, 60, 40)],
+    border: rgb(120, 70, 50),
+    border_focus: rgb(255, 149, 60),
+    surface: rgb(74, 44, 32),
+    surface_fg: rgb(245, 230, 220),
+    hint_key: rgb(255, 190, 100),
+    hint_text: rgb(150, 108, 88),
+    bar_fill: rgb(255, 149, 60),
+    bar_empty: rgb(66, 40, 30),
+    overlay: Color::Black,
 };
 
 /// Pale arctic blues and whites.
@@ -439,6 +559,15 @@ pub static ICE: Theme = Theme {
     mac: rgb(255, 140, 150),
     op: rgb(198, 231, 255),
     banner: [rgb(198, 231, 255), rgb(160, 214, 255), rgb(110, 150, 200)],
+    border: rgb(80, 100, 125),
+    border_focus: rgb(160, 214, 255),
+    surface: rgb(44, 62, 84),
+    surface_fg: rgb(238, 246, 255),
+    hint_key: rgb(160, 214, 255),
+    hint_text: rgb(130, 150, 175),
+    bar_fill: rgb(180, 235, 220),
+    bar_empty: rgb(44, 58, 76),
+    overlay: Color::Black,
 };
 
 pub static ALL: &[&Theme] = &[&LAUDA, &CHERRY, &MIDNIGHT, &NORD, &DRACULA, &MONOKAI, &SOLARIZED, &GRUVBOX, &TOKYO, &EVERFOREST, &EMBER, &ICE];

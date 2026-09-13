@@ -10,6 +10,11 @@ pub struct Provider {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// Transport kind. "openai" (default) is the OpenAI-compatible client;
+    /// "aitopia" and "powerbrain" are built-in free providers
+    /// with their own request/response shapes (see src/api.rs).
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -21,11 +26,12 @@ pub struct Provider {
 
 impl Provider {
     /// Whether this provider can function without an API key (local servers,
-    /// and generic custom endpoints).
+    /// built-in free providers, and generic custom endpoints).
     pub fn key_is_optional(&self) -> bool {
         self.base_url.contains("localhost")
             || self.base_url.contains("127.0.0.1")
             || self.base_url.is_empty()
+            || self.kind != "openai"
     }
 }
 
@@ -95,12 +101,42 @@ pub struct ActiveProvider {
     pub name: String,
     pub base_url: String,
     pub api_key: String,
+    /// Transport kind; empty means OpenAI-compatible ("openai").
+    pub kind: String,
     pub model: String,
     pub headers: BTreeMap<String, String>,
     /// Where each resolved field came from: "command line", "environment",
     /// "config file", or "none". Keys: base_url, api_key, model.
     pub sources: BTreeMap<String, String>,
     pub reasoning_effort: Option<String>,
+}
+
+/// Built-in keyless free providers (hardcoded, no API key). Powerbrain is the
+/// out-of-the-box default chat provider; both names auto-provision when
+/// requested on a blank config, so the app is usable with zero setup.
+pub fn builtin_provider(name: &str) -> Option<Provider> {
+    let (base_url, kind, model) = match name {
+        "powerbrain" => (
+            "https://powerbrainai.com/app/backend/api/api.php",
+            "powerbrain",
+            "gpt-5",
+        ),
+        "aitopia" => ("https://extensions.aitopia.ai/ai/send", "aitopia", "AITOPIA"),
+        _ => return None,
+    };
+    Some(Provider {
+        base_url: base_url.into(),
+        api_key: String::new(),
+        kind: kind.into(),
+        model: model.into(),
+        headers: BTreeMap::new(),
+        reasoning_effort: None,
+    })
+}
+
+/// The keyless provider used when nothing at all selects one.
+pub fn builtin_default_provider() -> Provider {
+    builtin_provider("powerbrain").expect("powerbrain builtin exists")
 }
 
 impl Config {
@@ -203,6 +239,30 @@ impl Config {
             Some(p) => p.clone(),
             None => Provider::default(),
         };
+
+        // If this run has NO provider info anywhere (no config, no env vars, no
+        // CLI flags), fall back to the built-in keyless Powerbrain transport so
+        // the app is usable out of the box without setup or an API key.
+        // "default" is the name used when nothing selects a provider; any known
+        // built-in free provider name also auto-provisions on a blank config.
+        let nothing_configured = match self.providers.get(&name) {
+            Some(c) => c.base_url.is_empty() && c.model.is_empty() && c.api_key.is_empty(),
+            None => true,
+        } && cli_base_url.is_none()
+            && cli_api_key.is_none()
+            && cli_model.is_none()
+            && std::env::var("OPENAI_BASE_URL").is_err()
+            && std::env::var("OPENAI_API_KEY").is_err()
+            && std::env::var("OPENAI_MODEL").is_err();
+        let provisioned_builtin = nothing_configured
+            && (name == "default" || builtin_provider(&name).is_some());
+        if provisioned_builtin {
+            p = builtin_default_provider();
+            if let Some(builtin) = builtin_provider(&name) {
+                p = builtin;
+            }
+        }
+
         let mut sources: BTreeMap<String, String> = [
             ("base_url", "none"),
             ("api_key", "none"),
@@ -251,17 +311,26 @@ impl Config {
             }
         }
 
-        if !name.is_empty() && !self.providers.contains_key(&name) {
-            // A named provider was requested but not configured — only valid if env/CLI filled it in.
-            if p.base_url.is_empty() || p.model.is_empty() {
-                bail!(
-                    "provider '{name}' not found. Add it with `/provider add {name}` \
-                     or run `laudacode provider add`."
-                );
-            }
+        // The built-in keyless default transport (see `builtin_default_provider`) is
+        // the out-of-the-box chat provider: when this run is entirely
+        // unconfigured (fresh install or a request for a built-in free name),
+        // it was provisioned above.
+        if provisioned_builtin {
+            sources.insert("base_url".into(), "built-in default".into());
+            sources.insert("model".into(), "built-in default".into());
+            sources.insert("api_key".into(), "none".into());
         }
         if p.base_url.is_empty() {
             p.base_url = crate::DEFAULT_BASE_URL.to_string();
+        }
+        // A named provider requested but not configured anywhere — after the
+        // built-in default fallback and defaults above, only valid if env/CLI
+        // filled in a model; otherwise fail loudly.
+        if !self.providers.contains_key(&name) && p.model.is_empty() {
+            bail!(
+                "provider '{name}' not found. Add it with `/provider add {name}` \
+                 or run `laudacode provider add`."
+            );
         }
         if p.model.is_empty() {
             bail!(
@@ -288,6 +357,7 @@ impl Config {
             name,
             base_url: p.base_url.trim_end_matches('/').to_string(),
             api_key: p.api_key,
+            kind: p.kind,
             model: p.model,
             headers: p.headers,
             sources,
@@ -375,6 +445,45 @@ mod tests {
         // Unknown provider with nothing filled in must fail loudly.
         let err = cfg.resolve_active(Some("ghost"), None, None, None);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn unconfigured_fall_backs_to_builtin_default_provider() {
+        let _g = env_lock();
+        for var in [
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+            "LAUDACODE_PROVIDER",
+        ] {
+            std::env::remove_var(var);
+        }
+        let cfg = Config::default();
+        // Fresh install, nothing configured anywhere → keyless powerbrain.
+        let a = cfg.resolve_active(None, None, None, None).unwrap();
+        assert_eq!(a.kind, "powerbrain");
+        assert_eq!(a.model, "gpt-5");
+        assert_eq!(a.base_url, "https://powerbrainai.com/app/backend/api/api.php");
+        assert_eq!(a.sources.get("base_url").map(String::as_str), Some("built-in default"));
+        assert_eq!(a.sources.get("api_key").map(String::as_str), Some("none"));
+        // Requesting either built-in by name provisions it too.
+        let a = cfg.resolve_active(Some("powerbrain"), None, None, None).unwrap();
+        assert_eq!(a.kind, "powerbrain");
+        let a = cfg.resolve_active(Some("aitopia"), None, None, None).unwrap();
+        assert_eq!(a.kind, "aitopia");
+        assert_eq!(a.model, "AITOPIA");
+        // Unknown unconfigured providers still fail loudly.
+        assert!(cfg.resolve_active(Some("ghost"), None, None, None).is_err());
+        // A keyed setup via env takes precedence over the free default: any
+        // env/CLI provider info voids the built-in fallback entirely.
+        std::env::set_var("OPENAI_MODEL", "env-model");
+        std::env::set_var("OPENAI_API_KEY", "env-key");
+        let a = cfg.resolve_active(Some("aitopia"), None, None, None).unwrap();
+        std::env::remove_var("OPENAI_MODEL");
+        std::env::remove_var("OPENAI_API_KEY");
+        assert_eq!(a.model, "env-model");
+        assert_eq!(a.sources.get("model").map(String::as_str), Some("environment"));
+        assert_eq!(a.sources.get("base_url").map(String::as_str), Some("none"));
     }
 
     #[test]

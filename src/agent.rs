@@ -256,6 +256,7 @@ impl Agent {
     fn build_system_prompt(cwd: &std::path::Path) -> String {
         let overview = tools::project_overview(cwd);
         let agents_md = load_agents_md(cwd);
+        let skills = crate::skills::prompt_block(&crate::skills::discover(cwd));
         let termux = std::env::var("TERMUX_VERSION").is_ok();
         format!(
             r#"You are Laudacode, an expert AI coding agent running in the user's terminal.
@@ -273,7 +274,7 @@ paths or URLs — if an action is blocked, adapt instead of retrying identically
 
 {overview}
 {agents_md}
-{capabilities}
+{skills}{capabilities}
 
 Working rules:
 1. Inspect BEFORE editing: grep/glob/list_dir/read_file first; read_file returns numbered lines and pages via offset/limit — never guess contents.
@@ -293,6 +294,7 @@ Working rules:
             date = chrono_today(),
             overview = overview,
             agents_md = agents_md,
+            skills = skills,
             capabilities = Self::capabilities_block(),
         )
     }
@@ -838,7 +840,7 @@ mod tests {
         std::fs::write(dir.join("src/exists.rs"), "original\n").unwrap();
         std::fs::write(dir.join("src/doomed.rs"), "bye\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None)
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None, "openai")
             .expect("client");
         let mut agent = Agent::new(
             client,
@@ -894,7 +896,7 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), "v0\n").unwrap();
         std::fs::write(dir.join("src/b.rs"), "v0\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None)
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None, "openai")
             .expect("client");
         let mut agent = Agent::new(
             client,

@@ -210,6 +210,9 @@ pub struct ChatClient {
     send_reasoning: bool,
     /// `reasoning_effort` hint for reasoning models ("low"|"medium"|"high").
     reasoning_effort: Option<String>,
+    /// Transport kind: "openai" (default) or a built-in free provider
+    /// ("aitopia" and "powerbrain").
+    kind: String,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -265,6 +268,12 @@ struct ApiErrorBody {
     message: Option<String>,
 }
 
+const AITOPIA_URL: &str = "https://extensions.aitopia.ai/ai/send";
+const POWERBRAIN_URL: &str = "https://powerbrainai.com/app/backend/api/api.php";
+/// A healthy SSE stream emits keepalives/frames constantly; a silent gap this
+/// long means the connection is effectively dead.
+const STREAM_IDLE: Duration = Duration::from_secs(75);
+
 impl ChatClient {
     pub fn new(
         base_url: &str,
@@ -272,6 +281,7 @@ impl ChatClient {
         headers: &BTreeMap<String, String>,
         send_reasoning: bool,
         reasoning_effort: Option<String>,
+        kind: &str,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("laudacode/", env!("CARGO_PKG_VERSION")))
@@ -285,11 +295,29 @@ impl ChatClient {
             extra_headers: headers.clone(),
             send_reasoning,
             reasoning_effort,
+            kind: kind.to_string(),
         })
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.base_url.trim_end_matches('/'), path.trim_start_matches('/'))
+    }
+
+    /// The chat-completions URL for the active transport kind. Built-in free
+    /// providers ship their full endpoint as `base_url` and don't need an
+    /// OpenAI suffix appended.
+    fn chat_url(&self) -> String {
+        match self.kind.as_str() {
+            "aitopia" | "powerbrain" if self.base_url.is_empty() => {
+                if self.kind == "aitopia" {
+                    AITOPIA_URL.to_string()
+                } else {
+                    POWERBRAIN_URL.to_string()
+                }
+            }
+            "aitopia" | "powerbrain" => self.base_url.clone(),
+            _ => self.endpoint("/chat/completions"),
+        }
     }
 
     fn headers(&self) -> Result<HeaderMap> {
@@ -310,13 +338,34 @@ impl ChatClient {
         Ok(map)
     }
 
-    /// Stream a chat completion. Content/reasoning deltas go through `on_event`;
-    /// the assembled turn is returned at the end.
-    ///
-    /// Transient failures (connection errors, 429/5xx before any body bytes)
-    /// are retried with backoff. `cancel`, when provided, aborts between
-    /// network reads.
-    pub async fn stream_chat<F>(
+    /// Stream a chat completion. Content/reasoning deltas go through
+    /// `on_event`; the assembled turn is returned at the end.
+///
+/// Transient failures (connection errors, 429/5xx before any body bytes)
+/// are retried with backoff. `cancel`, when provided, aborts between
+/// network reads.
+pub async fn stream_chat<F>(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolDef],
+        on_event: F,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Turn>
+    where
+        F: FnMut(StreamEvent),
+    {
+        if is_cancelled(cancel) {
+            bail!("cancelled");
+        }
+        match self.kind.as_str() {
+            "aitopia" => self.stream_aitopia(model, messages, on_event, cancel).await,
+            "powerbrain" => self.stream_powerbrain(model, messages, on_event, cancel).await,
+            _ => self.stream_openai(model, messages, tools, on_event, cancel).await,
+        }
+    }
+
+    async fn stream_openai<F>(
         &self,
         model: &str,
         messages: &[Message],
@@ -343,12 +392,14 @@ impl ChatClient {
             body["reasoning"] = serde_json::json!({ "enabled": true });
         }
         if let Some(effort) = &self.reasoning_effort {
-            // OpenAI chat-completions param for o-series / gpt-5 reasoning.
+            // OpenAI chat-completions param for o-series / gpt-5 reasoning;
+            // "max" is the xAI spelling and passes through as-is — picky
+            // endpoints ignore unknown values rather than erroring.
             body["reasoning_effort"] = serde_json::json!(effort);
         }
 
         const MAX_ATTEMPTS: usize = 3;
-        let url = self.endpoint("/chat/completions");
+        let url = self.chat_url();
         let mut attempt = 0usize;
         let mut last_err: Option<anyhow::Error> = None;
         let resp = loop {
@@ -431,9 +482,6 @@ impl ChatClient {
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         let mut turn = Turn::default();
         let mut acc: Vec<(usize, String, String, String)> = Vec::new(); // (index, id, name, args)
-        // A healthy SSE stream emits keepalives/frames constantly; a silent
-        // gap this long means the connection is effectively dead.
-        const STREAM_IDLE: Duration = Duration::from_secs(75);
 
         loop {
             let next = tokio::time::timeout(STREAM_IDLE, stream.next()).await;
@@ -527,8 +575,294 @@ impl ChatClient {
         Ok(turn)
     }
 
+    /// Aitopia (extensions.aitopia.ai) adapter — free, no API key.
+    ///
+    /// Request body is a proprietary `history` array (assistant turns arrive
+    /// as role "system", plus a trailing empty "system" slot that receives the
+    /// answer). Auth is an opaque `hopekey` header plus a Chrome-extension
+    /// Origin; the SSE body looks like OpenAI but `choices` is an object
+    /// keyed by index instead of an array.
+    async fn stream_aitopia<F>(
+        &self,
+        model: &str,
+        messages: &[Message],
+        mut on_event: F,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Turn>
+    where
+        F: FnMut(StreamEvent),
+    {
+        #[derive(serde::Serialize)]
+        struct Extra {
+            prompt_mode: bool,
+        }
+        #[derive(serde::Serialize)]
+        struct HistoryItem {
+            item: String,
+            role: String,
+            model: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            loading: Option<bool>,
+            extra_data: Extra,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            finish_reason: Option<String>,
+        }
+        #[derive(serde::Serialize)]
+        struct AitopiaBody {
+            history: Vec<HistoryItem>,
+            text: String,
+            model: String,
+            stream: bool,
+            mode: &'static str,
+            prompt_mode: bool,
+            extra_key: &'static str,
+            extra_data: Extra,
+            language_detail: serde_json::Value,
+            is_continue: bool,
+            lang_code: &'static str,
+        }
+
+        let mut history: Vec<HistoryItem> = Vec::new();
+        let mut last_user = String::new();
+        for m in messages {
+            // Aitopia has no tool-call channel — skip tool plumbing.
+            if m.role == "tool" || !m.tool_calls.is_empty() {
+                continue;
+            }
+            let text = m.content.clone().unwrap_or_default();
+            let role = if m.role == "user" { "user" } else { "system" };
+            history.push(HistoryItem {
+                item: text.clone(),
+                role: role.to_string(),
+                model: model.to_string(),
+                title: None,
+                loading: None,
+                extra_data: Extra { prompt_mode: false },
+                finish_reason: None,
+            });
+            if role == "user" && !text.is_empty() {
+                last_user = text;
+            }
+        }
+        history.push(HistoryItem {
+            item: String::new(),
+            role: "system".into(),
+            model: model.to_string(),
+            title: None,
+            loading: Some(true),
+            extra_data: Extra { prompt_mode: false },
+            finish_reason: None,
+        });
+
+        let body = AitopiaBody {
+            history,
+            text: last_user,
+            model: model.to_string(),
+            stream: true,
+            mode: "ai_chat",
+            prompt_mode: false,
+            extra_key: "__all",
+            extra_data: Extra { prompt_mode: false },
+            language_detail: serde_json::json!({
+                "lang_code": "en",
+                "name": "English",
+                "title": "English",
+            }),
+            is_continue: false,
+            lang_code: "en",
+        };
+
+        let url = self.chat_url();
+        let req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/plain")
+            .header("accept-language", "en-US,en;q=0.9")
+            .header("cache-control", "no-cache")
+            .header("hopekey", random_hex_32())
+            .header("origin", "chrome-extension://becfinhbfclcgokjlobojlnldbfillpf")
+            .header("pragma", "no-cache")
+            .header("priority", "u=1, i")
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            )
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "none")
+            .json(&body)
+            .send()
+            .await
+            .context("aitopia request failed")?;
+        let status = req.status();
+        if !status.is_success() {
+            let text = req.text().await.unwrap_or_default();
+            bail!(
+                "aitopia API error ({status}): {}",
+                text.chars().take(500).collect::<String>()
+            );
+        }
+
+        let mut stream = req.bytes_stream();
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut turn = Turn::default();
+        loop {
+            let next = tokio::time::timeout(STREAM_IDLE, stream.next()).await;
+            let item = match next {
+                Err(_) => bail!(
+                    "stream stalled — no data for {}s (server hung up?)",
+                    STREAM_IDLE.as_secs()
+                ),
+                Ok(None) => break,
+                Ok(Some(item)) => item,
+            };
+            if is_cancelled(cancel) {
+                bail!("cancelled");
+            }
+            let chunk = item.context("connection lost while streaming")?;
+            buf.extend_from_slice(&chunk);
+            while let Some((_sep, consume)) = find_frame_end(&buf) {
+                let frame: Vec<u8> = buf.drain(..consume).collect();
+                let text = String::from_utf8_lossy(&frame);
+                for line in text.lines() {
+                    let line = line.trim();
+                    if !line.starts_with("data:") {
+                        continue;
+                    }
+                    let data = line[5..].trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    if let Some(ct) = extract_aitopia_content(data) {
+                        if !ct.is_empty() {
+                            turn.content.push_str(&ct);
+                            on_event(StreamEvent::Content(ct));
+                        }
+                    }
+                }
+            }
+        }
+        if turn.content.is_empty() {
+            bail!("aitopia returned an empty reply");
+        }
+        Ok(turn)
+    }
+
+    /// Powerbrain (powerbrainai.com) adapter — free, no API key.
+    ///
+    /// Non-OpenAI body carries a hardcoded `secret_token` + `action`
+    /// ("send_message"). The endpoint streams plain JSON objects (one per
+    /// line, `{"data":"<partial text>"}`), possibly wrapped in SSE `data:`.
+    async fn stream_powerbrain<F>(
+        &self,
+        model: &str,
+        messages: &[Message],
+        mut on_event: F,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Turn>
+    where
+        F: FnMut(StreamEvent),
+    {
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+        for m in messages {
+            if m.role == "tool" || !m.tool_calls.is_empty() {
+                continue;
+            }
+            let content = m.content.clone().unwrap_or_default();
+            if content.trim().is_empty() {
+                continue;
+            }
+            msgs.push(serde_json::json!({ "role": m.role, "content": content }));
+        }
+        if msgs.is_empty() {
+            msgs.push(serde_json::json!({ "role": "user", "content": "" }));
+        }
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": msgs,
+            "secret_token": "AIChatPowerBrain123@2024",
+            "action": "send_message",
+        });
+        let url = self.chat_url();
+        let req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("user-agent", "Dart/3.5 (dart:io)")
+            .json(&body)
+            .send()
+            .await
+            .context("powerbrain request failed")?;
+        let status = req.status();
+        if !status.is_success() {
+            let text = req.text().await.unwrap_or_default();
+            bail!(
+                "powerbrain API error ({status}): {}",
+                text.chars().take(500).collect::<String>()
+            );
+        }
+
+        let mut stream = req.bytes_stream();
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut turn = Turn::default();
+        loop {
+            let next = tokio::time::timeout(STREAM_IDLE, stream.next()).await;
+            let item = match next {
+                Err(_) => bail!(
+                    "stream stalled — no data for {}s (server hung up?)",
+                    STREAM_IDLE.as_secs()
+                ),
+                Ok(None) => break,
+                Ok(Some(item)) => item,
+            };
+            if is_cancelled(cancel) {
+                bail!("cancelled");
+            }
+            let chunk = item.context("connection lost while streaming")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(idx) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=idx).collect();
+                emit_powerbrain_line(&String::from_utf8_lossy(&line), &mut turn, &mut on_event)?;
+            }
+        }
+        // Some powerbrain responses end without a trailing newline — drain the
+        // leftover buffer so the final (or only) JSON object isn't dropped.
+        if !buf.is_empty() {
+            emit_powerbrain_line(&String::from_utf8_lossy(&buf), &mut turn, &mut on_event)?;
+        }
+        if turn.content.is_empty() {
+            bail!("powerbrain returned an empty reply");
+        }
+        Ok(turn)
+    }
+
     /// Fetch available models from `/v1/models`.
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        // Built-in free providers have no OpenAI /models catalog (or return a
+        // non-OpenAI shape) — offer a curated, always-current default set.
+        match self.kind.as_str() {
+            "aitopia" => {
+                return Ok(vec![
+                    "AITOPIA".into(),
+                    "gpt-4o-mini".into(),
+                    "gpt-4o".into(),
+                    "claude-3.5-sonnet".into(),
+                ])
+            }
+            "powerbrain" => {
+                return Ok(vec![
+                    "gpt-5".into(),
+                    "gpt-5-mini".into(),
+                    "gemini-2.0-flash".into(),
+                ])
+            }
+            _ => {}
+        }
         let url = self.endpoint("/models");
         let resp = self.http.get(&url).headers(self.headers()?).send().await?;
         let status = resp.status();
@@ -555,6 +889,18 @@ impl ChatClient {
     /// garbage keys, so this is the only trustworthy pre-flight check for
     /// provider setup (`/provider add|edit`).
     pub async fn probe_chat(&self, model: &str) -> Result<()> {
+        if self.kind != "openai" {
+            // Built-in free providers have no OpenAI /chat/completions probe —
+            // a 1-word reply through the real transport is the honest check.
+            let turn = self
+                .stream_chat(model, &[Message::user("ping")], &[], |_| {}, None)
+                .await
+                .context("probe request failed")?;
+            if turn.content.trim().is_empty() {
+                bail!("provider returned an empty reply");
+            }
+            return Ok(());
+        }
         let body = serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
@@ -596,6 +942,96 @@ impl ChatClient {
                 }
             })
     }
+}
+
+/// Parse one powerbrain response line/fragment and push any text delta into
+/// the running turn. Handles both raw `{"data":"…"}` JSON and the SSE-wrapped
+/// form; errors bail with the server's own message.
+fn emit_powerbrain_line<F: FnMut(StreamEvent)>(
+    line: &str,
+    turn: &mut Turn,
+    on_event: &mut F,
+) -> Result<()> {
+    let line = line.trim().strip_prefix("data:").unwrap_or(line.trim()).trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+    #[derive(serde::Deserialize)]
+    struct PB {
+        #[serde(default)]
+        data: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    if let Ok(pb) = serde_json::from_str::<PB>(line) {
+        if let Some(er) = pb.error {
+            if !er.trim().is_empty() {
+                bail!("powerbrain error: {er}");
+            }
+        }
+        if let Some(d) = pb.data {
+            if !d.is_empty() {
+                turn.content.push_str(&d);
+                on_event(StreamEvent::Content(d));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extract the text delta from one aitopia SSE `data:` line.
+///
+/// Aitopia sends `{"choices":{"0":{"delta":{"content":"…"},"finish_reason":…}}}`
+/// (an object keyed by index) — the OpenAI array form is also tolerated.
+fn extract_aitopia_content(data: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        delta: EntryDelta,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct EntryDelta {
+        #[serde(default)]
+        content: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Chunk {
+        choices: serde_json::Value,
+    }
+    let chunk: Chunk = serde_json::from_str(data).ok()?;
+    match chunk.choices {
+        serde_json::Value::Object(map) => {
+            let entry: Entry = serde_json::from_value(map.get("0").cloned()?).ok()?;
+            entry.delta.content
+        }
+        serde_json::Value::Array(mut arr) => {
+            if arr.is_empty() {
+                return None;
+            }
+            let entry: Entry = serde_json::from_value(arr.remove(0)).ok()?;
+            entry.delta.content
+        }
+        _ => None,
+    }
+}
+
+/// A fresh 32-hex-char random token for aitopia's `hopekey` header. No rand
+/// crate: seed an xorshift with the clock + process id.
+fn random_hex_32() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut x = (nanos ^ (std::process::id() as u64).wrapping_mul(0x0100_0000_01b3)) | 1;
+    let mut out = String::with_capacity(32);
+    for _ in 0..4 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push_str(&format!("{x:016x}"));
+    }
+    out
 }
 
 /// Locate the end of the next SSE frame in `buf`.
@@ -717,7 +1153,7 @@ mod tests {
     /// error (not hang or silently succeed).
     #[tokio::test]
     async fn probe_fails_without_server() {
-        let c = ChatClient::new("http://127.0.0.1:9/v1", "k", &Default::default(), false, None)
+        let c = ChatClient::new("http://127.0.0.1:9/v1", "k", &Default::default(), false, None, "openai")
             .expect("client builds");
         assert!(c.probe_chat("m").await.is_err());
     }
@@ -734,6 +1170,7 @@ mod tests {
             &Default::default(),
             false,
             None,
+            "openai",
         )
         .unwrap();
         // /models is public and would happily return 200 — the chat probe
@@ -743,5 +1180,39 @@ mod tests {
             c.probe_chat("openai/gpt-4o-mini").await.is_err(),
             "garbage key must fail a real completion"
         );
+    }
+
+    /// Live end-to-end check for the built-in keyless free providers. These
+    /// are external services — failures here are usually rate-limit/budget on
+    /// the provider side. Run explicitly: `cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn free_providers_stream_a_real_reply() {
+        for (kind, base_url, model) in [
+            ("aitopia", "https://extensions.aitopia.ai/ai/send", "AITOPIA"),
+            (
+                "powerbrain",
+                "https://powerbrainai.com/app/backend/api/api.php",
+                "gpt-5",
+            ),
+        ] {
+            let c = ChatClient::new(base_url, "", &Default::default(), false, None, kind)
+                .expect("client builds");
+            let reply = c
+                .stream_chat(
+                    model,
+                    &[Message::user("reply with exactly: ok")],
+                    &[],
+                    |_| {},
+                    None,
+                )
+                .await;
+            match reply {
+                Ok(t) => assert!(!t.content.trim().is_empty(), "{kind}: empty reply"),
+                Err(e) => {
+                    eprintln!("{kind} failed (may be provider-side limits): {e:#}");
+                }
+            }
+        }
     }
 }

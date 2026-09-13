@@ -5,6 +5,8 @@
 **A fast, lightweight AI coding agent for your terminal.**
 Pure Rust, no Node.js, tiny binary, built for Termux.
 
+<img src="./img/laudacode.jpg" alt="Laudacode" width="100%"/>
+
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green)]()
@@ -102,11 +104,18 @@ laudacode                 # first run: no wizard — just type /provider
 ```
 
 `/provider` opens a fully interactive menu (**add · use · edit · list**):
-choose **add** → pick a preset (**openrouter**, tokenrouter, openai,
-groq, deepseek, together, ollama, ollamacloud, lmstudio) → paste your API key → pick a model
+choose **add** → pick a preset (openrouter, tokenrouter, openai,
+groq, deepseek, together, ollama, ollamacloud, lmstudio…) → paste your API key → pick a model
 from the live catalog. Nothing is saved until a real test request proves
 the key and model work. The CLI flow is still there too — same rule: a provider is only saved
 after a live test request proves the key and model work.
+
+**Keyless free providers** — the `powerbrain` and `aitopia` presets need no
+API key and no model picker: picking them saves immediately with a built-in
+default model (gpt-5 and gpt-4o-mini class respectively). Use them with
+`--provider` or `/provider use`. `powerbrain` is also the built-in default:
+with no provider configured at all, Laudacode just works out of the box
+chat-first.
 
 ```sh
 laudacode provider add                        # guided setup (name, url, key, model)

@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 use std::time::{Duration, Instant};
@@ -77,6 +77,66 @@ fn banner_colors() -> Vec<Color> {
     crate::theme::banner_gradient(crate::tui::HEADER_HEIGHT as usize)
 }
 
+// ---------------------------------------------------------------------------
+// Chrome helpers — the shared visual vocabulary for every panel, popup and
+// status line. Routing through these keeps the UI consistent and lets
+// `/theme` restyle the whole shell (no stray hardcoded greys).
+// ---------------------------------------------------------------------------
+
+/// Rounded border used by every panel/modal/popup. Plain on terminals that
+/// can't render the box-drawing set reliably.
+fn rounded() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+}
+
+/// Rounded panel with an optional title line and accent border color.
+fn panel(title: Option<Line<'static>>, accent: Option<Color>) -> Block<'static> {
+    let t = crate::theme::get();
+    let mut b = rounded().border_style(Style::default().fg(accent.unwrap_or(t.border)));
+    if let Some(ti) = title {
+        b = b.title(ti);
+    }
+    b
+}
+
+/// Selected-row style: a filled "pill" instead of the old bold-only row.
+fn selection_style() -> Style {
+    let t = crate::theme::get();
+    Style::default().bg(t.surface).fg(t.surface_fg).add_modifier(Modifier::BOLD)
+}
+
+/// A key-hint chip: the key cap is accent-colored + bold, the label dim.
+/// Mirrors the `[Key] Label` idiom used across polished ratatui apps.
+fn key_hint(key: &str, label: &str) -> Vec<Span<'static>> {
+    let t = crate::theme::get();
+    vec![
+        Span::styled(format!(" {key} "), Style::default().bg(t.surface).fg(t.hint_key).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {label}"), Style::default().fg(t.hint_text)),
+    ]
+}
+
+/// Colored context/progress meter with rounded caps, e.g. `▏██████░░░░▕`.
+/// `pct` is 0-100; the fill color escalates to warning/danger as it grows.
+fn meter(pct: u64, slots: usize) -> Vec<Span<'static>> {
+    let t = crate::theme::get();
+    let filled = (pct as usize * slots / 100).min(slots);
+    let fill = if pct >= 85 {
+        t.error
+    } else if pct >= 60 {
+        t.warning
+    } else {
+        t.bar_fill
+    };
+    vec![
+        Span::styled("▏", Style::default().fg(t.bar_empty)),
+        Span::styled("█".repeat(filled), Style::default().fg(fill)),
+        Span::styled("░".repeat(slots - filled), Style::default().fg(t.bar_empty)),
+        Span::styled("▕", Style::default().fg(t.bar_empty)),
+    ]
+}
+
 /// Total header height: 13 braille-art rows (branding is embedded in the art).
 const HEADER_HEIGHT: u16 = 13;
 /// Height of the slim one-line wordmark header used on short/narrow windows.
@@ -114,6 +174,35 @@ pub enum Action {
     ToggleBanner,
     /// The input modal was answered with Enter; carries the typed text.
     InputSubmit(String),
+}
+
+/// A tappable region registered during draw. Termux is touch-first, so
+/// everything the keyboard can do should also be reachable by tapping the
+/// thing that shows it. Registered regions are hit-tested topmost-first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tap {
+    /// Index into [`Tui::hint_chips`] — the key-hint strip under the composer.
+    HintChip(usize),
+    /// The mode pill in the composer title or footer.
+    ModeChip,
+    /// The brand banner band (toggles it off/on).
+    Banner,
+    /// The "↑ N lines · esc release" indicator (scrolls back to the bottom).
+    ScrollHint,
+    /// Inside the Ctrl+O overlay — dismisses it.
+    OverlayClose,
+    /// An approval-modal button, tagged with its key (`y`/`a`/`n`/esc).
+    Approval(char),
+    /// Confirm the open input modal.
+    InputConfirm,
+    /// Cancel the open input modal.
+    InputCancel,
+    /// The app-brand chip in the footer.
+    FooterBrand,
+    /// The floating slash-command suggestion popup.
+    SlashPopup,
+    /// The floating @-mention file suggestion popup.
+    AtPopup,
 }
 
 /// A modal picker over a list of strings (models, providers, ...).
@@ -303,6 +392,14 @@ pub struct Tui {
     last_transcript: Option<Rect>,
     last_composer: Option<Rect>,
     last_picker: Option<Rect>,
+    /// Geometry of the floating suggestion popups, so a tap can complete the
+    /// command/file under the finger (they float over the transcript).
+    last_slash_popup: Option<Rect>,
+    last_at_popup: Option<Rect>,
+    /// Tappable regions registered by the most recent frame.
+    tap_targets: Vec<(Rect, Tap)>,
+    /// Row of the previous mouse event — drives finger-drag scrolling.
+    last_mouse_row: Option<u16>,
 }
 
 /// Identity + counters rendered in the wide-terminal side dashboard.
@@ -376,6 +473,7 @@ fn shorten_id(id: &str) -> String {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/model", "pick a model from the live list"),
+    ("/reasoning", "thinking depth: normal · low · medium · high · max"),
     ("/approvals", "switch approval mode (plan/build/full-auto)"),
     ("/provider", "menu: add · use · edit · list"),
     ("/compact", "summarize history to free context"),
@@ -411,6 +509,8 @@ fn filter_slash_commands(query: &str) -> Vec<usize> {
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const TICK_MS: u64 = 100;
+/// Rows visible in the floating slash/@ suggestion popups (excluding border).
+const POPUP_MAX_VISIBLE: usize = 6;
 
 impl Tui {
     pub fn new() -> Self {
@@ -459,6 +559,10 @@ impl Tui {
             last_transcript: None,
             last_composer: None,
             last_picker: None,
+            last_slash_popup: None,
+            last_at_popup: None,
+            tap_targets: Vec::new(),
+            last_mouse_row: None,
         }
     }
 
@@ -545,6 +649,25 @@ impl Tui {
     pub fn push(&mut self, e: Entry) {
         self.entries.push(e);
         self.scroll = 0;
+    }
+
+    /// What the Esc key does: close an open @-token first, then release
+    /// scroll-back, then clear the input — and always signal interrupt.
+    fn esc_pressed(&mut self) -> Action {
+        self.history_pos = None;
+        if self.at_token_present() {
+            if let Some(i) = self.input.rfind('@') {
+                self.input.truncate(i);
+                self.cursor_home();
+                self.at_sel = 0;
+            }
+        } else if self.scroll > 0 {
+            self.scroll = 0;
+        } else {
+            self.input.clear();
+            self.cursor_home();
+        }
+        Action::Interrupt
     }
 
     /// Set/clear the footer activity indicator.
@@ -934,7 +1057,7 @@ impl Tui {
                 .map(|l| {
                     Line::from(Span::styled(
                         l,
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default().fg(crate::theme::get().dim).add_modifier(Modifier::ITALIC),
                     ))
                 })
                 .collect(),
@@ -944,7 +1067,7 @@ impl Tui {
                     name.clone(),
                     Style::default().fg(crate::theme::get().accent2).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
+                Span::styled(format!(" {summary}"), Style::default().fg(crate::theme::get().gray)),
             ])],
             Entry::ToolResult { name, ok, preview } => {
                 let t = crate::theme::get();
@@ -956,7 +1079,7 @@ impl Tui {
                 for l in preview.lines().take(4) {
                     lines.push(Line::from(Span::styled(
                         format!("  {l}"),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(crate::theme::get().gray),
                     )));
                 }
                 lines
@@ -1002,16 +1125,16 @@ impl Tui {
                             LineKind::Add => Style::default().fg(crate::theme::get().success),
                             LineKind::Del => Style::default().fg(crate::theme::get().error),
                             LineKind::Meta => {
-                                Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC)
+                                Style::default().fg(crate::theme::get().heading).add_modifier(Modifier::ITALIC)
                             }
-                            LineKind::Ctx => Style::default().fg(Color::DarkGray),
+                            LineKind::Ctx => Style::default().fg(crate::theme::get().dim),
                         };
                         // Meta lines (@@ headers) stay plain; code gets tokens.
                         // The +/-/-sign keeps its strong kind color.
                         let content: Vec<Span<'static>> = match dl.kind {
                             LineKind::Meta => vec![Span::styled(
                                 dl.text.clone(),
-                                Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC),
+                                Style::default().fg(crate::theme::get().heading).add_modifier(Modifier::ITALIC),
                             )],
                             _ => {
                                 let base = match tint {
@@ -1051,7 +1174,7 @@ impl Tui {
                 .collect(),
             Entry::Error(t) => wrap_text(t, width.saturating_sub(2) as usize)
                 .into_iter()
-                .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))))
+                .map(|l| Line::from(Span::styled(l, Style::default().fg(crate::theme::get().error).add_modifier(Modifier::BOLD))))
                 .collect(),
         }
     }
@@ -1136,40 +1259,79 @@ impl Tui {
         }
     }
 
-    /// Build the hint strip, dropping low-priority chips until it fits
-    /// `width` columns. Chips are ordered most-important first so a narrow
-    /// Termux window never clips a one-line hint awkwardly.
-    fn hint_line(width: u16) -> String {
-        const CHIPS: &[&str] = &[
-            "enter send",
-            "esc interrupt",
-            "↑↓ history",
-            "tab mode",
-            "←→ edit",
-            "ctrl+c quit",
-            "pgup/pgdn scroll",
+    /// Build the hint strip, dropping low-priority chips until they fit
+    /// `width` columns. Each chip renders the key cap in the accent color and
+    /// the action label dimmed, so the strip scans much faster than a run of
+    /// plain grey text. Returns `(key, label)` pairs chosen for `width`.
+    fn hint_chips(width: u16) -> Vec<(&'static str, &'static str)> {
+        const CHIPS: &[(&str, &str)] = &[
+            ("enter", "send"),
+            ("esc", "interrupt"),
+            ("↑↓", "history"),
+            ("tab", "mode"),
+            ("←→", "edit"),
+            ("ctrl+o", "tools"),
+            ("ctrl+b", "banner"),
+            ("ctrl+c", "quit"),
         ];
         let w = width as usize;
-        if w < 12 {
-            return " esc".to_string();
+        if w < 14 {
+            return vec![("esc", "")];
         }
-        let mut out = String::with_capacity(w);
-        out.push(' ');
-        for (i, chip) in CHIPS.iter().enumerate() {
-            let sep = if i == 0 { "" } else { " · " };
-            let added = format!("{sep}{chip}");
-            if out.chars().count() + added.chars().count() > w.saturating_sub(1) {
+        let mut out: Vec<(&str, &str)> = Vec::new();
+        // Each chip costs " KEY label" plus the 2-col separator between chips.
+        let mut used = 1usize;
+        for (key, label) in CHIPS {
+            let cost = key.chars().count() + label.chars().count() + 3 + if out.is_empty() { 0 } else { 2 };
+            if used + cost > w {
                 break;
             }
-            out.push_str(&added);
+            used += cost;
+            out.push((key, label));
         }
-        if out.trim_end() == "" {
-            out = " esc".into();
+        if out.is_empty() {
+            out.push(("esc", ""));
         }
         out
     }
+
+    /// Plain-text form of [`Tui::hint_chips`] (test-only width check).
+    #[cfg(test)]
+    fn hint_line(width: u16) -> String {
+        let chips = Self::hint_chips(width);
+        let mut s = String::from(" ");
+        for (i, (key, label)) in chips.iter().enumerate() {
+            if i > 0 {
+                s.push_str("  ");
+            }
+            s.push_str(key);
+            if !label.is_empty() {
+                s.push(' ');
+                s.push_str(label);
+            }
+        }
+        s
+    }
+
+    /// Last path component of the working directory, for the composer
+    /// breadcrumb. Falls back to the full stored path when it has no basename.
+    fn cwd_basename(&self) -> String {
+        let raw = self.dash.cwd.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        let p = raw.trim_end_matches('/');
+        if p.is_empty() {
+            return "/".to_string();
+        }
+        p.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
+    }
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
+        // Every frame rebuilds the tap map, so stale hitboxes can never fire.
+        self.tap_targets.clear();
+        self.last_slash_popup = None;
+        self.last_at_popup = None;
 
         // Ctrl+O full-output overlay takes over the screen.
         if self.overlay {
@@ -1266,10 +1428,12 @@ impl Tui {
                     ),
                     Span::styled(
                         format!(" v{} · {}", env!("CARGO_PKG_VERSION"), self.mode.label()),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(crate::theme::get().dim),
                     ),
                 ]);
                 f.render_widget(Paragraph::new(line), h);
+                // Tapping the slim header cycles the mode (same as Tab).
+                self.tap_targets.push((h, Tap::ModeChip));
             } else {
                 let grad = banner_colors();
                 let banner_lines: Vec<Line> = BANNER
@@ -1288,6 +1452,8 @@ impl Tui {
                 if !self.is_busy() {
                     self.fx.render(f.buffer_mut(), h);
                 }
+                // Tapping the banner collapses it (Ctrl+B equivalent).
+                self.tap_targets.push((h, Tap::Banner));
             }
         }
 
@@ -1321,20 +1487,24 @@ impl Tui {
         let list = List::new(shown).block(Block::default().borders(Borders::NONE));
         f.render_widget(list, transcript_area);
 
-        // Scroll hint
+        // Scroll hint + position indicator when the transcript is released
+        // from the bottom, so the user can tell how far back they are.
         if self.scroll > 0 {
-            let hint = Span::styled(format!(" ↑ {} lines (Esc to release) ", self.scroll), Style::default().fg(Color::DarkGray));
+            let t = crate::theme::get();
+            let hint = Span::styled(
+                format!(" ↑ {} lines · esc release ", self.scroll),
+                Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
+            );
             let r = Rect::new(transcript_area.x, transcript_area.y, transcript_area.width, 1);
             let p = Paragraph::new(Line::from(hint)).alignment(ratatui::layout::Alignment::Right);
             f.render_widget(p, r);
+            // Tapping it jumps back to the live tail.
+            self.tap_targets.push((r, Tap::ScrollHint));
         }
 
-        // Composer — border glows in the active mode color while working.
-        let comp_style = if self.busy {
-            Style::default().fg(self.mode.color())
-        } else {
-            Style::default().fg(Color::Rgb(110, 110, 135))
-        };
+        // Composer — the focused widget, so its border always uses the
+        // focus accent (the active mode color) rather than a raw grey.
+        let comp_style = Style::default().fg(self.mode.color());
         const PLACEHOLDER: &str =
             "ask laudacode anything — @ to mention files, # to remember, / for commands";
         let cursor_ok = self.pending_approval.is_none();
@@ -1342,12 +1512,12 @@ impl Tui {
         let text: Vec<Line> = if self.input.is_empty() && !cursor_ok {
             vec![Line::from(Span::styled(
                 "waiting for approval — y / a / n",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::get().dim).add_modifier(Modifier::ITALIC),
             ))]
         } else if self.input.is_empty() {
             vec![Line::from(Span::styled(
                 PLACEHOLDER,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::get().dim),
             ))]
         } else {
             // Rendered from the exact same wrapped rows used for height and
@@ -1357,8 +1527,27 @@ impl Tui {
                 .map(Line::from)
                 .collect()
         };
+        // Title carries a mode pill + working directory so the composer
+        // doubles as a breadcrumb for "where am I, which mode".
+        let mode_pill = Span::styled(
+            format!(" {} ", self.mode.label()),
+            Style::default()
+                .bg(self.mode.color())
+                .fg(crate::theme::get().overlay)
+                .add_modifier(Modifier::BOLD),
+        );
+        let cwd = self.cwd_basename();
+        let comp_title = if cwd.is_empty() {
+            Line::from(vec![Span::styled(" ", Style::default()), mode_pill])
+        } else {
+            Line::from(vec![
+                Span::styled(" ", Style::default()),
+                mode_pill,
+                Span::styled(format!("  {cwd} "), Style::default().fg(crate::theme::get().dim)),
+            ])
+        };
         let composer = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).style(comp_style));
+            .block(rounded().border_style(comp_style).title(comp_title.clone()));
         f.render_widget(composer, composer_area);
         if cursor_ok && !self.input.is_empty() {
             // Place the caret at `self.cursor` (char count from start).
@@ -1380,14 +1569,44 @@ impl Tui {
             self.draw_at_popup(f, area, composer_area);
         }
 
-        // Hints strip under the composer — adapts to width so it never clips
-        // awkwardly on narrow Termux screens: priority chips first, trimmed
-        // to what fits, or a minimal row on the smallest widths.
-        let hint = Self::hint_line(hints_area.width);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
-            hints_area,
-        );
+        // Hints strip under the composer — colored key-cap chips, trimmed to
+        // what fits so a narrow Termux window never clips awkwardly.
+        let mut hint_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        let chips = Self::hint_chips(hints_area.width);
+        let mut chip_x = hints_area.x + 1; // leading space cell
+        for (i, (key, label)) in chips.iter().enumerate() {
+            if i > 0 {
+                hint_spans.push(Span::styled("  ", Style::default()));
+                chip_x += 2;
+            }
+            let start = chip_x;
+            let key_w = UnicodeWidthStr::width(*key) as u16;
+            let label_w = if label.is_empty() {
+                0
+            } else {
+                1 + UnicodeWidthStr::width(*label) as u16
+            };
+            // Each chip is independently tappable.
+            let cw = key_w + label_w;
+            if cw > 0 && start + cw <= hints_area.x + hints_area.width {
+                self.tap_targets.push((
+                    Rect::new(start, hints_area.y, cw, 1),
+                    Tap::HintChip(i),
+                ));
+            }
+            chip_x += cw;
+            hint_spans.push(Span::styled(
+                (*key).to_string(),
+                Style::default().fg(crate::theme::get().hint_key).add_modifier(Modifier::BOLD),
+            ));
+            if !label.is_empty() {
+                hint_spans.push(Span::styled(
+                    format!(" {label}"),
+                    Style::default().fg(crate::theme::get().hint_text),
+                ));
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(hint_spans)), hints_area);
 
         // Approval modal floats over everything else.
         if let Some(detail) = self.pending_approval.clone() {
@@ -1401,11 +1620,24 @@ impl Tui {
             Constraint::Percentage(45),
         ])
         .split(footer_area);
+        let brand = " LaudaCode ";
+        let mode_chip = format!(" {} ", self.mode.label());
+        let brand_w = UnicodeWidthStr::width(brand) as u16;
+        let chip_w = UnicodeWidthStr::width(mode_chip.as_str()) as u16;
+        // Tapping the brand or mode chip in the footer toggles banner / mode.
+        self.tap_targets.push((
+            Rect::new(footer_area.x, footer_area.y, brand_w, 1),
+            Tap::FooterBrand,
+        ));
+        self.tap_targets.push((
+            Rect::new(footer_area.x + brand_w, footer_area.y, chip_w, 1),
+            Tap::ModeChip,
+        ));
         let mut spans = vec![
-            Span::styled(" LaudaCode ", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(brand, Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!(" {} ", self.mode.label()),
-                Style::default().bg(self.mode.color()).fg(Color::Black).add_modifier(Modifier::BOLD),
+                mode_chip,
+                Style::default().bg(self.mode.color()).fg(crate::theme::get().overlay).add_modifier(Modifier::BOLD),
             ),
         ];
         if self.busy {
@@ -1413,47 +1645,55 @@ impl Tui {
             let secs = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             spans.push(Span::styled(
                 format!(" {glyph} {} (esc · {secs}s)", self.busy_label),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::get().warning).add_modifier(Modifier::BOLD),
             ));
         }
         if let Some((msg, at)) = &self.status {
             let secs = at.elapsed().as_secs();
             spans.push(Span::styled(
                 format!("  ·  {msg} ({secs}s)"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(crate::theme::get().dim),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
 
-        // Context-left meter: ▕██████░░░░░░▏ 38%
-        let pct = self
-            .ctx_used
-            .min(self.ctx_total)
-            .checked_mul(100)
-            .and_then(|n| n.checked_div(self.ctx_total))
-            .map(|p| p.min(100))
-            .unwrap_or(0);
-        const BAR_SLOTS: usize = 10;
-        let filled = pct as usize * BAR_SLOTS / 100;
-        let bar_color = if pct >= 85 {
-            Color::LightRed
-        } else if pct >= 60 {
-            Color::LightYellow
-        } else {
-            Color::DarkGray
-        };
-        let meter_spans = vec![
-            Span::styled(self.subtitle.clone(), Style::default().fg(Color::DarkGray)),
-            Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
-            Span::styled("▕", Style::default().fg(Color::DarkGray)),
-            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
-            Span::styled("░".repeat(BAR_SLOTS - filled), Style::default().fg(Color::DarkGray)),
-            Span::styled("▏", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!(" {:>3}% ", 100 - pct),
-                Style::default().fg(if 100 - pct <= 15 { Color::LightRed } else { Color::Gray }),
-            ),
-        ];
+        // Right side: provider subtitle + context meter. The meter adapts to
+        // the available footer width so it can never clip mid-bar.
+        let mut meter_spans: Vec<Span<'static>> = Vec::new();
+        let sub = self.subtitle.trim();
+        if !sub.is_empty() {
+            meter_spans.push(Span::styled(
+                format!("{sub}  "),
+                Style::default().fg(crate::theme::get().dim),
+            ));
+        }
+        if self.ctx_total > 0 {
+            let pct = self
+                .ctx_used
+                .min(self.ctx_total)
+                .checked_mul(100)
+                .and_then(|n| n.checked_div(self.ctx_total))
+                .map(|p| p.min(100))
+                .unwrap_or(0);
+            // Subtitle + "ctx " + caps + " 100% " = fixed overhead; give the
+            // bar whatever remains, but always leave at least two slots.
+            const FIXED: usize = 12;
+            let avail = (cols[1].width as usize).saturating_sub(sub.chars().count() + FIXED);
+            let slots = avail.clamp(2, 10);
+            let left = 100 - pct;
+            let tail = format!(" {:>3}% ", left);
+            let label = if slots >= 6 { "ctx " } else { "" };
+            meter_spans.push(Span::styled(label, Style::default().fg(crate::theme::get().dim)));
+            meter_spans.extend(meter(pct, slots));
+            meter_spans.push(Span::styled(
+                tail,
+                Style::default().fg(if left <= 15 {
+                    crate::theme::get().error
+                } else {
+                    crate::theme::get().gray
+                }),
+            ));
+        }
         f.render_widget(
             Paragraph::new(Line::from(meter_spans)).alignment(ratatui::layout::Alignment::Right),
             cols[1],
@@ -1486,14 +1726,14 @@ impl Tui {
         }
         let joined = parts.join(" · ");
         let mut spans = vec![
-            Span::styled(" ", Style::default().fg(Color::DarkGray)),
-            Span::styled("LaudaCode", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ", Style::default().fg(crate::theme::get().accent)),
+            Span::styled("LaudaCode", Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default().fg(crate::theme::get().dim)),
         ];
         let budget = w.saturating_sub(14);
         if budget >= 4 {
             let shown = Self::truncate_to(joined, budget);
-            spans.push(Span::styled(shown, Style::default().fg(Color::Gray)));
+            spans.push(Span::styled(shown, Style::default().fg(crate::theme::get().gray)));
         }
         spans
     }
@@ -1501,35 +1741,40 @@ impl Tui {
     /// Persistent right-side panel: session identity + live counters.
     fn draw_dashboard(&mut self, f: &mut Frame, rect: Rect) {
         let lines = self.dashboard_lines(rect.width);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(70, 70, 95)))
-            .title(Span::styled(
-                " laudacode ",
-                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
-            ));
+        let block = panel(
+            Some(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(crate::theme::get().accent)),
+                Span::styled(
+                    "laudacode",
+                    Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ])),
+            None,
+        );
         f.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
     /// Build the dashboard rows (pure — unit-tested without a terminal).
     fn dashboard_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let theme = crate::theme::get();
         let w = width.saturating_sub(2) as usize; // border padding
         let mut v: Vec<Line<'static>> = Vec::new();
         let row = |label: &str, value: String, vcolor: Color| -> Line<'static> {
             Line::from(vec![
-                Span::styled(format!(" {:<9}", label), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {:<9}", label), Style::default().fg(theme.dim)),
                 Span::styled(Self::truncate_to(value, w.saturating_sub(10)), Style::default().fg(vcolor)),
             ])
         };
-        v.push(row("session", self.dash.session_id.clone(), Color::White));
+        v.push(row("session", self.dash.session_id.clone(), theme.text));
         if !self.dash.session_name.is_empty() {
-            v.push(row("name", self.dash.session_name.clone(), Color::Cyan));
+            v.push(row("name", self.dash.session_name.clone(), theme.accent2));
         }
-        v.push(row("model", self.dash.model.clone(), Color::Gray));
-        v.push(row("provider", self.dash.provider.clone(), Color::Gray));
+        v.push(row("model", self.dash.model.clone(), theme.gray));
+        v.push(row("provider", self.dash.provider.clone(), theme.gray));
         v.push(Line::from(Span::styled(
             format!(" {}", "─".repeat(w.saturating_sub(1))),
-            Style::default().fg(Color::Rgb(60, 60, 80)),
+            Style::default().fg(theme.rule),
         )));
         v.push(row("mode", self.mode.label().to_string(), self.mode.color()));
         v.push(Line::from(Span::raw(String::new())));
@@ -1537,7 +1782,7 @@ impl Tui {
         // Context usage block.
         v.push(Line::from(Span::styled(
             " context",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )));
         let pct = self
             .ctx_used
@@ -1547,59 +1792,55 @@ impl Tui {
             .map(|p| p.min(100))
             .unwrap_or(0);
         const SLOTS: usize = 14;
-        let filled = pct as usize * SLOTS / 100;
-        let bar_color = if pct >= 85 {
-            Color::LightRed
-        } else if pct >= 60 {
-            Color::LightYellow
-        } else {
-            Color::Green
-        };
+        let mut bar = vec![Span::raw(" ")];
+        bar.extend(meter(pct, SLOTS));
+        v.push(Line::from(bar));
         v.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("▕", Style::default().fg(Color::DarkGray)),
-            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
-            Span::styled("░".repeat(SLOTS - filled), Style::default().fg(Color::Rgb(60, 60, 80))),
-            Span::styled("▏", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {:<9}", "in"), Style::default().fg(theme.dim)),
+            Span::styled(Self::fmt_tokens(self.dash.prompt_tokens), Style::default().fg(theme.gray)),
+            Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
         v.push(Line::from(vec![
-            Span::styled(format!(" {:<9}", "in"), Style::default().fg(Color::DarkGray)),
-            Span::styled(Self::fmt_tokens(self.dash.prompt_tokens), Style::default().fg(Color::Gray)),
-            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {:<9}", "out"), Style::default().fg(theme.dim)),
+            Span::styled(Self::fmt_tokens(self.dash.completion_tokens), Style::default().fg(theme.gray)),
+            Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
         v.push(Line::from(vec![
-            Span::styled(format!(" {:<9}", "out"), Style::default().fg(Color::DarkGray)),
-            Span::styled(Self::fmt_tokens(self.dash.completion_tokens), Style::default().fg(Color::Gray)),
-            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
-        ]));
-        v.push(Line::from(vec![
-            Span::styled(format!(" {:<9}", "total"), Style::default().fg(Color::DarkGray)),
-            Span::styled(Self::fmt_tokens(self.dash.tot_tokens), Style::default().fg(Color::LightCyan)),
-            Span::styled(" tok", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {:<9}", "total"), Style::default().fg(theme.dim)),
+            Span::styled(Self::fmt_tokens(self.dash.tot_tokens), Style::default().fg(theme.accent2)),
+            Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
 
         v.push(Line::from(Span::raw(String::new())));
-        v.push(row("requests", self.dash.requests.to_string(), Color::Gray));
-        v.push(row("messages", self.dash.messages.to_string(), Color::Gray));
+        v.push(row("requests", self.dash.requests.to_string(), theme.gray));
+        v.push(row("messages", self.dash.messages.to_string(), theme.gray));
         if self.dash.plan_total > 0 {
             v.push(row(
                 "plan",
                 format!("{}/{} done", self.dash.plan_done, self.dash.plan_total),
                 if self.dash.plan_done == self.dash.plan_total {
-                    Color::LightGreen
+                    theme.success
                 } else {
-                    Color::Gray
+                    theme.gray
                 },
             ));
         }
-        v.push(row("cwd", self.dash.cwd.clone(), Color::DarkGray));
+        v.push(row("cwd", self.dash.cwd.clone(), theme.dim));
         let secs = self.session_started.elapsed().as_secs();
-        v.push(row("elapsed", Self::fmt_elapsed(secs), Color::DarkGray));
+        v.push(row("elapsed", Self::fmt_elapsed(secs), theme.dim));
         v.push(Line::from(Span::raw(String::new())));
-        v.push(Line::from(Span::styled(
-            " esc interrupt · tab mode",
-            Style::default().fg(Color::Rgb(55, 55, 75)),
-        )));
+        let mut hints: Vec<Span<'static>> = vec![Span::raw(" ")];
+        for (i, (key, label)) in [("esc", "interrupt"), ("tab", "mode")].iter().enumerate() {
+            if i > 0 {
+                hints.push(Span::styled("  ", Style::default()));
+            }
+            hints.push(Span::styled(
+                (*key).to_string(),
+                Style::default().fg(theme.hint_key).add_modifier(Modifier::BOLD),
+            ));
+            hints.push(Span::styled(format!(" {label}"), Style::default().fg(theme.hint_text)));
+        }
+        v.push(Line::from(hints));
         v
     }
 
@@ -1657,28 +1898,40 @@ const DASH_WIDTH: u16 = 40;
             width,
             height,
         };
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            "Allow this action?",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))];
+        let theme = crate::theme::get();
+        let mut lines: Vec<Line> = vec![Line::from(vec![
+            Span::styled("⚠ ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Allow this action?",
+                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            ),
+        ])];
         for l in wrapped {
-            lines.push(Line::from(Span::styled(l, Style::default().fg(Color::Gray))));
+            lines.push(Line::from(Span::styled(l, Style::default().fg(theme.gray))));
         }
         lines.push(Line::from(String::new()));
-        lines.push(Line::from(vec![
-            Span::styled("y", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::raw(" yes   "),
-            Span::styled("a", Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
-            Span::raw(" always (full-auto)   "),
-            Span::styled("n", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
-            Span::raw(" no   "),
-            Span::styled("esc", Style::default().fg(Color::Gray)),
-            Span::raw(" cancel"),
-        ]));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(" approval ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        let mut keys: Vec<Span> = Vec::new();
+        for (i, (key, label)) in [("y", "yes"), ("a", "always"), ("n", "no"), ("esc", "cancel")]
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                keys.push(Span::styled("   ", Style::default()));
+            }
+            keys.extend(key_hint(key, label));
+        }
+        lines.push(Line::from(keys));
+        let block = panel(
+            Some(Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(theme.warning)),
+                Span::styled(
+                    "approval",
+                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ])),
+            Some(theme.warning),
+        );
         f.render_widget(Clear, rect);
         f.render_widget(
             Paragraph::new(lines)
@@ -1686,6 +1939,26 @@ const DASH_WIDTH: u16 = 40;
                 .wrap(Wrap { trim: false }),
             rect,
         );
+        // Make the key-cap buttons tappable: their layout is deterministic
+        // (leading space, " key label", 3-col separators) so we can mirror
+        // the x offsets instead of pixel-locating rendered spans.
+        let mut x = rect.x + 1;
+        let inner_w = rect.width.saturating_sub(2);
+        for (key, label) in [("y", "yes"), ("a", "always"), ("n", "no"), ("esc", "cancel")] {
+            let w = (key.chars().count() + label.chars().count() + 3) as u16;
+            if x + w > rect.x + 1 + inner_w {
+                break;
+            }
+            let c = match key {
+                "y" => Tap::Approval('y'),
+                "a" => Tap::Approval('a'),
+                "n" => Tap::Approval('n'),
+                _ => Tap::Approval('\x1b'), // esc
+            };
+            self.tap_targets
+                .push((Rect::new(x, rect.y + rect.height - 2, w, 1), c));
+            x += w + 3; // trailing separator
+        }
     }
 
     /// Centered modal input dialog: hint line + live input field with caret.
@@ -1699,9 +1972,10 @@ const DASH_WIDTH: u16 = 40;
             width,
             height,
         };
+        let theme = crate::theme::get();
         let mut lines: Vec<Line> = Vec::new();
         for l in &hint_lines {
-            lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))));
+            lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(theme.gray))));
         }
         lines.push(Line::from(String::new()));
         // The field itself: a filled row so it reads as an input box.
@@ -1712,23 +1986,29 @@ const DASH_WIDTH: u16 = 40;
         }
         let pad = field_w.saturating_sub(shown.chars().count());
         lines.push(Line::from(vec![
-            Span::styled(format!(" {shown}"), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" ".repeat(pad), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {shown}"), Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD)),
+            Span::styled(" ".repeat(pad), Style::default().fg(theme.surface)),
         ]));
         lines.push(Line::from(String::new()));
-        lines.push(Line::from(vec![
-            Span::styled("enter", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::raw(" confirm   "),
-            Span::styled("esc", Style::default().fg(Color::Gray)),
-            Span::raw(" cancel"),
-        ]));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(crate::theme::get().accent))
-            .title(Span::styled(
-                format!(" {} ", m.title),
-                Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
-            ));
+        let mut keys: Vec<Span> = Vec::new();
+        for (i, (key, label)) in [("enter", "confirm"), ("esc", "cancel")].iter().enumerate() {
+            if i > 0 {
+                keys.push(Span::styled("   ", Style::default()));
+            }
+            keys.extend(key_hint(key, label));
+        }
+        lines.push(Line::from(keys));
+        let block = panel(
+            Some(Line::from(vec![
+                Span::styled("✎ ", Style::default().fg(theme.accent)),
+                Span::styled(
+                    m.title.clone(),
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ])),
+            Some(theme.accent),
+        );
         f.render_widget(Clear, rect);
         f.render_widget(
             Paragraph::new(lines)
@@ -1736,47 +2016,71 @@ const DASH_WIDTH: u16 = 40;
                 .wrap(Wrap { trim: false }),
             rect,
         );
+        // Tappable confirm/cancel key-caps, laid out identically to the
+        // rendered spans (" enter confirm   esc cancel").
+        let mut x = rect.x + 1;
+        let inner_w = rect.width.saturating_sub(2);
+        for (w, tap) in [
+            (("enter", "confirm"), Tap::InputConfirm),
+            (("esc", "cancel"), Tap::InputCancel),
+        ] {
+            let w = (w.0.chars().count() + w.1.chars().count() + 3) as u16;
+            if x + w > rect.x + 1 + inner_w {
+                break;
+            }
+            self.tap_targets
+                .push((Rect::new(x, rect.y + rect.height - 2, w, 1), tap));
+            x += w + 3;
+        }
     }
 
     /// Ctrl+O overlay: recent tool activity expanded in full, scrollable.
     fn draw_overlay(&mut self, f: &mut Frame, area: Rect) {
+        let theme = crate::theme::get();
         f.render_widget(Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " tool output — esc/ctrl+o to close ",
-                Style::default().fg(Color::Cyan),
-            ))
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner_w = area.width.saturating_sub(2);
+        // Any tap inside the overlay dismisses it (same as Esc).
+        self.tap_targets.push((area, Tap::OverlayClose));
+        let block = panel(
+            Some(Line::from(vec![
+                Span::styled("⚙ ", Style::default().fg(theme.accent2)),
+                Span::styled(
+                    "tool output",
+                    Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  esc/ctrl+o close ", Style::default().fg(theme.dim)),
+            ])),
+            Some(theme.accent2),
+        );
+        let inner = block.inner(area);
+        let inner_w = inner.width.max(20);
         // Collect the last tool entries, newest last.
         let mut lines: Vec<Line> = Vec::new();
         for e in &self.entries {
             match e {
                 Entry::ToolCall { name, summary } => {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("● {name}"), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!(" {summary}"), Style::default().fg(Color::Gray)),
+                        Span::styled("● ", Style::default().fg(theme.accent2)),
+                        Span::styled(name.to_string(), Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {summary}"), Style::default().fg(theme.gray)),
                     ]));
                 }
                 Entry::ToolResult { name, ok, preview } => {
-                    let color = if *ok { Color::LightGreen } else { Color::LightRed };
+                    let color = if *ok { theme.success } else { theme.error };
                     lines.push(Line::from(Span::styled(
-                        format!("{} {}", if *ok { "✔" } else { "✘" }, name),
+                        format!("{} {name}", if *ok { "✔" } else { "✘" }),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     )));
-                    for l in wrap_text(preview, inner_w.max(20) as usize) {
+                    for l in wrap_text(preview, inner_w as usize) {
                         lines.push(Line::from(Span::styled(
                             format!("  {l}"),
-                            Style::default().fg(Color::Gray),
+                            Style::default().fg(theme.gray),
                         )));
                     }
                     lines.push(Line::from(Span::raw(String::new())));
                 }
                 Entry::ToolDiff { .. } => {
                     // Full colored rendering reuses the transcript pipeline.
-                    let w = area.width.saturating_sub(2).max(20);
-                    lines.extend(Self::entry_lines(e, w));
+                    lines.extend(Self::entry_lines(e, inner_w));
                     lines.push(Line::from(Span::raw(String::new())));
                 }
                 _ => {}
@@ -1785,16 +2089,28 @@ const DASH_WIDTH: u16 = 40;
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no tool output yet",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )));
         }
         let total_lines = lines.len();
-        let visible = area.height.saturating_sub(2) as usize;
+        let visible = inner.height as usize;
         let max_scroll = total_lines.saturating_sub(visible);
         let skip = self.overlay_scroll.min(max_scroll);
         let start = total_lines.saturating_sub(visible + skip);
         let shown = &lines[start..start + visible.min(total_lines - start)];
         f.render_widget(Paragraph::new(shown.to_vec()).block(block), area);
+        // Scrollbar hint on the right edge of the panel.
+        if max_scroll > 0 {
+            let mut sb = ScrollbarState::new(max_scroll).position(skip);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(theme.border))
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                inner,
+                &mut sb,
+            );
+        }
     }
 
     /// Floating suggestion list above the composer while typing a command.
@@ -1803,7 +2119,7 @@ const DASH_WIDTH: u16 = 40;
         if matches.is_empty() {
             return;
         }
-        const MAX_VISIBLE: usize = 6;
+        const MAX_VISIBLE: usize = POPUP_MAX_VISIBLE;
         let visible = matches.len().min(MAX_VISIBLE);
         let height = visible as u16 + 2; // borders
         let width = area.width.clamp(28, 52);
@@ -1812,33 +2128,47 @@ const DASH_WIDTH: u16 = 40;
             return; // not enough room above the composer
         }
         let rect = Rect { x: area.x, y, width, height };
+        // Remember the geometry so a tap on a row can complete it.
+        self.last_slash_popup = Some(rect);
+        // Popups float over the transcript: their tap region is registered
+        // last (topmost) so it always wins over chrome underneath it.
+        self.tap_targets.push((rect, Tap::SlashPopup));
 
         let entries = self.slash_entries();
         let sel = self.slash_sel.min(matches.len() - 1);
         // Keep the highlighted row inside a sliding window.
         let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
+        let theme = crate::theme::get();
+        let sel_style = selection_style();
         let items: Vec<ListItem> = matches[start..start + visible]
             .iter()
             .map(|&i| {
                 let entry = &entries[i];
                 let (cmd, desc) = (&entry.cmd, &entry.desc);
                 let selected = i == matches[sel];
-                let style = if selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).fg(Color::White)
-                } else {
-                    Style::default()
-                };
-                let name_color = if entry.custom.is_some() { Color::LightGreen } else { Color::Cyan };
+                let name_color = if entry.custom.is_some() { theme.success } else { theme.accent2 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<14}", cmd), style.fg(if selected { Color::White } else { name_color }).add_modifier(Modifier::BOLD)),
-                    Span::styled(desc.to_string(), if selected { style } else { Style::default().fg(Color::DarkGray) }),
+                    Span::styled(" ", if selected { sel_style } else { Style::default() }),
+                    Span::styled(
+                        format!("{:<14}", cmd),
+                        if selected {
+                            sel_style
+                        } else {
+                            Style::default().fg(name_color).add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::styled(
+                        desc.to_string(),
+                        if selected { sel_style } else { Style::default().fg(theme.dim) },
+                    ),
                 ]))
             })
             .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+        let block = panel(
+            Some(Line::from(Span::styled(" commands ", Style::default().fg(theme.dim)))),
+            Some(theme.border),
+        );
         f.render_widget(Clear, rect);
         f.render_widget(List::new(items).block(block), rect);
     }
@@ -1849,46 +2179,67 @@ const DASH_WIDTH: u16 = 40;
         if matches.is_empty() || self.pending_approval.is_some() {
             return;
         }
-        const MAX_VISIBLE: usize = 6;
+        const MAX_VISIBLE: usize = POPUP_MAX_VISIBLE;
         let visible = matches.len().min(MAX_VISIBLE);
         let height = visible as u16 + 2;
         let width = area.width.clamp(30, 56);
         // Stack above the slash popup when both would collide.
-        let slash_h = if self.slash_popup_active() { 8 } else { 0 };
+        let slash_h = if self.slash_popup_active() {
+            POPUP_MAX_VISIBLE as u16 + 2
+        } else {
+            0
+        };
         let y = composer.y.saturating_sub(height + slash_h);
         if y < area.y {
             return;
         }
         let rect = Rect { x: area.x, y, width, height };
+        // Remember the geometry so a tap on a row can complete it.
+        self.last_at_popup = Some(rect);
+        // Registered last (topmost) for the same reason as the slash popup.
+        self.tap_targets.push((rect, Tap::AtPopup));
         let sel = self.at_sel.min(matches.len() - 1);
         let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
+        let theme = crate::theme::get();
+        let sel_style = selection_style();
         let items: Vec<ListItem> = matches[start..start + visible]
             .iter()
             .map(|&i| {
                 let selected = i == matches[sel];
                 let path = &self.files[i];
                 let style = if selected {
-                    Style::default().bg(Color::Rgb(50, 70, 60)).fg(Color::White)
+                    sel_style
                 } else {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(theme.success)
                 };
-                ListItem::new(Line::from(Span::styled(format!("@{path}"), style)))
+                ListItem::new(Line::from(vec![
+                    Span::styled(" ", if selected { sel_style } else { Style::default() }),
+                    Span::styled(format!("@{path}"), style),
+                ]))
             })
             .collect();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" files ", Style::default().fg(Color::Green)))
-            .border_style(Style::default().fg(Color::Green));
+        let block = panel(
+            Some(Line::from(Span::styled(" files ", Style::default().fg(theme.success)))),
+            Some(theme.success),
+        );
         f.render_widget(Clear, rect);
         f.render_widget(List::new(items).block(block), rect);
     }
 
     fn draw_picker(&mut self, f: &mut Frame, area: Rect, p: &mut Picker) {
         self.last_picker = Some(area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(format!(" {} ", p.title), Style::default().fg(Color::Cyan)))
-            .border_style(Style::default().fg(Color::Cyan));
+        let theme = crate::theme::get();
+        let block = panel(
+            Some(Line::from(vec![
+                Span::styled("◇ ", Style::default().fg(theme.accent)),
+                Span::styled(
+                    p.title.clone(),
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ])),
+            Some(theme.accent),
+        );
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height == 0 || inner.width == 0 {
@@ -1904,7 +2255,7 @@ const DASH_WIDTH: u16 = 40;
 
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("› ", Style::default().fg(theme.accent)),
                 Span::raw(p.filter.clone()),
             ])),
             rows[0],
@@ -1914,29 +2265,52 @@ const DASH_WIDTH: u16 = 40;
         let max = rows[1].height as usize;
         let sel_pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
         let start = sel_pos.saturating_sub(max / 2);
+        let sel_style = selection_style();
         let items: Vec<ListItem> = idxs
             .iter()
             .skip(start)
             .take(max)
             .map(|i| {
                 let style = if *i == p.selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).fg(Color::White)
+                    sel_style
                 } else {
-                    Style::default()
+                    Style::default().fg(theme.text)
                 };
-                ListItem::new(Line::from(Span::styled(p.items[*i].clone(), style)))
+                ListItem::new(Line::from(vec![
+                    Span::styled(" ", if *i == p.selected { sel_style } else { Style::default() }),
+                    Span::styled(p.items[*i].clone(), style),
+                ]))
             })
             .collect();
         f.render_widget(List::new(items), rows[1]);
+        // Scrollbar when the list overflows the viewport.
+        if idxs.len() > max && max > 1 {
+            let mut sb = ScrollbarState::new(idxs.len().saturating_sub(max)).position(start);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(Style::default().fg(theme.border))
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                rows[1],
+                &mut sb,
+            );
+        }
 
         let count = idxs.len();
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("{count} items · ↑/↓ move · enter select · esc cancel"),
-                Style::default().fg(Color::DarkGray),
-            ))),
-            rows[2],
-        );
+        let mut hints: Vec<Span> = vec![Span::styled(
+            format!(" {count} items  "),
+            Style::default().fg(theme.dim),
+        )];
+        for (i, (key, label)) in [("↑↓", "move"), ("enter", "select"), ("esc", "cancel")]
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                hints.push(Span::styled("  ", Style::default()));
+            }
+            hints.extend(key_hint(key, label));
+        }
+        f.render_widget(Paragraph::new(Line::from(hints)), rows[2]);
     }
 
     /// Handle one terminal event. Returns the action the host should take.
@@ -2142,24 +2516,7 @@ const DASH_WIDTH: u16 = 40;
                 }
                 Action::None
             }
-            KeyCode::Esc => {
-                // Close an open @-token first, then release scroll, then
-                // clear the input — and always signal interrupt.
-                self.history_pos = None;
-                if self.at_token_present() {
-                    if let Some(i) = self.input.rfind('@') {
-                        self.input.truncate(i);
-                        self.cursor_home();
-                        self.at_sel = 0;
-                    }
-                } else if self.scroll > 0 {
-                    self.scroll = 0;
-                } else {
-                    self.input.clear();
-                    self.cursor_home();
-                }
-                Action::Interrupt
-            }
+            KeyCode::Esc => self.esc_pressed(),
             // Scrolling lives on PageUp/PageDown only — the arrow keys are
             // fully reserved for prompt-history recall.
             KeyCode::Up => {
@@ -2200,12 +2557,38 @@ const DASH_WIDTH: u16 = 40;
             _ => {}
         }
 
-        // Only act on the completion of a tap (button release) so a simple
-        // tap on a row both selects and confirms it.
-        if me.kind != MouseEventKind::Up(MouseButton::Left) {
-            return None;
+        // Finger-drag scrolling: track the row under the pressed button and
+        // scroll by the vertical delta while it stays down. Termux reports a
+        // finger drag as Down + Moved, so watch for both.
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Moved => {
+                if let Some(prev_row) = self.last_mouse_row.replace(me.row) {
+                    let delta = me.row as isize - prev_row as isize;
+                    if delta > 0 {
+                        self.page_down(delta as usize);
+                    } else if delta < 0 {
+                        self.page_up((-delta) as usize);
+                    }
+                }
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Drag ends; the tap below may still trigger an action.
+                self.last_mouse_row = None;
+            }
+            MouseEventKind::Up(_) => {
+                self.last_mouse_row = None;
+                return None;
+            }
+            _ => {}
         }
         let pos = Position::new(me.column, me.row);
+
+        // Tap targets registered by the last frame (topmost wins). Floating
+        // popups register last, so their rows beat any chrome they cover.
+        if let Some(action) = self.tap_hit(pos) {
+            return Some(action);
+        }
 
         // Tapping inside an open picker selects + confirms that row.
         if self.picker.is_some() {
@@ -2225,6 +2608,152 @@ const DASH_WIDTH: u16 = 40;
         }
 
         None
+    }
+
+    /// Hit-test the tap map registered by the most recent frame, topmost
+    /// first (later registrations draw over earlier ones). Returns the
+    /// `Action` the tap should trigger, or `None` when nothing matches.
+    fn tap_hit(&mut self, pos: Position) -> Option<Action> {
+        // Find topmost hit without a second mutable borrow while matching.
+        let hit = self
+            .tap_targets
+            .iter()
+            .rev()
+            .find(|(r, _)| r.contains(pos))
+            .map(|(_, t)| t.clone());
+        match hit? {
+            // Mode pill in the composer title, slim header or footer —
+            // same as pressing Tab.
+            Tap::ModeChip => Some(Action::CycleMode),
+            // The banner band or footer brand — same as Ctrl+B.
+            Tap::Banner | Tap::FooterBrand => {
+                self.toggle_banner();
+                Some(Action::None)
+            }
+            // "↑ N lines · esc release" — jump back to the live tail.
+            Tap::ScrollHint => {
+                self.scroll = 0;
+                Some(Action::None)
+            }
+            // Overlay (Ctrl+O) — tapping anywhere dismisses it.
+            Tap::OverlayClose => {
+                self.overlay = false;
+                Some(Action::None)
+            }
+            // Hint chips stand in for their keys on touch screens.
+            Tap::HintChip(i) => self.hint_chip_action(i),
+            Tap::Approval(c) => match c {
+                'y' => Some(Action::Approve(true)),
+                'a' => Some(Action::ApproveAlways),
+                'n' => Some(Action::Approve(false)),
+                // esc — same as the modal's Esc handling: deny and close.
+                _ => Some(Action::Approve(false)),
+            },
+            // Confirm the input modal with its current value.
+            Tap::InputConfirm => {
+                let value = self.input_modal.as_ref().map(|m| m.value.clone())?;
+                self.input_modal = None;
+                Some(Action::InputSubmit(value))
+            }
+            // Cancel the input modal without submitting.
+            Tap::InputCancel => {
+                self.input_modal = None;
+                Some(Action::None)
+            }
+            // Floating suggestion popups: row taps complete the entry; the
+            // tap is consumed (border included) without falling through.
+            Tap::SlashPopup | Tap::AtPopup => self.popup_tap(pos),
+        }
+    }
+
+    /// The action a key-hint chip represents: the chip strip is the
+    /// touch-screen stand-in for the keyboard shortcuts it names.
+    fn hint_chip_action(&mut self, chip: usize) -> Option<Action> {
+        let chips = Self::hint_chips(u16::MAX);
+        let key = chips.get(chip).map(|(k, _)| k.to_string())?;
+        match key.as_str() {
+            "enter" => {
+                // Submit only when there is something to send.
+                if self.input.trim().is_empty() {
+                    None
+                } else {
+                    let input = self.input.trim().to_string();
+                    self.input.clear();
+                    self.cursor_home();
+                    self.record_history(&input);
+                    Some(Action::Submit(input))
+                }
+            }
+            "esc" => Some(self.esc_pressed()),
+            "tab" => Some(Action::CycleMode),
+            "ctrl+b" => {
+                self.toggle_banner();
+                Some(Action::None)
+            }
+            "ctrl+o" => {
+                self.overlay = true;
+                Some(Action::None)
+            }
+            "ctrl+c" => Some(Action::Quit),
+            // ↑↓ history and ←→ editing don't map to a single tap: they
+            // fall back to the composer so the caret still moves.
+            _ => None,
+        }
+    }
+
+    /// Map a tap on a floating slash/@ suggestion popup to a completion. The
+    /// popups render a 1-cell border plus one row per visible match, with the
+    /// list windowed around the current selection — mirror that math here.
+    /// Returns `Some(Action::None)` when the tap landed on the popup (so it is
+    /// consumed without falling through to the composer caret).
+    fn popup_tap(&mut self, pos: Position) -> Option<Action> {
+        if let Some(rect) = self.last_slash_popup {
+            if rect.contains(pos) {
+                let matches = self.slash_matches();
+                if !matches.is_empty() {
+                    let visible = matches.len().min(POPUP_MAX_VISIBLE);
+                    let sel = self.slash_sel.min(matches.len() - 1);
+                    let start =
+                        sel.saturating_sub(visible / 2).min(matches.len() - visible);
+                    if let Some(off) = Self::popup_row_offset(pos, rect, visible) {
+                        self.slash_sel = start + off;
+                        self.complete_slash();
+                    }
+                }
+                return Some(Action::None);
+            }
+        }
+        if let Some(rect) = self.last_at_popup {
+            if rect.contains(pos) {
+                let matches = self.at_matches_list();
+                if !matches.is_empty() {
+                    let visible = matches.len().min(POPUP_MAX_VISIBLE);
+                    let sel = self.at_sel.min(matches.len() - 1);
+                    let start =
+                        sel.saturating_sub(visible / 2).min(matches.len() - visible);
+                    if let Some(off) = Self::popup_row_offset(pos, rect, visible) {
+                        self.at_sel = start + off;
+                        self.complete_at();
+                    }
+                }
+                return Some(Action::None);
+            }
+        }
+        None
+    }
+
+    /// Translate a tap position into a 0-based row index within a popup, or
+    /// `None` when the tap hit the border rather than an item row.
+    fn popup_row_offset(pos: Position, rect: Rect, visible: usize) -> Option<usize> {
+        if pos.y <= rect.y || pos.y >= rect.y + rect.height.saturating_sub(1) {
+            return None; // top or bottom border
+        }
+        let row = (pos.y - rect.y - 1) as usize;
+        if row < visible {
+            Some(row)
+        } else {
+            None
+        }
     }
 
     /// Tap-to-choose for the open picker: the tapped row (0-based item index)
@@ -2761,6 +3290,209 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_tap_completes_tapped_command() {
+        let mut t = Tui::new();
+        t.input = "/".into();
+        // Popup of 6 visible rows: border, rows 1..6, bottom border.
+        let rect = Rect::new(0, 10, 40, 8);
+        t.last_slash_popup = Some(rect);
+        // Frames register the popup as the topmost tap target.
+        t.tap_targets.push((rect, Tap::SlashPopup));
+        // Tap the second visible row (y = rect.y + 2).
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, rect.y + 2));
+        assert!(matches!(action, Some(Action::None)));
+        // The command on that row replaced the composer input.
+        assert_eq!(t.input, format!("{} ", t.input.trim_end()));
+        assert!(!t.slash_popup_active(), "completion closes the popup");
+        assert!(t.input.starts_with('/'));
+    }
+
+    #[test]
+    fn slash_popup_tap_on_border_is_consumed_but_keeps_popup() {
+        let mut t = Tui::new();
+        t.input = "/mo".into();
+        let rect = Rect::new(0, 10, 40, 8);
+        t.last_slash_popup = Some(rect);
+        t.tap_targets.push((rect, Tap::SlashPopup));
+        // Tap the top border row — must not fall through to the composer.
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, rect.y));
+        assert!(matches!(action, Some(Action::None)));
+        assert_eq!(t.input, "/mo", "input unchanged on a border tap");
+        assert!(t.slash_popup_active());
+    }
+
+    #[test]
+    fn slash_popup_tap_outside_leaves_composer_intact() {
+        let mut t = Tui::new();
+        t.input = "/mo".into();
+        t.cursor = 3;
+        t.last_slash_popup = Some(Rect::new(0, 10, 40, 8));
+        // Tap well below the popup (composer area) — no popup, no completion.
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 40));
+        assert!(action.is_none());
+        assert_eq!(t.input, "/mo");
+    }
+
+    #[test]
+    fn at_popup_tap_completes_tapped_file() {
+        let mut t = Tui::new();
+        t.set_files(vec!["src/main.rs".into(), "README.md".into()]);
+        t.input = "@".into();
+        t.cursor = 1;
+        let rect = Rect::new(0, 10, 40, 8);
+        t.last_at_popup = Some(rect);
+        t.tap_targets.push((rect, Tap::AtPopup));
+        t.tap_targets.push((rect, Tap::AtPopup));
+        // Tap the second visible row (deeper path: src/main.rs).
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, rect.y + 2));
+        assert!(matches!(action, Some(Action::None)));
+        assert_eq!(t.input, "@src/main.rs ");
+        assert!(!t.at_popup_active());
+    }
+
+    #[test]
+    fn at_popup_tap_outside_falls_through() {
+        let mut t = Tui::new();
+        t.set_files(vec!["src/main.rs".into()]);
+        t.input = "@".into();
+        t.cursor = 1;
+        let rect = Rect::new(0, 10, 40, 8);
+        t.last_at_popup = Some(rect);
+        t.tap_targets.push((rect, Tap::AtPopup));
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 40));
+        assert!(action.is_none());
+        assert_eq!(t.input, "@", "input unchanged by a tap outside the popup");
+    }
+
+    #[test]
+    fn popup_tap_beats_overlapping_chrome() {
+        // Regression: a popup floating over the transcript must consume taps
+        // on its rows even when a registered chip (here: the scroll hint)
+        // occupies the same cells. Registered last wins, so the popup
+        // completion fires instead of the scroll-to-bottom.
+        let mut t = Tui::new();
+        t.set_files(vec!["src/main.rs".into(), "README.md".into()]);
+        t.input = "@".into();
+        t.cursor = 1;
+        let rect = Rect::new(0, 10, 40, 8);
+        // The underlying chip is registered first (drawn earlier).
+        t.tap_targets.push((Rect::new(0, 10, 40, 1), Tap::ScrollHint));
+        t.last_at_popup = Some(rect);
+        t.tap_targets.push((rect, Tap::AtPopup));
+        // Tap the first visible row, which overlaps the scroll hint.
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, rect.y + 1));
+        assert!(matches!(action, Some(Action::None)));
+        assert_eq!(t.input, "@README.md ", "popup completion wins over the chip");
+        assert!(!t.at_popup_active());
+    }
+
+    #[test]
+    fn tap_targets_fire_their_actions() {
+        let mut t = Tui::new();
+        // Mode chip — same as Tab.
+        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::ModeChip));
+        assert!(
+            matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0)), Some(Action::CycleMode))
+        );
+        // Banner tap toggles it (same as Ctrl+B).
+        t.tap_targets.clear();
+        let before = t.show_banner;
+        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::Banner));
+        let _ = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
+        assert_eq!(t.show_banner, !before);
+        // Scroll hint jumps back to the live tail.
+        t.tap_targets.clear();
+        t.scroll = 7;
+        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::ScrollHint));
+        let _ = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
+        assert_eq!(t.scroll, 0);
+        // Overlay tap dismisses the overlay.
+        t.tap_targets.clear();
+        t.overlay = true;
+        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::OverlayClose));
+        let _ = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
+        assert!(!t.overlay);
+    }
+
+    #[test]
+    fn tap_hit_prefers_topmost_registration() {
+        let mut t = Tui::new();
+        // Two overlapping targets; the later (drawn on top) one must win.
+        t.tap_targets.push((Rect::new(0, 0, 10, 10), Tap::Banner));
+        t.tap_targets.push((Rect::new(2, 2, 4, 4), Tap::ModeChip));
+        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 3));
+        assert!(matches!(action, Some(Action::CycleMode)));
+    }
+
+    #[test]
+    fn hint_chip_tap_submits_and_interrupts() {
+        let mut t = Tui::new();
+        t.input = "hello".into();
+        t.cursor = 5;
+        // "enter" is chip 0 in the full chip list.
+        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::HintChip(0)));
+        match t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)) {
+            Some(Action::Submit(s)) => assert_eq!(s, "hello"),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        assert!(t.input.is_empty(), "composer cleared after submit tap");
+        // "esc" chip mirrors the real Esc: clears input + signals interrupt.
+        t.tap_targets.clear();
+        t.input = "draft".into();
+        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::HintChip(1)));
+        assert!(
+            matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)), Some(Action::Interrupt))
+        );
+        assert!(t.input.is_empty(), "esc chip clears the composer like the key");
+    }
+
+    #[test]
+    fn approval_buttons_are_tappable() {
+        let mut t = Tui::new();
+        for (x, expect) in [(0, Tap::Approval('y')), (6, Tap::Approval('a')), (13, Tap::Approval('n'))] {
+            t.tap_targets.clear();
+            t.tap_targets.push((Rect::new(x, 0, 5, 1), expect));
+            let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, 0));
+            assert!(action.is_some(), "button at {x} must fire");
+        }
+    }
+
+    #[test]
+    fn input_modal_buttons_submit_and_cancel() {
+        let mut t = Tui::new();
+        t.open_input_modal(InputModal::new("api key", "paste key", true));
+        t.input_modal.as_mut().unwrap().value = "sk-test".into();
+        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::InputConfirm));
+        match t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)) {
+            Some(Action::InputSubmit(v)) => assert_eq!(v, "sk-test"),
+            other => panic!("expected InputSubmit, got {other:?}"),
+        }
+        assert!(t.input_modal.is_none(), "confirm closes the modal");
+        // Cancel discards the value and just closes.
+        t.open_input_modal(InputModal::new("api key", "paste key", true));
+        t.input_modal.as_mut().unwrap().value = "sk-nope".into();
+        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::InputCancel));
+        assert!(matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)), Some(Action::None)));
+        assert!(t.input_modal.is_none(), "cancel closes the modal");
+    }
+
+    #[test]
+    fn drag_scrolls_transcript_and_tap_clears_it() {
+        let mut t = Tui::new();
+        // Press at row 10, drag up to row 7 → scrolls up 3 lines.
+        t.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 10));
+        t.on_mouse(mouse(MouseEventKind::Moved, 0, 7));
+        assert_eq!(t.scroll, 3);
+        // Dragging back down scrolls toward the live tail.
+        t.on_mouse(mouse(MouseEventKind::Moved, 0, 10));
+        assert_eq!(t.scroll, 0);
+        // Releasing ends the drag; a later stray Moved must not scroll.
+        t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 10));
+        t.on_mouse(mouse(MouseEventKind::Moved, 0, 4));
+        assert_eq!(t.scroll, 0, "no drag active after release");
+    }
+
+    #[test]
     fn dash_endpoint_updates_live() {
         let mut t = Tui::new();
         t.dash.set_session("abc-123", "m1", "p1", "~", 0);
@@ -2809,18 +3541,19 @@ mod tests {
     fn slash_filter_matches_prefixes_case_insensitively() {
         assert_eq!(filter_slash_commands("/").len(), SLASH_COMMANDS.len());
         assert_eq!(filter_slash_commands("").len(), SLASH_COMMANDS.len());
-        assert_eq!(filter_slash_commands("/pro"), vec![3]); // /provider
-        assert_eq!(filter_slash_commands("/appro"), vec![2]); // /approvals
-        assert_eq!(filter_slash_commands("/resum"), vec![8]); // /resume
-        assert_eq!(filter_slash_commands("/imag"), vec![10]); // /image
-        assert_eq!(filter_slash_commands("/RETRY"), vec![6]);
-        assert_eq!(filter_slash_commands("/quit"), vec![16]);
+        assert_eq!(filter_slash_commands("/pro"), vec![4]); // /provider
+        assert_eq!(filter_slash_commands("/appro"), vec![3]); // /approvals
+        assert_eq!(filter_slash_commands("/resum"), vec![9]); // /resume
+        assert_eq!(filter_slash_commands("/imag"), vec![11]); // /image
+        assert_eq!(filter_slash_commands("/RETRY"), vec![7]);
+        assert_eq!(filter_slash_commands("/reason"), vec![2]); // /reasoning
+        assert_eq!(filter_slash_commands("/quit"), vec![17]);
         // Newer commands are discoverable too.
-        assert_eq!(filter_slash_commands("/status"), vec![11]);
-        assert_eq!(filter_slash_commands("/diff"), vec![12]);
-        assert_eq!(filter_slash_commands("/review"), vec![13]);
-        assert_eq!(filter_slash_commands("/undo"), vec![14]);
-        assert_eq!(filter_slash_commands("/session"), vec![9]);
+        assert_eq!(filter_slash_commands("/status"), vec![12]);
+        assert_eq!(filter_slash_commands("/diff"), vec![13]);
+        assert_eq!(filter_slash_commands("/review"), vec![14]);
+        assert_eq!(filter_slash_commands("/undo"), vec![15]);
+        assert_eq!(filter_slash_commands("/session"), vec![10]);
         assert!(filter_slash_commands("/zzz").is_empty());
     }
 
@@ -2889,7 +3622,7 @@ mod tests {
         t.on_key(key(KeyCode::Char('l'), KeyModifiers::NONE)); // "/cl"
         assert_eq!(t.slash_sel, 0);
         // Matches for "/cl": /clear only.
-        assert_eq!(t.slash_matches(), vec![5]);
+        assert_eq!(t.slash_matches(), vec![6]);
     }
 
     #[test]
@@ -3220,5 +3953,118 @@ mod tests {
         assert!(t.entries.is_empty(), "activity must not create transcript entries");
         t.set_busy(false, "working");
         assert!(!t.is_busy());
+    }
+
+    #[test]
+    fn hint_chips_fit_width_and_prioritize_send() {
+        // The first chip is always the most important action.
+        for w in [14u16, 24, 40, 80] {
+            let chips = Tui::hint_chips(w);
+            assert_eq!(chips[0].0, "enter", "first chip must be enter-send at {w}");
+            let plain = Tui::hint_line(w);
+            assert!(
+                UnicodeWidthStr::width(plain.as_str()) <= w as usize,
+                "hint strip overflows at {w}: {plain:?}"
+            );
+        }
+        // Very narrow widths still give a usable escape hatch.
+        assert_eq!(Tui::hint_chips(10), vec![("esc", "")]);
+    }
+
+    #[test]
+    fn cwd_basename_handles_trailing_slash_and_root() {
+        let mut t = Tui::new();
+        t.dash.cwd = "/data/data/com.termux/files/home/Laudacode".into();
+        assert_eq!(t.cwd_basename(), "Laudacode");
+        t.dash.cwd = "/home/user/project/".into();
+        assert_eq!(t.cwd_basename(), "project");
+        t.dash.cwd = "/".into();
+        assert_eq!(t.cwd_basename(), "/");
+        t.dash.cwd = String::new();
+        assert_eq!(t.cwd_basename(), "");
+    }
+
+    #[test]
+    fn meter_never_exceeds_slot_count() {
+        for (pct, slots) in [(0u64, 10usize), (50, 10), (85, 14), (150, 8)] {
+            let spans = meter(pct, slots);
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            let bars = text.chars().filter(|c| *c == '█' || *c == '░').count();
+            assert_eq!(bars, slots, "meter at {pct}% must fill exactly {slots} slots");
+        }
+        // Escalates to the warning color between 60-84% and error above.
+        let warn = meter(70, 4);
+        assert_eq!(warn[1].style.fg, Some(crate::theme::get().warning));
+        let danger = meter(95, 4);
+        assert_eq!(danger[1].style.fg, Some(crate::theme::get().error));
+    }
+
+    #[test]
+    fn key_hint_has_cap_and_label() {
+        let spans = key_hint("enter", "send");
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].content.contains("enter"));
+        assert!(spans[1].content.contains("send"));
+        assert_eq!(spans[0].style.fg, Some(crate::theme::get().hint_key));
+        assert_eq!(spans[1].style.fg, Some(crate::theme::get().hint_text));
+    }
+
+    #[test]
+    fn chrome_uses_theme_palette_not_raw_colors() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut t = Tui::new();
+        t.dash.set_session("abcdef0123456", "model-x", "openrouter", "/tmp/proj", 3);
+        t.entries.push(Entry::ToolResult {
+            name: "read_file".into(),
+            ok: true,
+            preview: "src/main.rs".into(),
+        });
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Must not panic at the geometry the dashboard activates at.
+        terminal.draw(|f| t.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // The composer border must carry the active mode color, proving the
+        // chrome is themed rather than hardcoded.
+        let mode_color = Some(t.mode.color());
+        let has_mode_border = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.fg) == mode_color)
+        });
+        assert!(has_mode_border, "composer border should use the mode color");
+    }
+
+    #[test]
+    #[ignore]
+    fn visual_dump() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        type Setup = Box<dyn Fn(&mut Tui)>;
+        let scenarios: Vec<(&str, Setup)> = vec![
+            ("slash popup", Box::new(|t: &mut Tui| { t.input = "/th".into(); t.cursor = 3; })),
+            ("approval modal", Box::new(|t: &mut Tui| { t.pending_approval = Some("run_command: rm -rf target/".into()); })),
+        ];
+        for (name, setup) in scenarios {
+            let mut t = Tui::new();
+            t.dash.set_session("a1b2c3d4e5f6g", "stealth/ox-alpha", "openrouter", "/home/u/Laudacode", 4);
+            t.dash.record_usage(12_400, 3_100);
+            t.ctx_used = 42_000;
+            t.entries.push(Entry::User("tidy up the composer".into()));
+            t.entries.push(Entry::Assistant("Restyling chrome.".into()));
+            setup(&mut t);
+            let backend = TestBackend::new(74, 22);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| t.draw(f)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            println!("=== {name} ===");
+            for y in 0..buf.area.height {
+                let mut row = String::new();
+                for x in 0..buf.area.width {
+                    row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+                }
+                println!("{}", row.trim_end());
+            }
+            println!();
+        }
     }
 }

@@ -9,6 +9,10 @@ active_provider = "openrouter"
 # Default approval mode: suggest | auto-edit | full-auto (default: auto-edit)
 approval_mode = "auto-edit"
 
+# Reasoning depth for reasoning-capable models (set at runtime with
+# /reasoning — normal · low · medium · high · max). None = model default.
+# model_reasoning_effort = "high"
+
 [providers.tokenrouter]
 base_url = "https://api.tokenrouter.com/v1"
 api_key  = "tr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -24,6 +28,13 @@ base_url = "https://api.openai.com/v1"
 api_key  = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 model    = "gpt-4o-mini"
 
+# Anthropic exposes an OpenAI-compatible layer:
+# https://api.anthropic.com/v1 (use a Claude model id + Anthropic key)
+[providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key  = "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "claude-sonnet-4-5"
+
 [providers.groq]
 base_url = "https://api.groq.com/openai/v1"
 api_key  = "gsk_xxxxxxxxxxxxxxxx"
@@ -34,6 +45,42 @@ base_url = "https://api.deepseek.com/v1"
 api_key  = "sk-xxxxxxxxxxxxxxxx"
 model    = "deepseek-chat"
 
+[providers.xai]
+base_url = "https://api.x.ai/v1"
+api_key  = "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "grok-4"
+
+[providers.mistral]
+base_url = "https://api.mistral.ai/v1"
+api_key  = "xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "mistral-large-latest"
+
+[providers.cerebras]
+base_url = "https://api.cerebras.ai/v1"
+api_key  = "csk-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "llama3.3-70b"
+
+[providers.moonshot]
+base_url = "https://api.moonshot.ai/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxx"
+model    = "kimi-k2-0905-preview"
+
+# Z.AI (Zhipu GLM models)
+[providers.zai]
+base_url = "https://api.z.ai/api/paas/v4"
+api_key  = "xxxxxxxxxxxxxxxx.xxxxxxxxxxxx"
+model    = "glm-4.6"
+
+[providers.novita]
+base_url = "https://api.novita.ai/v3/openai"
+api_key  = "sk_xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "deepseek/deepseek-v3-turbo"
+
+[providers.chutes]
+base_url = "https://llm.chutes.ai/v1"
+api_key  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "deepseek/deepseek-r1"
+
 [providers.ollama]
 base_url = "http://localhost:11434/v1"
 api_key  = "ollama"
@@ -43,6 +90,23 @@ model    = "qwen2.5-coder:7b"
 base_url = "https://ollama.com/v1"
 api_key  = "ollama-xxxxxxxxxxxxxxxx"
 model    = "qwen3-coder:32b"
+
+# ── Built-in free providers (no API key, kind set to the adapter) ──────────
+# These are prefilled by /provider add under powerbrain / aitopia. Picking
+# the preset stores the correct `kind` automatically. powerbrain is also the
+# built-in default used when no provider is configured at all.
+
+[providers.aitopia]
+base_url   = "https://extensions.aitopia.ai/ai/send"
+api_key    = ""
+kind       = "aitopia"
+model      = "AITOPIA"          # gpt-4o-mini class model
+
+[providers.powerbrain]
+base_url   = "https://powerbrainai.com/app/backend/api/api.php"
+api_key    = ""
+kind       = "powerbrain"
+model      = "gpt-5"
 
 # Custom headers per provider (e.g. OpenRouter ranking headers):
 # [providers.openrouter.headers]
