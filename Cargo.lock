@@ -767,13 +767,14 @@ dependencies = [
 
 [[package]]
 name = "laudacode"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
  "crossterm",
  "dirs",
  "futures-util",
+ "libc",
  "ratatui",
  "reqwest",
  "rustyline",

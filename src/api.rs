@@ -342,8 +342,8 @@ impl ChatClient {
     /// `on_event`; the assembled turn is returned at the end.
 ///
 /// Transient failures (connection errors, 429/5xx before any body bytes)
-/// are retried with backoff. `cancel`, when provided, aborts between
-/// network reads.
+/// are retried with backoff. `cancel`, when provided, also aborts pending
+/// connections, retry sleeps and stalled reads.
 pub async fn stream_chat<F>(
         &self,
         model: &str,
@@ -356,12 +356,29 @@ pub async fn stream_chat<F>(
         F: FnMut(StreamEvent),
     {
         if is_cancelled(cancel) {
-            bail!("cancelled");
+            bail!("interrupted by user");
         }
-        match self.kind.as_str() {
-            "aitopia" => self.stream_aitopia(model, messages, on_event, cancel).await,
-            "powerbrain" => self.stream_powerbrain(model, messages, on_event, cancel).await,
-            _ => self.stream_openai(model, messages, tools, on_event, cancel).await,
+        let request = async {
+            match self.kind.as_str() {
+                "aitopia" => self.stream_aitopia(model, messages, on_event, cancel).await,
+                "powerbrain" => self.stream_powerbrain(model, messages, on_event, cancel).await,
+                _ => self.stream_openai(model, messages, tools, on_event, cancel).await,
+            }
+        };
+        let Some(flag) = cancel else { return request.await };
+        tokio::select! {
+            biased;
+            _ = async {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } => bail!("interrupted by user"),
+            result = request => {
+                if is_cancelled(cancel) {
+                    bail!("interrupted by user");
+                }
+                result
+            }
         }
     }
 

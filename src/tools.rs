@@ -13,11 +13,20 @@ const MAX_READ_BYTES: u64 = 200 * 1024;
 pub enum Action {
     ListDir { path: String },
     ReadFile { path: String, offset: Option<u64>, limit: Option<u64> },
+    ViewImage { path: String },
     WriteFile { path: String, content: String },
     EditFile { path: String, old: String, new: String },
     /// V4A patch — multi-file add/update/delete in one call.
     ApplyPatch { patch: String },
     RunCommand { command: String },
+    /// Start a long-lived managed process (dev server, watcher, REPL...).
+    StartProcess { command: String },
+    /// Poll a managed process: status + buffered output since spawn.
+    PollProcess { id: u64 },
+    /// Send stdin to a managed process (eof=true closes stdin).
+    WriteProcess { id: u64, input: String, eof: bool },
+    /// Kill + remove a managed process.
+    StopProcess { id: u64 },
     FetchUrl { url: String },
     WebSearch { query: String, max_results: usize },
     Grep { pattern: String, path: Option<String>, ignore_case: bool, context: Option<u32> },
@@ -76,6 +85,25 @@ struct PatchArgs {
 #[derive(Deserialize)]
 struct CmdArgs {
     command: String,
+}
+
+#[derive(Deserialize)]
+struct StartProcessArgs {
+    command: String,
+}
+
+#[derive(Deserialize)]
+struct ProcessIdArgs {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct WriteProcessArgs {
+    id: u64,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    eof: bool,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +174,10 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                 let a: ReadArgs = serde_json::from_value(v)?;
                 Ok(Action::ReadFile { path: a.path, offset: a.offset, limit: a.limit })
             }
+            "view_image" => {
+                let a: ReadArgs = serde_json::from_value(v)?;
+                Ok(Action::ViewImage { path: a.path })
+            }
             "write_file" => {
                 let a: WriteArgs = serde_json::from_value(v)?;
                 Ok(Action::WriteFile { path: a.path, content: a.content })
@@ -161,6 +193,29 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
             "run_command" => {
                 let a: CmdArgs = serde_json::from_value(v)?;
                 Ok(Action::RunCommand { command: a.command })
+            }
+            "start_process" => {
+                let a: StartProcessArgs = serde_json::from_value(v)?;
+                Ok(Action::StartProcess { command: a.command })
+            }
+            "poll_process" => {
+                let a: ProcessIdArgs = serde_json::from_value(v)?;
+                Ok(Action::PollProcess { id: a.id })
+            }
+            "write_process" => {
+                let a: WriteProcessArgs = serde_json::from_value(v)?;
+                anyhow::ensure!(a.eof || a.input.is_some(), "input is required unless eof=true");
+                anyhow::ensure!(!a.eof || a.input.as_deref().unwrap_or_default().is_empty(),
+                    "EOF requires empty input");
+                Ok(Action::WriteProcess {
+                    id: a.id,
+                    input: a.input.unwrap_or_default(),
+                    eof: a.eof,
+                })
+            }
+            "stop_process" => {
+                let a: ProcessIdArgs = serde_json::from_value(v)?;
+                Ok(Action::StopProcess { id: a.id })
             }
             "fetch_url" => {
                 let a: FetchArgs = serde_json::from_value(v)?;
@@ -222,6 +277,7 @@ impl Action {
         match self {
             Action::ListDir { path } => format!("list {path}"),
             Action::ReadFile { path, .. } => format!("read {path}"),
+            Action::ViewImage { path } => format!("view image {path}"),
             Action::WriteFile { path, content } => {
                 format!("write {} ({} bytes)", path, content.len())
             }
@@ -236,6 +292,16 @@ impl Action {
                 Err(_) => "apply_patch (unparseable patch)".to_string(),
             },
             Action::RunCommand { command } => format!("$ {command}"),
+            Action::StartProcess { command } => format!("start process: $ {command}"),
+            Action::PollProcess { id } => format!("poll process #{id}"),
+            Action::WriteProcess { id, input, eof } => {
+                if *eof && input.is_empty() {
+                    format!("close stdin of process #{id}")
+                } else {
+                    format!("write to process #{id}: {}", input.lines().next().unwrap_or(""))
+                }
+            }
+            Action::StopProcess { id } => format!("stop process #{id}"),
             Action::FetchUrl { url } => format!("fetch {url}"),
             Action::WebSearch { query, .. } => format!("web search: {query}"),
             Action::Grep { pattern, path, ignore_case, context } => {
@@ -266,10 +332,12 @@ impl Action {
             self,
             Action::ListDir { .. }
                 | Action::ReadFile { .. }
+                | Action::ViewImage { .. }
                 | Action::Grep { .. }
                 | Action::Glob { .. }
                 | Action::UpdatePlan { .. }
                 | Action::FetchUrl { .. }
+                | Action::PollProcess { .. }
                 | Action::WebSearch { .. }
         )
     }
@@ -278,10 +346,12 @@ impl Action {
         match self {
             Action::ListDir { .. }
             | Action::ReadFile { .. }
+            | Action::ViewImage { .. }
             | Action::FetchUrl { .. }
             | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
+            | Action::PollProcess { .. }
             | Action::UpdatePlan { .. } => Danger::Safe,
             Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
                 // Writes outside the workspace always require explicit
@@ -320,6 +390,16 @@ impl Action {
                     Danger::Moderate
                 }
             }
+            Action::StartProcess { command } => {
+                if is_dangerous_command(command) {
+                    Danger::High
+                } else {
+                    Danger::Moderate
+                }
+            }
+            // Stdin may be code to an interpreter. Require explicit approval.
+            Action::WriteProcess { .. } => Danger::High,
+            Action::StopProcess { .. } => Danger::Moderate,
         }
     }
 
@@ -328,6 +408,7 @@ impl Action {
     pub async fn perform_with_diff(
         &self,
         cwd: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(String, Vec<crate::diff::FileDiff>)> {
         match self {
             // Mutating: capture pre-image → mutate → diff.
@@ -389,15 +470,20 @@ impl Action {
             }
             // Everything else has no file mutation — reuse plain perform().
             other => {
-                let out = Self::perform_plain(other, cwd).await?;
+                let out = Self::perform_plain(other, cwd, cancel).await?;
                 Ok((out, Vec::new()))
             }
         }
     }
 
     /// The original read-only/command paths (no diff capture).
-    async fn perform_plain(&self, cwd: &Path) -> Result<String> {
+    async fn perform_plain(
+        &self,
+        cwd: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         match self {
+            Action::ViewImage { .. } => bail!("view_image requires the agent's vision-message handler"),
             Action::ListDir { path } => {
                 let root = resolve_in(cwd, path)?;
                 let tree = build_tree(&root, 0, 2);
@@ -473,7 +559,13 @@ impl Action {
             Action::WriteFile { .. } | Action::EditFile { .. } | Action::ApplyPatch { .. } => {
                 unreachable!("mutating actions are intercepted by perform_with_diff")
             }
-            Action::RunCommand { command } => run_shell(command, cwd).await,
+            Action::RunCommand { command } => {
+                run_shell_cancellable(command, cwd, cancel).await
+            }
+            Action::StartProcess { .. } | Action::PollProcess { .. }
+            | Action::WriteProcess { .. } | Action::StopProcess { .. } => {
+                bail!("process tools require an owning agent")
+            }
             Action::FetchUrl { url } => fetch_url(url).await,
             Action::WebSearch { query, max_results } => web_search(query, *max_results).await,
             Action::Grep { pattern, path, ignore_case, context } => {
@@ -742,16 +834,29 @@ pub fn contained_in_workspace_path(cwd: &Path, target: &Path) -> bool {
 }
 
 pub async fn run_shell(command: &str, cwd: &Path) -> Result<String> {
+    run_shell_cancellable(command, cwd, None).await
+}
+
+/// `run_shell` with cooperative cancellation: the `cancel` flag is polled
+/// every 200 ms while the child runs; a set flag kills the process group
+/// (sh + children) and returns an interrupted marker so the agent loop can
+/// unwind without waiting out the rest of the 180 s timeout.
+pub async fn run_shell_cancellable(
+    command: &str,
+    cwd: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String> {
     use tokio::io::AsyncReadExt;
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning shell (sh)")?;
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().context("spawning shell (sh)")?;
 
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
@@ -760,7 +865,19 @@ pub async fn run_shell(command: &str, cwd: &Path) -> Result<String> {
     let timeout = tokio::time::Duration::from_secs(180);
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
-    let res = tokio::time::timeout(timeout, async {
+    // Cancellation poller: races the normal completion path; on cancel the
+    // whole group dies (process_group above) instead of orphaning children.
+    let check = async {
+        if let Some(flag) = cancel {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let res = tokio::select! {
+        r = tokio::time::timeout(timeout, async {
     let o = async {
         if let Some(o) = stdout_pipe.as_mut() {
             let _ = o.read_to_end(&mut out_buf).await;
@@ -773,8 +890,16 @@ pub async fn run_shell(command: &str, cwd: &Path) -> Result<String> {
     };
         let ((), (), status) = tokio::join!(o, e, child.wait());
         status
-    })
-    .await;
+        }) => r,
+        _ = check => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+            }
+            let _ = child.kill().await;
+            bail!("interrupted while running command");
+        }
+    };
 
     let status = match res {
         Ok(s) => s.context("waiting for command")?,
@@ -1231,6 +1356,18 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
+                name: "view_image",
+                description: "View a local PNG, JPEG, GIF, or WebP using model vision (requires a vision-capable model). Maximum 8 MiB. Image content is attached after this tool batch, not returned as text.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Local image path, relative to the workspace or absolute"}},
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
                 name: "list_dir",
                 description: "List files and folders under a directory (recursive, depth-limited).",
                 parameters: json!({
@@ -1380,6 +1517,64 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
+                name: "start_process",
+                description: "Start a long-lived process that keeps running across tool calls (dev server, watcher, REPL). Returns its id. Poll output with poll_process. Plain pipes, not a PTY.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run (via sh -c)"}
+                    },
+                    "required": ["command"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
+                name: "poll_process",
+                description: "Get a managed process's status and latest output tails (8 KiB per stream, older output discarded). Read-only; safe to call repeatedly.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Process id from start_process"}
+                    },
+                    "required": ["id"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
+                name: "write_process",
+                description: "Send input to a managed process's stdin (newline appended). eof=true instead closes stdin — the 'done writing' signal for REPLs. Returns the process's reaction.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Process id from start_process"},
+                        "input": {"type": "string", "description": "Text to send (omit when eof=true)"},
+                        "eof": {"type": "boolean", "description": "true closes stdin instead of writing"}
+                    },
+                    "required": ["id"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
+                name: "stop_process",
+                description: "Kill a managed process (and its children) and free its id. Returns its last output.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Process id from start_process"}
+                    },
+                    "required": ["id"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
                 name: "update_plan",
                 description: "Write your task plan. Use for any multi-step work: create steps at the start, mark exactly one step in_progress while working on it, mark completed as you finish each. Replace the whole list every call.",
                 parameters: json!({
@@ -1411,7 +1606,7 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
         .filter(|t| {
             matches!(
                 t.function.name,
-                "list_dir" | "read_file" | "grep" | "glob" | "fetch_url"
+                "list_dir" | "read_file" | "view_image" | "grep" | "glob" | "fetch_url"
             )
         })
         .collect()
@@ -1481,6 +1676,30 @@ mod tests {
         assert!(!is_dangerous_command("cargo build --release"));
         assert!(!is_dangerous_command("echo $(date)")); // subshells are common and benign
         assert!(!is_dangerous_command("ls -la src/"));
+    }
+
+    #[test]
+    fn process_tools_parse_and_classify_risk() {
+        let cwd = std::env::current_dir().unwrap();
+        for command in ["cargo build", "rm -rf ~"] {
+            let args = serde_json::json!({"command": command}).to_string();
+            let start = parse_tool_action("start_process", &args).unwrap();
+            let run = parse_tool_action("run_command", &args).unwrap();
+            assert_eq!(start.danger(&cwd), run.danger(&cwd));
+            assert!(!start.is_read_only());
+        }
+        let poll = parse_tool_action("poll_process", r#"{"id":1}"#).unwrap();
+        assert_eq!(poll.danger(&cwd), Danger::Safe);
+        assert!(poll.is_read_only());
+        let write = parse_tool_action("write_process", r#"{"id":1,"input":"hello"}"#).unwrap();
+        assert_eq!(write.danger(&cwd), Danger::High);
+        assert!(matches!(parse_tool_action("write_process", r#"{"id":1,"eof":true}"#).unwrap(),
+            Action::WriteProcess { eof: true, .. }));
+        assert!(parse_tool_action("write_process", r#"{"id":1}"#).is_err());
+        assert!(parse_tool_action("write_process", r#"{"id":1,"input":"lost","eof":true}"#).is_err());
+        assert!(parse_tool_action("poll_process", r#"{"id":-1}"#).is_err());
+        assert!(matches!(parse_tool_action("stop_process", r#"{"id":1}"#).unwrap(),
+            Action::StopProcess { id: 1 }));
     }
 
     #[test]
@@ -1580,7 +1799,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
-        rt.block_on(action.perform_with_diff(cwd))
+        rt.block_on(action.perform_with_diff(cwd, None))
             .expect("perform should succeed")
             .0
     }

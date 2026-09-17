@@ -25,6 +25,7 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, perfect for Android/Termux
 - 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
 - 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `update_plan`
+- ⚙️ **Managed processes** — `start_process` / `poll_process` / `write_process` / `stop_process`: run dev servers, watchers and REPL-style programs across tool calls. Up to 16 per agent; latest 8 KiB per output stream, stdin + EOF, and process-group cleanup on stop/exit. Plain pipes (not a PTY); processes do not survive session resume. Stop finished jobs to free their slots.
 - 🌐 **Web built in** — fetch documentation **and search the web** (`web_search`, DuckDuckGo) from the agent
 - 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
 - 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
@@ -207,6 +208,7 @@ laudacode provider add|list|use|edit|remove <name>
 | `/theme`             | switch color theme (live preview)            |
 | `/effect`            | ambient effects (petals · rain · lightning…) |
 | `/status`            | provider/model/session + token & cost totals |
+| `/skills`            | searchable picker — pick a skill to stage it in the composer |
 | `/diff`              | git diff of working tree                     |
 | `/review`            | AI review of the current git diff            |
 | `/undo [N]`          | revert file changes from the last N turns    |

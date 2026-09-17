@@ -370,7 +370,7 @@ async fn run_loop(
             let result = if !approved {
                 "User DECLINED this action.".to_string()
             } else {
-                match action.perform_with_diff(cwd).await {
+                match action.perform_with_diff(cwd, None).await {
                     Ok((out, files)) => {
                         if !files.is_empty() {
                             ui.on_event(AgentEvent::ToolEdit {

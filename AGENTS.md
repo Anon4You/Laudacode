@@ -18,7 +18,7 @@ cargo build --release  # optimized binary at target/release/laudacode
 cargo clippy -- -D warnings
 ```
 
-There is no test suite yet; verify changes with a manual live run:
+Run `cargo test` for the automated suite. Network-dependent tests are ignored by default. Also verify changes with a manual live run:
 
 ```sh
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
@@ -38,7 +38,8 @@ laudacode exec "list the files in this directory"
 | `src/provider`   | *(managed through `config.rs` + `repl.rs` helpers)*                   |
 | `src/api.rs`     | OpenAI-compatible chat client, SSE streaming, tool-call accumulation, vision multipart messages |
 | `src/agent.rs`   | agent loop (LLM ↔ tools), approval modes, system prompt, /compact     |
-| `src/tools.rs`   | tool schemas + execution: list_dir, read_file, write_file, edit_file, apply_patch, run_command, fetch_url, grep, glob, update_plan |
+| `src/tools.rs`   | tool schemas + execution: list_dir, read_file, write_file, edit_file, apply_patch, run_command, fetch_url, grep, glob, update_plan, start_process, poll_process, write_process, stop_process |
+| `src/processes.rs` | `ProcessManager`: long-lived processes across tool calls (pipes, own process group via setpgid, bounded 8 KiB output, stdin + EOF, 1 s stdin timeout, max 16, monotonic ids, group-kill on stop/drop) |
 | `src/diff.rs`    | dependency-free unified-diff engine (colored edit previews everywhere) |
 | `src/agents.rs`  | specialist sub-agent registry (`delegate` tool) + concurrent sub-agent runner |
 | `src/patch.rs`   | V4A patch parser/applier (`*** Begin Patch` format)                   |

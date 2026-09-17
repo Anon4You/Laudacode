@@ -32,7 +32,7 @@ pub struct Skill {
 
 impl Skill {
     /// Frontmatter-derived name is preferred; the directory name is the
-    /// fallback (and what `/skills` invocation uses).
+    /// fallback.
     pub fn dir_name(path: &Path) -> String {
         path
             .parent()
@@ -120,6 +120,22 @@ pub fn prompt_block(skills: &[Skill]) -> String {
     s
 }
 
+/// `/skills` picker rows: `name — description`. An empty description gets a
+/// hint. The REPL handles the chosen row (stages it into the composer).
+pub fn picker_items(cwd: &Path) -> Vec<String> {
+    picker_items_for(&discover(cwd))
+}
+
+fn picker_items_for(skills: &[Skill]) -> Vec<String> {
+    skills
+        .iter()
+        .map(|s| {
+            let desc = if s.description.is_empty() { "(no description)" } else { &s.description };
+            format!("{} — {}", s.name, desc)
+        })
+        .collect()
+}
+
 /// Parse simple `key: value` frontmatter (no nesting, no quotes needed).
 fn split_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, String>, String) {
     let mut map = std::collections::BTreeMap::new();
@@ -156,6 +172,25 @@ fn first_body_line(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_rows_use_name_and_description() {
+        assert!(picker_items_for(&[]).is_empty(), "no skills → empty picker");
+        let skills = vec![Skill {
+            name: "release-notes".into(),
+            description: "Write release notes".into(),
+            path: PathBuf::from("global/skills/release-notes/SKILL.md"),
+        }, Skill {
+            name: "minimal".into(),
+            description: String::new(),
+            path: PathBuf::from("global/skills/minimal/SKILL.md"),
+        }];
+        let items = picker_items_for(&skills);
+        assert_eq!(
+            items,
+            vec!["release-notes — Write release notes", "minimal — (no description)"]
+        );
+    }
 
     fn write_skill(dir: &Path, name: &str, description: &str) {
         let d = dir.join(name);

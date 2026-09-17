@@ -376,6 +376,9 @@ pub struct Tui {
     last_tick: Instant,
     /// Session start for the dashboard elapsed timer.
     session_started: Instant,
+    /// Esc pressed once while busy — waiting for the confirming second Esc
+    /// inside [`ESC_ARM_WINDOW`]; `None` when not armed.
+    esc_armed_at: Option<Instant>,
     /// Ambient particle effect engine (rendered in the banner band).
     pub fx: crate::effects::Engine,
     /// Sent-prompt history for ↑/↓ recall (newest last).
@@ -492,6 +495,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "exit Laudacode (alias of /quit)"),
     ("/theme", "switch color theme"),
     ("/effect", "ambient effects (petals, rain, …)"),
+    ("/skills", "search & pick a skill (staged into the composer)"),
 ];
 
 /// Indices into `SLASH_COMMANDS` whose name starts with `query`
@@ -507,6 +511,8 @@ fn filter_slash_commands(query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// How long an armed Esc interrupt stays armed (double-Esc to interrupt).
+const ESC_ARM_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const TICK_MS: u64 = 100;
 /// Rows visible in the floating slash/@ suggestion popups (excluding border).
@@ -541,6 +547,7 @@ impl Tui {
             pending_session: None,
             pending_delete: None,
             session_started: Instant::now(),
+            esc_armed_at: None,
             at_sel: 0,
             overlay: false,
             overlay_scroll: 0,
@@ -651,10 +658,27 @@ impl Tui {
         self.scroll = 0;
     }
 
-    /// What the Esc key does: close an open @-token first, then release
-    /// scroll-back, then clear the input — and always signal interrupt.
+    /// What the Esc key does while the agent is busy: the first press ARMS
+    /// the interrupt (visible status hint) and the second press inside
+    /// [`ESC_ARM_WINDOW`] actually interrupts — a deliberate double-tap, so
+    /// a stray Esc can't kill a running turn. Not busy: close an open
+    /// @-token first, then release scroll-back, then clear the input.
     fn esc_pressed(&mut self) -> Action {
         self.history_pos = None;
+        if self.busy {
+            let armed = self
+                .esc_armed_at
+                .is_some_and(|t| t.elapsed() <= ESC_ARM_WINDOW);
+            if armed {
+                self.esc_armed_at = None;
+                self.clear_status();
+                return Action::Interrupt;
+            }
+            self.esc_armed_at = Some(Instant::now());
+            self.set_status("press Esc again to interrupt");
+            return Action::None;
+        }
+        self.esc_armed_at = None;
         if self.at_token_present() {
             if let Some(i) = self.input.rfind('@') {
                 self.input.truncate(i);
@@ -670,9 +694,13 @@ impl Tui {
         Action::Interrupt
     }
 
-    /// Set/clear the footer activity indicator.
+    /// Set/clear the footer activity indicator. Ending a busy period also
+    /// disarms a stale interrupt arm.
     pub fn set_busy(&mut self, busy: bool, label: impl Into<String>) {
         self.busy = busy;
+        if !busy {
+            self.esc_armed_at = None;
+        }
         if busy {
             self.busy_label = label.into();
             if self.busy_since.is_none() {
@@ -875,7 +903,7 @@ impl Tui {
         s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
     }
 
-    fn cursor_end(&mut self) {
+    pub fn cursor_end(&mut self) {
         self.cursor = self.input.chars().count();
     }
 
@@ -2315,6 +2343,14 @@ const DASH_WIDTH: u16 = 40;
 
     /// Handle one terminal event. Returns the action the host should take.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return Action::None;
+        }
+        if key.code != KeyCode::Esc {
+            self.esc_armed_at = None;
+        } else if key.kind == crossterm::event::KeyEventKind::Repeat {
+            return Action::None;
+        }
         // When input was set directly (e.g. tests), cursor may still be 0
         // while input is non-empty. Move to end in that case.
         let char_count = self.input.chars().count();
@@ -3425,6 +3461,35 @@ mod tests {
     }
 
     #[test]
+    fn busy_esc_needs_a_confirming_double_press() {
+        let mut t = Tui::new();
+        t.set_busy(true, "working");
+        // First Esc arms the interrupt instead of firing it.
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        assert!(t.is_busy(), "arming must not stop the agent");
+        // A second Esc within the window confirms: interrupt fires.
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::Interrupt));
+        assert!(t.esc_armed_at.is_none(), "armed flag must clear after the interrupt");
+        // Idle Esc keeps its old single-press semantics (clears the composer).
+        t.set_busy(false, "");
+        t.input = "draft".into();
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::Interrupt));
+        assert!(t.input.is_empty());
+        // Arming expires: a late second Esc must NOT interrupt — and the
+        // next press re-arms fresh instead of firing immediately.
+        t.set_busy(true, "working");
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        t.esc_armed_at = Some(Instant::now() - ESC_ARM_WINDOW - Duration::from_millis(1));
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        assert!(t.esc_armed_at.is_some(), "re-armed for the next confirming press");
+        t.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(t.esc_armed_at.is_none(), "other keys disarm");
+        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        t.set_busy(false, "");
+        assert!(t.esc_armed_at.is_none(), "finishing a turn disarms");
+    }
+
+    #[test]
     fn hint_chip_tap_submits_and_interrupts() {
         let mut t = Tui::new();
         t.input = "hello".into();
@@ -3554,6 +3619,9 @@ mod tests {
         assert_eq!(filter_slash_commands("/review"), vec![14]);
         assert_eq!(filter_slash_commands("/undo"), vec![15]);
         assert_eq!(filter_slash_commands("/session"), vec![10]);
+        let skills = filter_slash_commands("/ski");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(SLASH_COMMANDS[skills[0]].0, "/skills");
         assert!(filter_slash_commands("/zzz").is_empty());
     }
 
@@ -3582,6 +3650,29 @@ mod tests {
         assert_eq!(t.input, "/model ");
         // Popup closed after completion (trailing space).
         assert!(!t.slash_popup_active());
+    }
+
+    #[test]
+    fn skills_autocomplete_completes_then_submits() {
+        for completion_key in [KeyCode::Tab, KeyCode::Enter] {
+            let mut t = Tui::new();
+            t.set_custom_cmds(vec![("custom".into(), "a custom command".into())]);
+            t.input = "/ski".into();
+            let matches = t.slash_matches();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(t.slash_entries()[matches[0]].cmd, "/skills");
+            assert!(matches!(
+                t.on_key(key(completion_key, KeyModifiers::NONE)),
+                Action::None
+            ));
+            assert_eq!(t.input, "/skills ");
+            assert!(!t.slash_popup_active());
+            assert!(matches!(
+                t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::Submit(s) if s == "/skills"
+            ));
+            assert!(t.input.is_empty());
+        }
     }
 
     #[test]

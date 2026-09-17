@@ -284,6 +284,7 @@ pub enum WorkerCmd {
     ListProviders,
     ShowProvider,
     Status,
+    ListSkills,
     Diff,
     /// Run the reviewer specialist over uncommitted git changes.
     Review,
@@ -428,10 +429,11 @@ pub fn spawn_worker(app: App) -> WorkerHandle {
     let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
     let (approve_tx, approve_rx) = mpsc::channel::<bool>();
     let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
 
     std::thread::Builder::new()
         .name("laudacode-agent".into())
-        .spawn(move || worker_main(app, ev_tx, cmd_rx, approve_rx))
+        .spawn(move || worker_main(app, ev_tx, cmd_rx, approve_rx, worker_cancel))
         .expect("spawning agent worker thread");
 
     WorkerHandle { cmd: cmd_tx, approve: approve_tx, events: ev_rx, cancel }
@@ -442,6 +444,7 @@ fn worker_main(
     ev_tx: Sender<WorkerEvent>,
     cmd_rx: Receiver<WorkerCmd>,
     approve_rx: Receiver<bool>,
+    cancel: Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -453,7 +456,6 @@ fn worker_main(
             return;
         }
     };
-    let cancel = Arc::new(AtomicBool::new(false));
     let approve_rx = Arc::new(std::sync::Mutex::new(approve_rx));
     let mut last_task: Option<String> = None;
     // Images queued via /image or the -i flag — consumed by the next Submit.
@@ -680,6 +682,20 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         }
                     }
                     let _ = ev_tx.send(WorkerEvent::Busy(false));
+                }
+            }
+            WorkerCmd::ListSkills => {
+                // Same searchable picker the /session list uses.
+                let items = crate::skills::picker_items(&app.cwd);
+                if items.is_empty() {
+                    let dirs = crate::skills::skill_dirs(&app.cwd);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "no skills found — create <name>/SKILL.md in:\n  {} (project)\n  {} (global)",
+                        dirs[1].display(),
+                        dirs[0].display()
+                    )));
+                } else {
+                    let _ = ev_tx.send(WorkerEvent::Pick { title: "skills".into(), items });
                 }
             }
             WorkerCmd::Status => {
@@ -1561,6 +1577,8 @@ impl App {
                         let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
                         tui.set_status("restoring session");
                         let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
+                    } else if let Some(skill) = sel.strip_prefix("skills:") {
+                        apply_skill_selection(tui, skill);
                     } else if let Some(what) = sel.strip_prefix("session_menu:") {
                         // `/session` root menu: rename · search · list · delete.
                         match what.split(" · ").next().unwrap_or("") {
@@ -2388,7 +2406,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                    /model        pick a model                                    /status    provider · model · info\n\
                    /reasoning    thinking depth (normal·low·med·high·max)      /approvals switch approval mode (or Tab)\n\
                    /agents       list the specialist sub-agent team             /session   rename · search · list\n\
-                   /agents       list the specialist sub-agent team             /resume    restore a previous session\n\
+                   /skills       search & pick a skill to use                   /resume    restore a previous session\n\
                    /compact      summarize history to free context              /export    save transcript as markdown\n\
                    /retry        re-run the previous task                       /image     attach an image\n\
                    /clear        reset conversation                             /quit      exit Laudacode\n\
@@ -2423,6 +2441,13 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         }
         "agents" | "team" => {
             tui.push(Entry::Info(crate::agents::describe_team()));
+        }
+        "skills" => {
+            if arg.is_empty() {
+                let _ = cmd.send(WorkerCmd::ListSkills);
+            } else {
+                tui.push(Entry::Error("usage: /skills — opens a searchable skill picker".into()));
+            }
         }
         "compact" => {
             tui.set_status("compacting");
@@ -2644,6 +2669,23 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         }
     }
     true
+}
+
+/// A `/skills` picker choice: stage the skill in the composer (like an
+/// @-mention) — the user finishes the prompt; nothing is auto-submitted.
+fn apply_skill_selection(tui: &mut Tui, skill: &str) {
+    let name = skill.split(" — ").next().unwrap_or(skill).trim().to_string();
+    let phrase = format!("Use the '{name}' skill — ");
+    if tui.input.trim().is_empty() {
+        tui.input = phrase;
+    } else {
+        if !tui.input.ends_with(' ') {
+            tui.input.push(' ');
+        }
+        tui.input.push_str(&phrase);
+    }
+    tui.cursor_end();
+    tui.set_status("skill added — finish your prompt and press Enter");
 }
 
 /// Keys that are obviously placeholders — warn instead of failing opaquely.
@@ -3410,6 +3452,120 @@ mod tests {
         };
         let app = App::build_with_config(dir, cfg, args.0, args.1, args.2, args.3, None).unwrap();
         assert_eq!(app.agent.mode, ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn worker_cancel_interrupts_a_stalled_stream() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::session::test_sync::env_lock();
+        let dir = std::env::current_dir().unwrap().join("target").join(format!(
+            "interrupt-test-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("LAUDACODE_SESSIONS_DIR");
+        std::env::set_var("LAUDACODE_SESSIONS_DIR", dir.join("sessions"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                if let Ok((socket, _)) = listener.accept() { break socket; }
+                if Instant::now() >= deadline { return; }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                if n == 0 { return; }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok()).flatten()
+                    }).unwrap_or(0);
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            socket.write_all(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"stream started\"}}]}\n\n"
+            ).as_bytes()).unwrap();
+            // Hold the stream open without sending another byte.
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let app = App::build_with_config(
+            dir.clone(), Config::default(), Some("test"), Some(&url),
+            Some("test-key"), Some("test-model"), None,
+        ).unwrap();
+        let worker = spawn_worker(app);
+        worker.cmd.send(WorkerCmd::Submit("test cancellation".into())).unwrap();
+        let mut streaming = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(WorkerEvent::Ev(AgentEvent::Content(_))) =
+                worker.events.recv_timeout(Duration::from_millis(100))
+            {
+                streaming = true;
+                break;
+            }
+        }
+        worker.cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut interrupted = false;
+        let mut idle = false;
+        while Instant::now() < deadline {
+            match worker.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::Info(s)) if s == "interrupted" => interrupted = true,
+                Ok(WorkerEvent::Busy(false)) => { idle = true; break; }
+                _ => {}
+            }
+        }
+        // Unblock and shut down even when the regression is present.
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        worker.cmd.send(WorkerCmd::Quit).unwrap();
+        while worker.events.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        match previous {
+            Some(value) => std::env::set_var("LAUDACODE_SESSIONS_DIR", value),
+            None => std::env::remove_var("LAUDACODE_SESSIONS_DIR"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(streaming, "mock stream must reach the worker");
+        assert!(interrupted && idle, "UI cancellation must stop a stalled worker stream promptly");
+    }
+
+    #[test]
+    fn skill_picker_selection_stages_composer_prompt() {
+        let mut tui = Tui::new();
+        apply_skill_selection(&mut tui, "release-notes — Write release notes");
+        assert_eq!(tui.input, "Use the 'release-notes' skill — ");
+        apply_skill_selection(&mut tui, "minimal — (no description)");
+        assert_eq!(
+            tui.input,
+            "Use the 'release-notes' skill — Use the 'minimal' skill — "
+        );
+    }
+
+    #[test]
+    fn skills_command_dispatches_without_submitting_a_prompt() {
+        let mut tui = Tui::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(handle_slash(&mut tui, &tx, "/skills"));
+        assert!(matches!(rx.try_recv().unwrap(), WorkerCmd::ListSkills));
+        assert!(rx.try_recv().is_err());
+        assert!(handle_slash(&mut tui, &tx, "/skills unexpected"));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("usage: /skills")));
+        assert!(handle_slash(&mut tui, &tx, "/help"));
+        assert!(matches!(tui.entries.last(), Some(Entry::Info(s)) if s.contains("/skills")));
     }
 
     #[test]
