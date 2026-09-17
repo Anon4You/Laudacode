@@ -1,10 +1,11 @@
 # Release builds — cross-compiled binaries for Termux/Android and Linux.
 #
-# Triggers:
-#   - pushing a tag like v0.7.0  → builds all targets, creates the GitHub
+# Trigger:
+#   - pushing a tag like v0.7.0 → builds all targets, creates the GitHub
 #     Release and uploads `laudacode-<tag>-<target>.tar.gz` + SHA256SUMS
-#   - workflow_dispatch (manual, e.g. from a branch) → builds artifacts only,
-#     no release — used to validate changes before tagging
+#
+# The workflow cannot be run manually (no workflow_dispatch) and every job
+# is guarded so it only runs for pushes made by the repository owner.
 #
 # Termux note: android-* targets link against Bionic at API 24 (Android 7,
 # Termux's minimum) using the NDK toolchain preinstalled on GitHub runners.
@@ -14,7 +15,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,6 +26,7 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    if: github.actor == github.repository_owner
     strategy:
       fail-fast: false
       matrix:
@@ -88,11 +89,18 @@ jobs:
             echo "AR_${UPPER}=${BIN}/llvm-ar"
           } >> "$GITHUB_ENV"
 
+      # pip3 install on ubuntu-24.04 (ubuntu-latest) is blocked by PEP 668
+      # (externally-managed environment), so install zig via the upstream setup
+      # action instead of the PyPI `ziglang` wrapper.
+      - name: Install zig (musl targets)
+        if: matrix.tool == 'zigbuild'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
       - name: Install cargo-zigbuild (musl targets)
         if: matrix.tool == 'zigbuild'
-        run: |
-          pip3 install ziglang
-          cargo install --locked cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
 
       - name: Build
         run: |
@@ -112,7 +120,9 @@ jobs:
           mkdir -p stage
           cp "$BIN" stage/laudacode
           tar -C stage -czf "$NAME.tar.gz" laudacode
-          sha256sum "$NAME.tar.gz" | tee sha256sums.partial
+          # per-target name so the files don't collide when the release job
+          # merges artifacts with download-artifact --merge-multiple
+          sha256sum "$NAME.tar.gz" | tee "sha256sums.${{ matrix.target }}"
           echo "ARTIFACT=$NAME.tar.gz" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
@@ -120,12 +130,12 @@ jobs:
           name: ${{ matrix.target }}
           path: |
             *.tar.gz
-            sha256sums.partial
+            sha256sums.*
           if-no-files-found: error
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.actor == github.repository_owner && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

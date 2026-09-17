@@ -73,7 +73,13 @@ detect_target() {
             *)                    return 1 ;;
         esac
     else
-        # Static musl binaries run on any Linux (glibc/musl/alpine).
+        # Static musl binaries run on Linux only; macOS/BSD report back a
+        # miss so the installer falls through to the source build (no macOS
+        # prebuilt assets are published by the release workflow).
+        case "$(uname -s)" in
+            Linux) : ;;
+            *)     return 1 ;;
+        esac
         case "$arch" in
             x86_64)  echo "x86_64-unknown-linux-musl";  return 0 ;;
             aarch64) echo "aarch64-unknown-linux-musl"; return 0 ;;
