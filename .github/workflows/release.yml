@@ -104,7 +104,7 @@ jobs:
 
       - name: Install cargo-zigbuild (musl targets)
         if: matrix.tool == 'zigbuild'
-        run: cargo install --locked cargo-zigbuild
+        run: command -v cargo-zigbuild >/dev/null 2>&1 || cargo install --locked cargo-zigbuild
 
       - name: Build
         run: |
