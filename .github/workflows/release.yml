@@ -81,12 +81,16 @@ jobs:
             i686-linux-android)      triple=i686-linux-android ;;
             *) echo "unknown android target"; exit 1 ;;
           esac
+          # cc-rs reads CC_/CXX_/AR_ with the LOWERCASE target triple
+          # (dashes -> underscores, e.g. CC_i686_linux_android), while cargo's
+          # linker override is UPPERCASE (CARGO_TARGET_I686_LINUX_ANDROID_LINKER).
           UPPER="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          LOWER="$(echo '${{ matrix.target }}' | tr '-' '_')"
           {
             echo "CARGO_TARGET_${UPPER}_LINKER=${BIN}/${triple}24-clang"
-            echo "CC_${UPPER}=${BIN}/${triple}24-clang"
-            echo "CXX_${UPPER}=${BIN}/${triple}24-clang++"
-            echo "AR_${UPPER}=${BIN}/llvm-ar"
+            echo "CC_${LOWER}=${BIN}/${triple}24-clang"
+            echo "CXX_${LOWER}=${BIN}/${triple}24-clang++"
+            echo "AR_${LOWER}=${BIN}/llvm-ar"
           } >> "$GITHUB_ENV"
 
       # pip3 install on ubuntu-24.04 (ubuntu-latest) is blocked by PEP 668
