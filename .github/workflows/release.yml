@@ -40,10 +40,15 @@ jobs:
             tool: ndk
           - target: i686-linux-android
             tool: ndk
-          # Static Linux
+          # Static Linux (musl: runs on any distro/arch, preferred)
           - target: x86_64-unknown-linux-musl
             tool: zigbuild
           - target: aarch64-unknown-linux-musl
+            tool: zigbuild
+          # Dynamic Linux/glibc builds ("normal" GNU-linked binaries)
+          - target: x86_64-unknown-linux-gnu
+            tool: zigbuild
+          - target: aarch64-unknown-linux-gnu
             tool: zigbuild
 
     steps:
