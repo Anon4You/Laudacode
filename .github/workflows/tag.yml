@@ -1,0 +1,53 @@
+# Tag push on version bump — when Cargo.toml [package] version changes on
+# main, create and push the matching v<version> tag. The release workflow
+# (tag trigger) then builds and publishes.
+#
+# Requires the `RELEASE_PAT` repo secret: a personal access token with
+# Contents read+write on this repo. A tag pushed with the default
+# GITHUB_TOKEN does *not* trigger other workflows, so a PAT is what makes
+# release.yml fire. Create one at
+# https://github.com/settings/tokens (fine-grained, this repo only) and add
+# it under Settings → Secrets → Actions as RELEASE_PAT.
+
+name: tag
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["Cargo.toml"]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: github.actor == github.repository_owner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Push version tag
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::secrets.RELEASE_PAT is not set — add a PAT (Contents: read+write) as repo secret RELEASE_PAT"
+            exit 1
+          fi
+          VERSION="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | grep '^version' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$VERSION" ] || { echo "could not parse version from Cargo.toml"; exit 1; }
+          TAG="v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG already exists; nothing to do"
+            exit 0
+          fi
+          git tag "$TAG"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$TAG"
+          echo "pushed $TAG — release workflow will fire"
