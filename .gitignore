@@ -9,3 +9,4 @@ Cargo.lock.orig
 config.toml
 config.json
 *.log
+plan.md

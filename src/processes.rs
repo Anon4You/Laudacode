@@ -240,6 +240,19 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
+    /// One-line summary for `/status`: `none` or `#id: cmd; ...`.
+    pub fn summary(&self) -> String {
+        if self.processes.is_empty() {
+            return "none".to_string();
+        }
+        let mut ids: Vec<u64> = self.processes.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| format!("#{id}: {}", self.processes[id].command))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Start a managed process; returns its id (monotonic, 1-based).
     pub async fn start(&mut self, command: &str, cwd: &Path) -> Result<u64> {
         static NEXT_PID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -364,6 +377,12 @@ mod tests {
         let buf = OutBuf::default();
         buf.push(&[b'x'; 10_000]);
         assert_eq!(buf.snapshot().len(), OUT_LIMIT);
+    }
+
+    #[test]
+    fn summary_lists_running_processes() {
+        let pm = ProcessManager::default();
+        assert_eq!(pm.summary(), "none");
     }
 
     #[cfg(unix)]

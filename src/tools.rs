@@ -10,15 +10,14 @@ const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 const MAX_READ_BYTES: u64 = 200 * 1024;
 /// Inspection subcommands. Nothing here writes to the repository, the index,
 /// the working tree or any remote, so these are allowed even in Plan mode.
-const GIT_READ: &[&str] = &["status", "log", "diff", "show", "blame"];
+const GIT_READ: &[&str] = &["status", "log", "diff", "show", "blame", "worktree"];
 
 /// Repo-mutating subcommands, local only. Deliberately no `push`, no `fetch`,
 /// no `reset`, no remote or PR operations — those stay behind `run_command`,
 /// which is permission-gated and runs the dangerous-command detector.
 ///
-/// No `worktree` either: it needs an add/list/remove lifecycle that only makes
-/// sense alongside the multi-session work in a later phase, and a half-built
-/// version would strand worktrees the user cannot see from the TUI.
+/// `worktree` is read-only (`list`): add/remove stays behind `run_command`
+/// until the multi-session work lands, so no stranded worktrees.
 const GIT_WRITE: &[&str] = &["add", "commit", "branch", "checkout", "stash"];
 
 /// Writes that discard or relocate work in ways the approval prompt cannot
@@ -188,6 +187,10 @@ pub fn git_command_line(
                 s.push(' ');
                 s.push_str(r);
             }
+        }
+        // Read-only list; add/remove stays behind `run_command`.
+        "worktree" => {
+            s.push_str(" list");
         }
         _ => {
             if let Some(r) = rev {
@@ -1517,6 +1520,11 @@ async fn run_git(
             }
             cmd.arg("--").arg(p);
         }
+        // Read-only list; extra operands are ignored so add/remove cannot
+        // slip through the git tool.
+        "worktree" => {
+            cmd.args(["list", "--porcelain"]);
+        }
         // ---- writes ----
         // No pathspec stages the whole tree. `-A` so deletions are staged too:
         // a bare `git add` silently skips them and the model reports a commit
@@ -2621,6 +2629,7 @@ mod tests {
             (r#"{"subcommand":"stash"}"#, "git stash"),
             (r#"{"subcommand":"stash","rev":"pop"}"#, "git stash pop"),
             (r#"{"subcommand":"log","rev":"HEAD~2"}"#, "git log HEAD~2"),
+            (r#"{"subcommand":"worktree"}"#, "git worktree list"),
         ] {
             let a = parse_tool_action("git", args).unwrap();
             let Action::Git {
@@ -3038,6 +3047,19 @@ mod tests {
         let dir = git_fixture("nomsg");
         let err = block_on(run_git(&dir, "commit", None, None, None, None)).unwrap_err();
         assert!(format!("{err:#}").contains("message"), "got: {err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_worktree_list_is_read_only_and_runs() {
+        let dir = git_fixture("worktree");
+        let a = parse_tool_action("git", r#"{"subcommand":"worktree"}"#).unwrap();
+        assert!(a.is_read_only());
+        assert_eq!(a.danger(Path::new(".")), Danger::Safe);
+        assert_eq!(a.describe(), "git worktree list");
+        let out = git_out(&dir, "worktree", None, None, None);
+        assert!(out.contains("worktree"), "{out}");
+        assert!(out.contains(dir.to_string_lossy().as_ref()), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -252,6 +252,11 @@ impl Agent {
         )
     }
 
+    /// Managed background processes for `/status` (count + commands).
+    pub fn processes_summary(&self) -> String {
+        self.processes.summary()
+    }
+
     /// Add a sub-agent's spend to the session totals.
     ///
     /// Deliberately does *not* touch `last_usage`: that drives the per-request
