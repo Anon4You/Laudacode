@@ -2,12 +2,12 @@
 # main, create and push the matching v<version> tag. The release workflow
 # (tag trigger) then builds and publishes.
 #
-# Requires the `RELEASE_PAT` repo secret: a personal access token with
-# Contents read+write on this repo. A tag pushed with the default
-# GITHUB_TOKEN does *not* trigger other workflows, so a PAT is what makes
-# release.yml fire. Create one at
-# https://github.com/settings/tokens (fine-grained, this repo only) and add
-# it under Settings → Secrets → Actions as RELEASE_PAT.
+# Requires the `RELEASE_PAT` repo secret: a *classic* personal access token
+# with the `repo` scope. A tag pushed with the default GITHUB_TOKEN — or with
+# a fine-grained PAT — does *not* trigger other workflows, so only a classic
+# PAT makes release.yml fire. Create one at
+# https://github.com/settings/tokens (classic, tick `repo`) and add it under
+# Settings → Secrets → Actions as RELEASE_PAT.
 
 name: tag
 
@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   tag:
@@ -30,24 +31,50 @@ jobs:
           fetch-tags: true
 
       - name: Push version tag
+        id: push
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
           REPO: ${{ github.repository }}
         run: |
           set -eu
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::secrets.RELEASE_PAT is not set — add a PAT (Contents: read+write) as repo secret RELEASE_PAT"
+            echo "::error::secrets.RELEASE_PAT is not set — add a classic PAT (repo scope) as repo secret RELEASE_PAT"
             exit 1
           fi
           VERSION="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml | grep '^version' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
           [ -n "$VERSION" ] || { echo "could not parse version from Cargo.toml"; exit 1; }
           TAG="v$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "tag $TAG already exists; nothing to do"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git tag "$TAG"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$TAG"
-          echo "pushed $TAG — release workflow will fire"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "pushed $TAG — release workflow should fire"
+
+      # A wrong token type fails silently (green job, no release), so wait
+      # for the release run and fail loudly if it never appears.
+      - name: Confirm release triggered
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.push.outputs.tag }}
+        run: |
+          set -eu
+          echo "waiting for release workflow on $TAG..."
+          for i in $(seq 1 15); do
+            COUNT="$(gh api "repos/${REPO}/actions/runs?event=push&per_page=30" --jq "[.workflow_runs[] | select(.head_branch == \"${TAG}\" and .path == \".github/workflows/release.yml\")] | length")"
+            if [ "$COUNT" != "0" ]; then
+              echo "release run found"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::pushed $TAG but no release run appeared within 5 minutes — RELEASE_PAT must be a classic PAT (repo scope)"
+          exit 1
