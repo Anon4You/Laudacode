@@ -2,14 +2,14 @@
 
 # Laudacode
 
-**A fast, lightweight AI coding agent for your terminal.**
+**A fast, lightweight AI coding agent for your terminal.**<br/>
 Pure Rust, no Node.js, tiny binary, built for Termux.
 
 <img src="./img/laudacode.jpg" alt="Laudacode" width="100%"/>
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green)]()
+[![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green)](#install)
 
 </div>
 
@@ -22,17 +22,17 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 
 ## Features
 
-- ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, for Android/Termux
+- ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small, nearly static binary, built for Android/Termux
 - 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
 - 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `git`, `update_plan`
 - 🔎 **Regex search** — `grep` is literal by default, pass `"regex": true` for a pattern; honors `ignore_case`, `context`, and has a compiled-size cap
 - 📊 **Local git** — one `git` tool, fixed local allowlist, direct argv, no shell. Read: `status`, `log`, `diff`, `show`, `blame`. Write: `add`, `commit`, `branch`, `checkout`, `stash`. No `push`/`fetch`/`reset` — use `run_command` for those, so the dangerous-command detector still sees them
 - 🧩 **MCP tool servers** — `[mcp_servers.<name>]` spawns any stdio MCP server and exposes its tools as `mcp__<server>__<tool>`; paged listings, per-request timeouts, name-collision rejection, and `/mcp` for status. Third-party tools ask for consent in BUILD/PLAN unless FULL AUTO
-- ⚡ **Parallel tool calls** — independent reads (`read_file`, `grep`, `glob`, `fetch_url`, `web_search`, git reads) in one assistant turn run concurrently; results stay in call order, and every write still runs sequentially behind its approval
+- 🚀 **Parallel tool calls** — independent reads (`read_file`, `grep`, `glob`, `fetch_url`, `web_search`, git reads) in one assistant turn run concurrently; results stay in call order, and every write still runs sequentially behind its approval
 - 🪝 **Post-edit hooks** — `[hooks] post_edit` runs formatters/linters/tests after every file mutation; exit status and output go back to the model
 - 💸 **Token & cost guardrails** — `[limits] max_tokens` / `max_cost_usd`; `/status` shows what's left. Cost is priced per model (input and output separately) from a built-in table, overridable with `[pricing]`; sub-agent spend counts too
 - 🧾 **Structured logs** — optional JSONL trail of tool calls, usage, hook results, budget blocks; never prompts or file contents
-- 🌐 **Proxy & custom CAs** — `[network] proxy` (http/https/socks5), `ca_bundle`, explicit `insecure`
+- 🛰️ **Proxy & custom CAs** — `[network] proxy` (http/https/socks5), `ca_bundle`, explicit `insecure`
 - 🚦 **Patient about flaky networks** — up to 5 retries by default on dropped connections and 408/409/429/5xx, jittered exponential backoff honoring `Retry-After`. Waits show in the status line, `Esc` cancels instantly, tune with `[limits] max_retries`
 - ⚙️ **Managed processes** — `start_process` / `poll_process` / `write_process` / `stop_process` for dev servers, watchers, REPLs; 16 per agent, 8 KiB per stream, process-group cleanup
 - 🌐 **Web built in** — `fetch_url` plus `web_search` (DuckDuckGo)
@@ -47,9 +47,9 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - ✨ **Ambient effects** — petals, rain, snow, matrix rain, lightning, stars, fireflies, bubbles, embers, confetti, comets, aurora (`/effect`, banner only)
 - 🌈 **Syntax highlighting** — code blocks and diffs, per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
 - ⌨️ **Prompt history** — ↑/↓ recall with draft restore, persisted
-- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`…, plus `@file`, `#note` and `!<cmd>`
+- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry` and more, plus `@file`, `#note` and `!<cmd>`
 - ↩️ **Multi-turn undo** — `/undo N` reverts the last N agent turns
-- 🔎 **Session cost tracking** — cumulative tokens and estimated USD in `/status`
+- 💰 **Session cost tracking** — cumulative tokens and estimated USD in `/status`
 - 📱 **Adaptive mobile UI** — banner art collapses to a one-line header on small screens
 - 👆 **Touch-native** — swipe to scroll, tap picker rows, tap the composer to move the caret
 - 🛠️ **Live activity feedback** — footer shows `reasoning` / `streaming` / `running <tool>` plus elapsed time
@@ -134,11 +134,11 @@ laudacode exec "add input validation to src/main.rs" --mode full-auto
 
 Precedence: **CLI flags > profile (`--profile`) > environment variables > config file**.
 
-| Variable         | Meaning                    |
-|------------------|----------------------------|
-| `OPENAI_API_KEY` | API key                    |
-| `OPENAI_BASE_URL`| e.g. `https://api.groq.com/openai/v1` |
-| `OPENAI_MODEL`   | model name                 |
+| Variable          | Meaning                               |
+|-------------------|---------------------------------------|
+| `OPENAI_API_KEY`  | API key                               |
+| `OPENAI_BASE_URL` | e.g. `https://api.groq.com/openai/v1` |
+| `OPENAI_MODEL`    | model name                            |
 
 Config file at `~/.config/laudacode/config.toml`
 (or `.json`; override location with `LAUDACODE_CONFIG`):
@@ -189,7 +189,7 @@ file-mutating tools trigger them.
 
 Provider presets (OpenAI, OpenRouter, Groq, DeepSeek, Cerebras, Mistral, xAI,
 Fireworks, SambaNova, DeepInfra, NVIDIA, Upstage, MiniMax, Hugging Face, Ollama,
-LM Studio) and annotated versions of every block above:
+LM Studio) and annotated versions of every block above live in
 [`config.example.toml`](config.example.toml).
 
 ### External tool servers (MCP)
@@ -275,7 +275,7 @@ If the budget runs out mid-analysis the result says it is still analysing
 rather than reporting a clean file.
 
 After any edit the server's diagnostics for the touched file are appended to
-the tool result, which is a real front end instead of an LLM round trip on
+the tool result — a real compiler front end instead of an LLM round trip on
 `cargo check`. Only extensions a server claims are checked.
 
 The `lsp` tool exposes the same server to the model on demand for
@@ -298,13 +298,13 @@ does not shift a column.
 
 Default is **BUILD** (`auto-edit`).
 
-| `--mode` value          | TUI label  | File edits | Shell commands | Dangerous commands |
-|--------------------------|------------|------------|----------------|--------------------|
-| `suggest` (alias `ask`)  | PLAN       | ask        | ask            | ask                |
-| `auto-edit` *(default)*  | BUILD      | ✅ auto    | ask            | ask                |
-| `full-auto` (alias `yolo`)| FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
+| `--mode` value             | TUI label | File edits | Shell commands | Dangerous commands |
+|----------------------------|-----------|------------|----------------|--------------------|
+| `suggest` (alias `ask`)    | PLAN      | ask        | ask            | ask                |
+| `auto-edit` *(default)*    | BUILD     | ✅ auto    | ask            | ask                |
+| `full-auto` (alias `yolo`) | FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
 
-Answer `[a]always` on any prompt to auto-approve the rest of the session. In the
+Answer `[a]lways` on any prompt to auto-approve the rest of the session. In the
 TUI, switch modes any time with `/approvals` or **Tab**.
 
 ## CLI reference
@@ -349,6 +349,18 @@ banner is suppressed automatically under `--json`.
 | `/checkpoints`       | list this session's checkpoints                |
 | `/branch <n\|id>`    | fork a new session from a checkpoint           |
 | `/skills`            | searchable picker — pick a skill to stage it in the composer |
+| `/lsp`               | language servers · running, failed, or disabled |
+| `/diff`              | git diff of working tree                     |
+| `/review`            | AI review of the current git diff            |
+| `/undo [N]`          | revert file changes from the last N turns    |
+| `/init`              | generate AGENTS.md for this project          |
+| `/compact`           | summarize history to free context window     |
+| `/clear`             | fresh conversation                           |
+| `/retry`             | re-run the previous task                     |
+| `/resume`            | restore a previous session by id             |
+| `/image <path>`      | attach an image to your next message         |
+| `/export`            | save transcript as markdown                  |
+| `/quit`              | exit                                         |
 
 A skill is a directory with a `SKILL.md`. The frontmatter is optional; `name`
 defaults to the directory name and `description` falls back to the first body
@@ -363,17 +375,7 @@ description: >            # `|` keeps the line breaks, `>` folds them to spaces
 ---
 Full instructions. Only name + description reach the model; it reads this file
 with `read_file` when the skill is relevant.
-| `/diff`              | git diff of working tree                     |
-| `/review`            | AI review of the current git diff            |
-| `/undo [N]`          | revert file changes from the last N turns    |
-| `/init`              | generate AGENTS.md for this project          |
-| `/compact`           | summarize history to free context window     |
-| `/clear`             | fresh conversation                           |
-| `/retry`             | re-run the previous task                     |
-| `/resume`            | restore a previous session by id             |
-| `/image <path>`      | attach an image to your next message         |
-| `/export`            | save transcript as markdown                  |
-| `/quit`              | exit                                         |
+```
 
 Input prefixes:
 
