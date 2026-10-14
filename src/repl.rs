@@ -1047,8 +1047,9 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 } else {
                     transport.join(" · ")
                 };
+                let processes = a.processes_summary();
                 let lines = format!(
-                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages · {} checkpoint(s)\nusage    : {}\ntotal    : {}\nbudget   : {}\nretries  : {}\ncontext  : {} tok window (compact at {})\npost-edit: {}\nlogging  : {}\nnetwork  : {}\ncwd      : {}\nconfig   : {}",
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages · {} checkpoint(s)\nusage    : {}\ntotal    : {}\nbudget   : {}\nretries  : {}\ncontext  : {} tok window (compact at {})\nprocesses: {}\npost-edit: {}\nlogging  : {}\nnetwork  : {}\ncwd      : {}\nconfig   : {}",
                     app.active.name,
                     app.active.base_url,
                     a.model,
@@ -1064,6 +1065,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     retries,
                     a.ctx_window,
                     budget::compact_threshold(a.ctx_window),
+                    processes,
                     hooks,
                     logging,
                     network,
