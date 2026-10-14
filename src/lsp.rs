@@ -1559,8 +1559,14 @@ mod tests {
         let mut lsp = Lsp::from_specs(&dir, specs).unwrap();
         rt(async {
             let failed = lsp.start_all().await;
-            assert_eq!(failed.len(), 1, "{failed:?}");
-            assert!(failed[0].contains("gone"), "{failed:?}");
+            if have("clangd") {
+                assert_eq!(failed.len(), 1, "{failed:?}");
+                assert!(failed[0].contains("gone"), "{failed:?}");
+            } else {
+                // No clangd on this machine (e.g. CI): both fail to spawn.
+                assert_eq!(failed.len(), 2, "{failed:?}");
+                assert!(failed.iter().any(|f| f.contains("gone")), "{failed:?}");
+            }
             if have("clangd") {
                 // Looked up by name: BTreeMap ordering means index 1 is `gone`.
                 let c = lsp
