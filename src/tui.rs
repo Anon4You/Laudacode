@@ -1717,6 +1717,13 @@ impl Tui {
                         Style::default().fg(crate::theme::get().gray),
                     )));
                 }
+                let hidden = preview.lines().count().saturating_sub(4);
+                if hidden > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  … +{hidden} lines (ctrl+o for full output)"),
+                        Style::default().fg(crate::theme::get().gray),
+                    )));
+                }
                 lines
             }
             Entry::ToolDiff { name, files } => {
@@ -1928,8 +1935,10 @@ impl Tui {
 
     /// Height of the compact summary bar shown when the side dashboard can't
     /// fit (narrow window) but there's still room for a single info line.
+    /// The content truncates itself to the width, so portrait phones down to
+    /// 40 columns still get model/provider/token status.
     pub fn compact_summary_h(total_w: u16, total_h: u16, no_dashboard: bool) -> u16 {
-        if no_dashboard && total_w >= 48 && total_h >= 14 {
+        if no_dashboard && total_w >= 40 && total_h >= 14 {
             1
         } else {
             0
@@ -2352,10 +2361,20 @@ impl Tui {
         }
         if let Some((msg, at)) = &self.status {
             let secs = at.elapsed().as_secs();
-            spans.push(Span::styled(
-                format!("  ·  {msg} ({secs}s)"),
-                Style::default().fg(crate::theme::get().dim),
-            ));
+            // cols[0] clips silently mid-word — trim the message itself to
+            // the remaining width so spinner and text end cleanly instead.
+            // Too narrow for even that: drop the status, the spinner matters.
+            let used: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(&*s.content))
+                .sum();
+            let avail = (cols[0].width as usize).saturating_sub(used);
+            if avail > 4 {
+                spans.push(Span::styled(
+                    Self::truncate_to(format!("  ·  {msg} ({secs}s)"), avail),
+                    Style::default().fg(crate::theme::get().dim),
+                ));
+            }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
 
@@ -2599,8 +2618,14 @@ impl Tui {
         Self::truncate_to(FULL.to_string(), inner_w)
     }
 
-    fn truncate_to(s: String, w: usize) -> String {
-        if UnicodeWidthStr::width(s.as_str()) <= w {
+    /// Modal dialog width: never wider than the screen (a fixed minimum
+    /// clips buttons off portrait phones), never narrower than 20 columns.
+    /// Holds for screens >= 22 wide; below that the terminal is unusable.
+    fn modal_width(area_w: u16) -> u16 {
+        area_w.saturating_sub(2).clamp(20, 64)
+    }
+
+    fn truncate_to(s: String, w: usize) -> String {        if UnicodeWidthStr::width(s.as_str()) <= w {
             return s;
         }
         let mut out = String::new();
@@ -2642,7 +2667,9 @@ impl Tui {
 
     /// Centered approval dialog: detail + y/a/n options.
     fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
-        let width = area.width.clamp(40, 64);
+        // Never wider than the screen: a fixed 40-col minimum clips the
+        // y/a/n buttons off portrait phones.
+        let width = Self::modal_width(area.width);
         let wrapped = wrap_text(detail, width.saturating_sub(4) as usize);
         let height = (wrapped.len() as u16 + 5).min(area.height.saturating_sub(2));
         let rect = Rect {
@@ -2735,7 +2762,8 @@ impl Tui {
 
     /// Centered modal input dialog: hint line + live input field with caret.
     fn draw_input_modal(&mut self, f: &mut Frame, area: Rect, m: &mut InputModal) {
-        let width = 64.min(area.width.saturating_sub(4)).max(30);
+        // Same no-overflow rule as the approval modal below-40-col screens.
+        let width = Self::modal_width(area.width);
         let hint_lines = wrap_text(&m.hint, width.saturating_sub(4) as usize);
         let height = (hint_lines.len() as u16 + 6).min(area.height.saturating_sub(2));
         let rect = Rect {
@@ -3121,7 +3149,7 @@ impl Tui {
         // The label wins ties but never eats the whole row — a provider with
         // a very long name must still show where it points.
         let label_cap = (text_avail / 2).max(8);
-        let items: Vec<ListItem> = idxs
+        let mut items: Vec<ListItem> = idxs
             .iter()
             .skip(start)
             .take(max)
@@ -3170,6 +3198,14 @@ impl Tui {
                 ListItem::new(Line::from(spans))
             })
             .collect();
+        // An empty filter match renders as a blank list, which reads as a
+        // stall while typing on a phone keyboard — say so explicitly.
+        if items.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "   no matches — keep typing, esc cancels",
+                Style::default().fg(theme.dim),
+            ))));
+        }
         f.render_widget(List::new(items), rows[1]);
         // Scrollbar when the list overflows the viewport.
         if idxs.len() > max && max > 1 {
@@ -4171,8 +4207,44 @@ mod tests {
         // With a dashboard present, never double up.
         assert_eq!(Tui::compact_summary_h(100, 50, false), 0);
         // Too narrow / too short → no bar.
-        assert_eq!(Tui::compact_summary_h(40, 30, true), 0);
+        assert_eq!(Tui::compact_summary_h(40, 30, true), 1);
+        assert_eq!(Tui::compact_summary_h(36, 30, true), 0);
         assert_eq!(Tui::compact_summary_h(80, 12, true), 0);
+    }
+
+    #[test]
+    fn modals_never_exceed_screen_width() {
+        for w in [22u16, 30, 39, 40, 64, 100, 200] {
+            let m = Tui::modal_width(w);
+            assert!(m <= w, "modal {m} wider than screen {w}");
+            assert!((20..=64).contains(&m), "modal width {m} out of range");
+        }
+    }
+
+    #[test]
+    fn tool_result_names_hidden_lines() {
+        let long = Entry::ToolResult {
+            name: "run".into(),
+            ok: true,
+            preview: "1\n2\n3\n4\n5\n6".into(),
+        };
+        let lines = Tui::entry_lines(&long, 80);
+        assert_eq!(lines.len(), 1 + 4 + 1, "header + 4 rows + hint");
+        let hint: String = lines
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| &*s.content)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(hint.contains("+2 lines"), "{hint:?}");
+        let short = Entry::ToolResult {
+            name: "run".into(),
+            ok: true,
+            preview: "a\nb".into(),
+        };
+        assert_eq!(Tui::entry_lines(&short, 80).len(), 1 + 2, "no hint when nothing hidden");
     }
 
     #[test]
