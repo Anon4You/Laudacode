@@ -126,6 +126,23 @@ pub async fn fetch_latest_tag(client: &reqwest::Client) -> Result<String> {
 
 /// Download `url` to `dest`, refusing absurd sizes before they eat RAM.
 pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+    download_to_with_progress(client, url, dest, |_, _| {}).await
+}
+
+/// 0–100, or `None` when the total is unknown (chunked encoding).
+pub fn pct(done: u64, total: Option<u64>) -> Option<u8> {
+    let t = total.filter(|&t| t > 0)?;
+    Some(((done.min(t) as f64 / t as f64) * 100.0) as u8)
+}
+
+/// Same as [`download_to`], reporting `(bytes_done, content_length)` per
+/// chunk so the caller can show progress.
+pub async fn download_to_with_progress(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<()> {
     let resp = client
         .get(url)
         .send()
@@ -135,14 +152,25 @@ pub async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Re
         bail!("not found: {url}");
     }
     let resp = resp.error_for_status().with_context(|| format!("downloading {url}"))?;
-    if resp.content_length().is_some_and(|n| n > MAX_ASSET_BYTES) {
+    let total = resp.content_length();
+    if total.is_some_and(|n| n > MAX_ASSET_BYTES) {
         bail!("asset exceeds {MAX_ASSET_BYTES} bytes — refusing");
     }
-    let bytes = resp.bytes().await.context("reading download")?;
-    if bytes.len() as u64 > MAX_ASSET_BYTES {
-        bail!("asset exceeds {MAX_ASSET_BYTES} bytes — refusing");
+    // Streamed (not one-shot) so progress can report per chunk.
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    let mut done = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading download")?;
+        done += chunk.len() as u64;
+        if done > MAX_ASSET_BYTES {
+            bail!("asset exceeds {MAX_ASSET_BYTES} bytes — refusing");
+        }
+        body.extend_from_slice(&chunk);
+        progress(done, total);
     }
-    std::fs::write(dest, &bytes)
+    std::fs::write(dest, &body)
         .with_context(|| format!("writing {}", dest.display()))?;
     Ok(())
 }
@@ -314,6 +342,16 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"precious download");
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(&dl).ok();
+    }
+
+    #[test]
+    fn pct_clamps_and_handles_unknown_totals() {
+        assert_eq!(pct(0, Some(100)), Some(0));
+        assert_eq!(pct(50, Some(100)), Some(50));
+        assert_eq!(pct(100, Some(100)), Some(100));
+        assert_eq!(pct(999, Some(100)), Some(100));
+        assert_eq!(pct(10, None), None);
+        assert_eq!(pct(10, Some(0)), None);
     }
 
     #[test]

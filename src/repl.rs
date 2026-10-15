@@ -631,14 +631,25 @@ fn run_update_check(
         );
         let dest = stage.join(&asset);
         info(format!("downloading {asset}..."));
-        if rt
-            .block_on(crate::update::download_to(
-                &client,
-                &format!("{base}/{asset}"),
-                &dest,
-            ))
-            .is_err()
-        {
+        // Progress via status-line notices (transient, no transcript spam),
+        // every 20% so slow mobile downloads don't look stuck.
+        let mut last_pct = 0u8;
+        let dl = rt.block_on(crate::update::download_to_with_progress(
+            &client,
+            &format!("{base}/{asset}"),
+            &dest,
+            |done, total| {
+                if let Some(p) = crate::update::pct(done, total) {
+                    if p >= last_pct.saturating_add(20) {
+                        last_pct = p;
+                        let _ = ev_tx.send(WorkerEvent::Ev(AgentEvent::Notice(
+                            format!("downloading {asset}… {p}%"),
+                        )));
+                    }
+                }
+            },
+        ));
+        if dl.is_err() {
             continue; // probably no asset for this target — try the next
         }
         // SHA256SUMS is mandatory, like install.sh: unverified stays out.
@@ -2338,6 +2349,13 @@ impl App {
                         let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
                     } else if let Some(skill) = sel.strip_prefix("skills:") {
                         apply_skill_selection(tui, skill);
+                    } else if let Some(row) = sel.strip_prefix("help:") {
+                        // Stage the command in the composer (args still
+                        // editable) instead of running it blind.
+                        let cmd = row.split(" · ").next().unwrap_or(row).trim();
+                        tui.input = format!("{cmd} ");
+                        tui.cursor_end();
+                        tui.set_status(format!("{cmd} staged — add args, Enter to run"));
                     } else if let Some(agent) = sel.strip_prefix("agents:") {
                         apply_agent_selection(tui, agent);
                     } else if let Some(row) = sel.strip_prefix("checkpoints:") {
@@ -3263,35 +3281,18 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
     let arg: Vec<&str> = parts.collect();
     match name.as_str() {
         "help" => {
+            // Searchable picker, not a wall of text: picking a command
+            // stages it in the composer (custom commands included).
             tui.push(Entry::Info(
-                "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
-                 SESSION\n\
-                   /model        pick a model                                    /status    provider · model · info\n\
-                   /reasoning    thinking depth (auto-detected: normal·low·med·high[·max])      /approvals switch approval mode (or Tab)\n\
-                   /agents       pick a specialist agent (or /agents <name>)      /session   rename · search · list\n\
-                   /skills       search & pick a skill to use                   /resume    restore a previous session\n\
-                   /compact      summarize history to free context              /export    save transcript as markdown\n\
-                    /retry        re-run the previous task                       /image     attach an image\n\
-                    /clear        reset conversation                             /quit      exit Laudacode\n\
-                    /usage        tokens & cost this session                    /archive   park a session aside\n\
-                 FILES & DIFF\n\
-                   /diff         show uncommitted git changes\n\
-                   /review       specialist review of uncommitted changes\n\
-                   /undo [N]     revert file changes from the last N turns\n\
-                    /init         analyze the project and write AGENTS.md\n\
-                    /update       check for a new release and install it\n\
-                    /doctor       environment diagnostics (no network, no tokens)\n\
-                  PROVIDER\n\
-                   /provider     menu: add · use · edit · list\n\
-                 INPUT & KEYS\n\
-                   @file         attach a file (contents inlined)\n\
-                   #note         save a memory into AGENTS.md\n\
-                   !<command>    run a shell command locally (no agent)\n\
-                   /your-cmd     custom commands from .laudacode/commands/*.md\n\
-                   ctrl+o        expand recent tool output      esc   interrupt / release scroll\n\
-                   enter send · tab mode · ↑↓ history · ctrl+c quit"
+                "@file attach a file · #note save a memory · !<cmd> run shell · ctrl+o tool output · esc interrupt"
                     .into(),
             ));
+            let items = tui
+                .slash_entries()
+                .iter()
+                .map(|e| format!("{} · {}", e.cmd, e.desc))
+                .collect::<Vec<_>>();
+            tui.open_picker("help", items);
         }
         "approvals" | "mode" => {
             // Static picker opened directly on the UI thread; selection
@@ -5185,7 +5186,13 @@ mod tests {
             matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("usage: /skills"))
         );
         assert!(handle_slash(&mut tui, &tx, "/help"));
-        assert!(matches!(tui.entries.last(), Some(Entry::Info(s)) if s.contains("/skills")));
+        // Help is a picker now (plus the one-line input-sugar hint), and it
+        // lists every advertised command for staging.
+        assert!(matches!(tui.entries.last(), Some(Entry::Info(s)) if s.contains("@file")));
+        let (title, rows) = tui.picker_view().expect("help opens a picker");
+        assert_eq!(title, "help");
+        assert!(rows.iter().any(|r| r.label == "/skills"), "help must list /skills");
+        assert!(rows.iter().any(|r| r.label == "/update"), "help must list /update");
     }
 
     #[test]
