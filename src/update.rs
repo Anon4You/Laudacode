@@ -61,6 +61,12 @@ pub fn asset_name(tag: &str, target: &str) -> String {
     format!("laudacode-{tag}-{target}.tar.gz")
 }
 
+/// Where the worker downloads the asset. Single source of truth so the
+/// extractor below can never collide with it again.
+pub fn download_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("lc-update-{}", std::process::id()))
+}
+
 /// Latest release tag (`vX.Y.Z`) from the GitHub API.
 pub async fn fetch_latest_tag(client: &reqwest::Client) -> Result<String> {
     let v: serde_json::Value = client
@@ -143,9 +149,13 @@ pub fn verify_against_sums(asset: &Path, sums: &str) -> Result<()> {
 
 /// Extract the `laudacode` binary from `tgz` and install it over `dest_exe`.
 /// The previous binary is kept next to it as `laudacode.bak`.
+///
+/// Extracts in its own staging dir: the caller downloads `tgz` into a
+/// *different* dir, and this must never delete it (wiping a shared dir here
+/// is exactly how an update once ate its own just-downloaded archive).
 pub fn install_from_tarball(tgz: &Path, dest_exe: &Path) -> Result<PathBuf> {
     let dir = dest_exe.parent().context("binary path has no parent dir")?;
-    let stage = std::env::temp_dir().join(format!("lc-update-{}", std::process::id()));
+    let stage = std::env::temp_dir().join(format!("lc-update-x-{}", std::process::id()));
     if stage.exists() {
         std::fs::remove_dir_all(&stage).ok();
     }
@@ -214,8 +224,51 @@ mod tests {
     }
 
     #[test]
-    fn sums_entry_lookup_skips_starred_and_unrelated_lines() {
-        let sums = "abc123  laudacode-v0.11.0-aarch64-linux-android.tar.gz\n\
+    fn install_never_touches_the_download_dir() {
+        // Regression: downloader and extractor once shared one staging dir,
+        // so the extractor deleted the just-downloaded archive before
+        // unpacking it (`tar: Cannot open: No such file or directory`).
+        // The tgz lives in download_dir(), exactly like the real flow.
+        let base = std::env::temp_dir().join(format!("lc-upd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dl = download_dir();
+        let _ = std::fs::remove_dir_all(&dl);
+        std::fs::create_dir_all(&dl).unwrap();
+        let bin_dir = base.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let dest = bin_dir.join("laudacode");
+        std::fs::write(&dest, b"old").unwrap();
+        let payload_dir = base.join("payload");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        std::fs::write(payload_dir.join("laudacode"), b"new").unwrap();
+        let tgz = dl.join("fake.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tgz)
+            .args(["-C"])
+            .arg(&payload_dir)
+            .arg("laudacode")
+            .status();
+        let Ok(st) = tar else {
+            eprintln!("skipping: tar not installed");
+            return;
+        };
+        assert!(st.success());
+        let sentinel = dl.join("downloaded-asset.bin");
+        std::fs::write(&sentinel, b"precious download").unwrap();
+
+        let installed = install_from_tarball(&tgz, &dest).expect("install");
+        assert_eq!(installed, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(std::fs::read(bin_dir.join("laudacode.bak")).unwrap(), b"old");
+        assert!(tgz.is_file(), "extractor deleted the download dir!");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"precious download");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&dl).ok();
+    }
+
+    #[test]
+    fn sums_entry_lookup_skips_starred_and_unrelated_lines() {        let sums = "abc123  laudacode-v0.11.0-aarch64-linux-android.tar.gz\n\
                     deadbeef  some-other-file.tar.gz\n";
         let dir = std::env::temp_dir();
         let asset = dir.join("laudacode-v0.11.0-aarch64-linux-android.tar.gz");

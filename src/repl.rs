@@ -608,7 +608,7 @@ fn run_update_check(
         Ok(e) => e,
         Err(e) => return fail(e.into()),
     };
-    let stage = std::env::temp_dir().join(format!("lc-update-{}", std::process::id()));
+    let stage = crate::update::download_dir();
     std::fs::create_dir_all(&stage).ok();
     let mut staged: Option<PathBuf> = None;
     for target in &targets {
