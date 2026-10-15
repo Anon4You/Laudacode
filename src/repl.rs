@@ -380,6 +380,9 @@ pub enum WorkerEvent {
     SessionName(String),
     /// A session was deleted — a status line can confirm it.
     SessionDeleted(String),
+    /// An image was queued for the next message — show its chip above the
+    /// composer (payloads ride along from the worker side).
+    ImageAttached(String),
     /// Authenticated catalog fetch failed during `/provider add` — the UI
     /// switches to manual model-name capture instead of a picker.
     SetupModelsFailed,
@@ -1573,6 +1576,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             WorkerCmd::QueueImage(path) => match load_image_data_uri(&app.cwd, &path) {
                 Ok(uri) => {
                     pending_images.push(uri);
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or(path.clone());
+                    let _ = ev_tx.send(WorkerEvent::ImageAttached(name));
                     let _ = ev_tx.send(WorkerEvent::Info(format!(
                         "image attached ({} queued) — it will ride along with your next message",
                         pending_images.len()
@@ -3048,6 +3056,11 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         WorkerEvent::SessionDeleted(id) => {
             tui.push(Entry::Info(format!("session '{id}' deleted")));
+        }
+        WorkerEvent::ImageAttached(name) => {
+            if !tui.attached_images.iter().any(|n| n == &name) {
+                tui.attached_images.push(name);
+            }
         }
         WorkerEvent::ProviderSwitched { provider, model } => {
             tui.dash.set_endpoint(&provider, &model);

@@ -905,6 +905,14 @@ pub struct Tui {
     /// Byte index of the editing caret in [`Tui::input`]. Left/Right move it;
     /// typed characters insert here instead of always appending.
     cursor: usize,
+    /// Collapsed big-paste payloads by chip number (`[paste #N +L lines]`).
+    /// `None` slots are deleted chips whose numbers are never reused, so a
+    /// stale reference can never resolve to somebody else's text.
+    pastes: Vec<Option<String>>,
+    /// Image file names queued for the next message. Display list only —
+    /// the payloads live in the worker's pending_images and ride along on
+    /// submit, which is also when this list clears.
+    pub attached_images: Vec<String>,
     /// Geometry of the last drawn frames, used to map touch/mouse taps back
     /// onto widgets (composer caret, picker rows, transcript).
     last_transcript: Option<Rect>,
@@ -1106,6 +1114,8 @@ impl Tui {
             history_pos: None,
             history_draft: String::new(),
             cursor: 0,
+            pastes: Vec::new(),
+            attached_images: Vec::new(),
             last_transcript: None,
             last_composer: None,
             last_picker: None,
@@ -1273,7 +1283,10 @@ impl Tui {
         self.files = f.into_iter().take(2000).collect();
     }
 
-    /// Insert bracketed-paste content verbatim (newlines included).
+    /// Insert bracketed-paste content. Short pastes go in verbatim; big ones
+    /// (Claude/Codex-style: >3 lines or >800 chars) collapse to a
+    /// `[paste #N +L lines]` chip so the composer stays readable. The full
+    /// text expands back at submit; Backspace on a chip drops it whole.
     /// Never triggers submission — the user sends with Enter afterwards.
     pub fn insert_paste(&mut self, text: &str) {
         if self.input_modal.is_some() {
@@ -1286,9 +1299,54 @@ impl Tui {
             return; // modals take over all input
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.insert_str(&normalized);
+        let lines = normalized.lines().count();
+        if lines > 3 || normalized.chars().count() > 800 {
+            let n = self.pastes.len();
+            self.pastes.push(Some(normalized));
+            self.insert_str(&format!("[paste #{n} +{lines} lines]"));
+        } else {
+            self.insert_str(&normalized);
+        }
         self.slash_sel = 0;
         self.at_sel = 0;
+    }
+
+    /// Chip token for paste payload `n`, or `None` when the slot is dead.
+    /// Only live chips expand — a hand-typed lookalike stays literal.
+    fn paste_token(&self, n: usize) -> Option<String> {
+        let body = self.pastes.get(n)?.as_ref()?;
+        Some(format!("[paste #{n} +{} lines]", body.lines().count()))
+    }
+
+    /// Expand live paste chips in `text` to their full content.
+    fn expand_pastes(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for n in 0..self.pastes.len() {
+            let pair = match (self.paste_token(n), self.pastes.get(n)) {
+                (Some(t), Some(Some(b))) => (t, b.clone()),
+                _ => continue,
+            };
+            out = out.replace(&pair.0, &pair.1);
+        }
+        out
+    }
+
+    /// Take the composer content for submission: expand paste chips, clear
+    /// the draft + payloads + image chips, record history. Returns `None`
+    /// when there is nothing to send.
+    fn take_submission(&mut self) -> Option<String> {
+        let input = self.input.trim().to_string();
+        // Expand before dropping the payloads — the chips resolve here.
+        let expanded = self.expand_pastes(&input);
+        self.input.clear();
+        self.cursor_home();
+        self.pastes.clear();
+        self.attached_images.clear();
+        if expanded.is_empty() {
+            return None;
+        }
+        self.record_history(&expanded);
+        Some(expanded)
     }
 
     /// Open the centered input dialog (API key, model id, …).
@@ -1531,12 +1589,37 @@ impl Tui {
         self.cursor += s.chars().count();
     }
 
-    /// Delete the char immediately before the caret.
+    /// Delete the char immediately before the caret — or a whole paste chip
+    /// when the caret sits right behind one (chips delete atomically, like
+    /// Claude/Codex, instead of leaving a broken half-token behind).
     fn backspace_at(&mut self) -> bool {
         if self.cursor == 0 || self.input.is_empty() {
             return false;
         }
         let byte_at = Self::char_byte_offset(&self.input, self.cursor);
+        // A live chip ending exactly at the caret: (start byte, token
+        // chars, payload index). Owned data only, so the borrow of
+        // `self.input` ends before the mutation below.
+        let chip: Option<(usize, usize, usize)> = self.input[..byte_at]
+            .rfind("[paste #")
+            .and_then(|start| {
+                let token = &self.input[start..byte_at];
+                if !token.ends_with(']') {
+                    return None;
+                }
+                let len = token.chars().count();
+                self.pastes.iter().enumerate().find_map(|(n, _)| {
+                    (self.paste_token(n).as_deref() == Some(token)).then_some((start, len, n))
+                })
+            });
+        if let Some((start, len, n)) = chip {
+            self.pastes[n] = None;
+            let tail: String = self.input[byte_at..].to_string();
+            self.input.truncate(start);
+            self.input.push_str(&tail);
+            self.cursor -= len;
+            return true;
+        }
         let prev_byte = Self::char_byte_offset(&self.input, self.cursor - 1);
         let tail: String = self.input[byte_at..].to_string();
         self.input.truncate(prev_byte);
@@ -2093,13 +2176,19 @@ impl Tui {
         let compact_h = Self::compact_summary_h(area.width, area.height, dash_area.is_none());
         let has_compact = compact_h > 0;
 
-        let mut constraints = Vec::with_capacity(6);
+        let mut constraints = Vec::with_capacity(7);
         if has_header {
             constraints.push(Constraint::Length(header_rows));
         }
         constraints.push(Constraint::Min(1));
         if has_compact {
             constraints.push(Constraint::Length(compact_h));
+        }
+        // Attachment chips (queued images) get their own row above the
+        // composer so they never eat transcript space when absent.
+        let has_attachments = !self.attached_images.is_empty();
+        if has_attachments {
+            constraints.push(Constraint::Length(1));
         }
         constraints.push(Constraint::Length(comp_h));
         constraints.push(Constraint::Length(1));
@@ -2122,7 +2211,26 @@ impl Tui {
         } else {
             None
         };
-        let composer_area = chunks[idx];
+        let composer_area = if has_attachments {
+            let a = chunks[idx];
+            idx += 1;
+            let names = self
+                .attached_images
+                .iter()
+                .map(|n| format!("[image: {n}]"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    Self::truncate_to(names, area.width as usize),
+                    Style::default().fg(crate::theme::get().accent),
+                ))),
+                a,
+            );
+            chunks[idx]
+        } else {
+            chunks[idx]
+        };
         idx += 1;
         let hints_area = chunks[idx];
         idx += 1;
@@ -3406,14 +3514,9 @@ impl Tui {
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
-                let input = self.input.trim().to_string();
-                self.input.clear();
-                self.cursor_home();
-                self.record_history(&input);
-                if input.is_empty() {
-                    Action::None
-                } else {
-                    Action::Submit(input)
+                match self.take_submission() {
+                    Some(input) => Action::Submit(input),
+                    None => Action::None,
                 }
             }
             // Shift+Enter / Alt+Enter insert a newline instead of submitting.
@@ -3442,6 +3545,7 @@ impl Tui {
                             if !self.input.is_empty() {
                                 self.input.clear();
                                 self.cursor_home();
+                                self.pastes.clear();
                                 self.last_ctrl_c = None;
                                 return Action::None;
                             }
@@ -3648,15 +3752,7 @@ impl Tui {
         match key.as_str() {
             "enter" => {
                 // Submit only when there is something to send.
-                if self.input.trim().is_empty() {
-                    None
-                } else {
-                    let input = self.input.trim().to_string();
-                    self.input.clear();
-                    self.cursor_home();
-                    self.record_history(&input);
-                    Some(Action::Submit(input))
-                }
+                self.take_submission().map(Action::Submit)
             }
             "esc" => Some(self.esc_pressed()),
             "tab" => Some(Action::CycleMode),
@@ -4185,6 +4281,40 @@ mod tests {
         t.open_approval("allow?".into());
         t.insert_paste("should not land");
         assert!(!t.input.contains("should not land"));
+    }
+
+    #[test]
+    fn big_paste_collapses_to_chip_and_expands_on_submit() {
+        let mut t = Tui::new();
+        t.insert_paste("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+        assert_eq!(t.input, "[paste #0 +9 lines]");
+        // Backspace removes the whole chip, not one char.
+        match t.on_key(key(KeyCode::Backspace, KeyModifiers::NONE)) {
+            Action::None => {}
+            other => panic!("backspace must not submit, got {other:?}"),
+        }
+        assert!(t.input.is_empty());
+        assert!(t.pastes.iter().all(|p| p.is_none()));
+        // Re-paste, then submit expands to the full text.
+        t.insert_paste("a\nb\nc\nd");
+        assert_eq!(t.input, "[paste #1 +4 lines]", "numbers are never reused");
+        match t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(s) => assert_eq!(s, "a\nb\nc\nd"),
+            other => panic!("enter must submit, got {other:?}"),
+        }
+        // History recorded the expanded text, so ↑ recall has no dangling chip.
+        assert_eq!(t.history.last().map(String::as_str), Some("a\nb\nc\nd"));
+    }
+
+    #[test]
+    fn hand_typed_chip_lookalike_stays_literal() {
+        let mut t = Tui::new();
+        t.input = "see [paste #7 +2 lines] ok".into();
+        t.cursor_end();
+        match t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::Submit(s) => assert_eq!(s, "see [paste #7 +2 lines] ok"),
+            other => panic!("enter must submit, got {other:?}"),
+        }
     }
 
     #[test]
