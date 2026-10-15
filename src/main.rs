@@ -21,6 +21,7 @@ mod syntax;
 mod theme;
 mod tools;
 mod tui;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;

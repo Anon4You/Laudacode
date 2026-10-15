@@ -462,6 +462,8 @@ pub enum WorkerCmd {
     SetTheme(String),
     /// Persist the chosen ambient effect.
     SetEffect(String),
+    /// Check GitHub releases and install a newer binary (`/update`).
+    CheckUpdate,
     Quit,
 }
 
@@ -557,6 +559,119 @@ pub struct WorkerHandle {
     pub approve: Sender<bool>,
     pub events: Receiver<WorkerEvent>,
     pub cancel: Arc<AtomicBool>,
+}
+
+/// `/update`: compare against the latest GitHub release, ask through the
+/// standard y/n approval dialog, then download and install over the running
+/// binary. No auto-restart: the worker cannot relaunch the process, so the
+/// user /quits and starts the new binary themselves.
+fn run_update_check(
+    rt: &tokio::runtime::Runtime,
+    ev_tx: &Sender<WorkerEvent>,
+    approve_rx: &Arc<std::sync::Mutex<Receiver<bool>>>,
+) {
+    let info = |s: String| {
+        let _ = ev_tx.send(WorkerEvent::Info(s));
+    };
+    let fail = |e: anyhow::Error| {
+        let _ = ev_tx.send(WorkerEvent::Error(format!("update failed: {e:#}")));
+    };
+    let client = match crate::api::build_web_client(
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
+    ) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let tag = match rt.block_on(crate::update::fetch_latest_tag(&client)) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    let current = crate::update::current_version();
+    if !crate::update::is_newer(&tag, current) {
+        return info(format!("already on latest (v{current})"));
+    }
+    // Reuse the y/n approval dialog: Enter and Esc both decline.
+    let _ = ev_tx.send(WorkerEvent::NeedApproval(format!(
+        "new version {tag} available (you have v{current}) — download and install now?"
+    )));
+    if approve_rx.lock().unwrap().recv() != Ok(true) {
+        return info("update skipped — run /update any time".into());
+    }
+    let targets = crate::update::detect_targets();
+    if targets.is_empty() {
+        return fail(anyhow::anyhow!(
+            "no prebuilt binary for this platform (macOS has none) — update with install.sh or cargo instead"
+        ));
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return fail(e.into()),
+    };
+    let stage = std::env::temp_dir().join(format!("lc-update-{}", std::process::id()));
+    std::fs::create_dir_all(&stage).ok();
+    let mut staged: Option<PathBuf> = None;
+    for target in &targets {
+        let asset = crate::update::asset_name(&tag, target);
+        let base = format!(
+            "https://github.com/{}/releases/download/{tag}",
+            crate::update::REPO
+        );
+        let dest = stage.join(&asset);
+        info(format!("downloading {asset}..."));
+        if rt
+            .block_on(crate::update::download_to(
+                &client,
+                &format!("{base}/{asset}"),
+                &dest,
+            ))
+            .is_err()
+        {
+            continue; // probably no asset for this target — try the next
+        }
+        // SHA256SUMS is mandatory, like install.sh: unverified stays out.
+        let sums_dest = stage.join("SHA256SUMS");
+        let sums = match rt.block_on(crate::update::download_to(
+            &client,
+            &format!("{base}/SHA256SUMS"),
+            &sums_dest,
+        )) {
+            Ok(()) => match std::fs::read_to_string(&sums_dest) {
+                Ok(s) => s,
+                Err(e) => {
+                    fail(e.into());
+                    return;
+                }
+            },
+            Err(e) => {
+                fail(e);
+                return;
+            }
+        };
+        match crate::update::verify_against_sums(&dest, &sums) {
+            Ok(()) => {
+                staged = Some(dest);
+                break;
+            }
+            Err(e) => {
+                let _ = ev_tx.send(WorkerEvent::Error(format!(
+                    "{asset}: {e:#} — trying next target"
+                )));
+            }
+        }
+    }
+    let tgz = match staged {
+        Some(p) => p,
+        None => return fail(anyhow::anyhow!("no verified binary for this platform")),
+    };
+    match crate::update::install_from_tarball(&tgz, &exe) {
+        Ok(path) => info(format!(
+            "installed {tag} to {} (old binary kept as laudacode.bak) — /quit and relaunch to use it",
+            path.display()
+        )),
+        Err(e) => fail(e),
+    }
+    std::fs::remove_dir_all(&stage).ok();
 }
 
 /// Move `App` onto a dedicated thread that owns the agent and answers
@@ -1073,6 +1188,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     Config::toml_path().display(),
                 );
                 let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::CheckUpdate => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                run_update_check(&rt, &ev_tx, &approve_rx);
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
             }
             WorkerCmd::Diff => {
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
@@ -2999,8 +3119,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                    /diff         show uncommitted git changes\n\
                    /review       specialist review of uncommitted changes\n\
                    /undo [N]     revert file changes from the last N turns\n\
-                   /init         analyze the project and write AGENTS.md\n\
-                 PROVIDER\n\
+                    /init         analyze the project and write AGENTS.md\n\
+                    /update       check for a new release and install it\n\
+                  PROVIDER\n\
                    /provider     menu: add · use · edit · list\n\
                  INPUT & KEYS\n\
                    @file         attach a file (contents inlined)\n\
@@ -3269,6 +3390,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "status" => {
             tui.set_status("gathering status");
             let _ = cmd.send(WorkerCmd::Status);
+        }
+        "update" => {
+            tui.set_status("checking for updates");
+            let _ = cmd.send(WorkerCmd::CheckUpdate);
         }
         "mcp" => {
             let _ = cmd.send(WorkerCmd::Mcp);
@@ -4356,6 +4481,7 @@ mod tests {
             "theme",
             "effect",
             "undo",
+            "update",
         ];
         for name in DISPATCHED {
             let entry = format!("/{name}");
