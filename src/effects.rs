@@ -23,6 +23,10 @@ pub enum EffectKind {
     Confetti,
     Meteor,
     Aurora,
+    Leaves,
+    Drizzle,
+    Rainbow,
+    Pulse,
 }
 
 impl EffectKind {
@@ -40,6 +44,10 @@ impl EffectKind {
             "confetti" | "party" => Self::Confetti,
             "meteor" | "comet" => Self::Meteor,
             "aurora" | "northern lights" => Self::Aurora,
+            "leaves" | "leaf" | "autumn" => Self::Leaves,
+            "drizzle" => Self::Drizzle,
+            "rainbow" | "prism" => Self::Rainbow,
+            "pulse" | "breathe" => Self::Pulse,
             _ => Self::Off,
         }
     }
@@ -59,10 +67,14 @@ impl EffectKind {
             Self::Confetti => "confetti",
             Self::Meteor => "meteor",
             Self::Aurora => "aurora",
+            Self::Leaves => "leaves",
+            Self::Drizzle => "drizzle",
+            Self::Rainbow => "rainbow",
+            Self::Pulse => "pulse",
         }
     }
 
-    pub fn all() -> [EffectKind; 13] {
+    pub fn all() -> [EffectKind; 17] {
         [
             Self::Off,
             Self::Petals,
@@ -77,6 +89,10 @@ impl EffectKind {
             Self::Confetti,
             Self::Meteor,
             Self::Aurora,
+            Self::Leaves,
+            Self::Drizzle,
+            Self::Rainbow,
+            Self::Pulse,
         ]
     }
 }
@@ -188,10 +204,15 @@ impl Engine {
     fn target_count(&self) -> usize {
         let base = (self.area.0 as usize / 14).clamp(8, MAX_PARTICLES);
         match self.kind {
-            EffectKind::Off | EffectKind::Lightning | EffectKind::Meteor | EffectKind::Aurora => 0,
-            EffectKind::Rain | EffectKind::Matrix => base * 2,
-            EffectKind::Snow | EffectKind::Petals => base + base / 2,
+            EffectKind::Off
+            | EffectKind::Lightning
+            | EffectKind::Meteor
+            | EffectKind::Aurora
+            | EffectKind::Pulse => 0,
+            EffectKind::Rain | EffectKind::Matrix | EffectKind::Rainbow => base * 2,
+            EffectKind::Snow | EffectKind::Petals | EffectKind::Leaves => base + base / 2,
             EffectKind::Confetti => base * 3 / 2,
+            EffectKind::Drizzle => (base / 2).max(4),
             EffectKind::Fireflies | EffectKind::Embers | EffectKind::Bubbles => base.min(36),
             EffectKind::Stars => base.min(40),
         }
@@ -200,10 +221,11 @@ impl Engine {
     fn spawn(&mut self, from_top: bool) -> Particle {
         let r = &mut self.rng;
         let (vy_lo, vy_hi) = match self.kind {
-            EffectKind::Rain => (1.1, 2.2),
+            EffectKind::Rain | EffectKind::Rainbow => (1.1, 2.2),
             EffectKind::Matrix => (0.7, 1.6),
+            EffectKind::Drizzle => (0.5, 1.0),
             EffectKind::Snow => (0.15, 0.45),
-            EffectKind::Petals | EffectKind::Confetti => (0.2, 0.6),
+            EffectKind::Petals | EffectKind::Confetti | EffectKind::Leaves => (0.2, 0.6),
             EffectKind::Bubbles | EffectKind::Embers => (-0.5, -0.2),
             _ => (0.0, 0.0),
         };
@@ -248,7 +270,7 @@ impl Engine {
             p.phase += 0.08 * p.sway;
             if matches!(
                 self.kind,
-                EffectKind::Snow | EffectKind::Petals | EffectKind::Confetti
+                EffectKind::Snow | EffectKind::Petals | EffectKind::Confetti | EffectKind::Leaves
             ) {
                 p.x += p.sway * 0.35 * p.phase.sin();
             }
@@ -414,6 +436,22 @@ impl Engine {
                 }
             }
         }
+        // Pulse: the whole band breathes between two dark surface shades.
+        if self.kind == EffectKind::Pulse {
+            let th = crate::theme::get();
+            let bg = if (self.frame / 10) % 2 == 0 {
+                th.surface
+            } else {
+                th.code_bg
+            };
+            for yy in area.y..area.y + area.height {
+                for xx in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell_mut((xx, yy)) {
+                        cell.set_style(cell.style().bg(bg));
+                    }
+                }
+            }
+        }
         // Lightning bolt + flash wash.
         if self.flashing() {
             let wash = Style::default().bg(crate::theme::get().overlay);
@@ -447,6 +485,9 @@ impl Engine {
             EffectKind::Bubbles => ["○", "◌", "°", "·"][variant as usize],
             EffectKind::Embers => ["˙", "*", ".", "↑"][variant as usize],
             EffectKind::Confetti => ["▪", "▫", "✦", "*"][variant as usize],
+            EffectKind::Leaves => ["❧", "~", "*", "·"][variant as usize],
+            EffectKind::Drizzle => ["╵", "'", "`", "·"][variant as usize],
+            EffectKind::Rainbow => ["•", "·", "*", "+"][variant as usize],
             _ => " ",
         }
     }
@@ -486,6 +527,13 @@ impl Engine {
             EffectKind::Bubbles => [th.accent2, th.user, th.text, th.gray][variant as usize],
             EffectKind::Embers => [th.warning, th.error, th.mac, th.warning][variant as usize],
             EffectKind::Confetti => [th.user, th.bullet, th.string, th.warning][variant as usize],
+            EffectKind::Leaves => [th.warning, th.string, th.num, th.bullet][variant as usize],
+            EffectKind::Drizzle => [th.user, th.accent2, th.heading, th.dim][variant as usize],
+            EffectKind::Rainbow => {
+                // Hue cycles with the frame so the rain reads as a spectrum.
+                let cols = [th.accent, th.accent2, th.bullet, th.warning, th.string, th.user];
+                cols[(self.frame as usize + variant as usize) % cols.len()]
+            }
             _ => th.gray,
         };
         Style::default().fg(c)
@@ -505,7 +553,7 @@ mod tests {
         assert_eq!(EffectKind::parse(None), EffectKind::Off);
         assert_eq!(EffectKind::parse(Some("bogus")), EffectKind::Off);
         assert_eq!(EffectKind::parse(Some("off")).as_str(), "off");
-        assert_eq!(EffectKind::all().len(), 13);
+        assert_eq!(EffectKind::all().len(), 17);
     }
 
     #[test]
@@ -604,6 +652,39 @@ mod tests {
         assert_eq!(EffectKind::parse(Some("comet")), EffectKind::Meteor);
         assert_eq!(EffectKind::parse(Some("aurora")), EffectKind::Aurora);
         assert_eq!(EffectKind::parse(Some("party")), EffectKind::Confetti);
+        assert_eq!(EffectKind::parse(Some("autumn")), EffectKind::Leaves);
+        assert_eq!(EffectKind::parse(Some("drizzle")), EffectKind::Drizzle);
+        assert_eq!(EffectKind::parse(Some("prism")), EffectKind::Rainbow);
+        assert_eq!(EffectKind::parse(Some("breathe")), EffectKind::Pulse);
+    }
+
+    #[test]
+    fn every_effect_ticks_and_renders_inside_the_band() {
+        // New kinds ride the shared particle pipeline — sweep all of them so
+        // a future addition cannot silently spawn nothing or paint outside.
+        for kind in EffectKind::all() {
+            let mut e = Engine::new(kind);
+            e.set_area(40, 8);
+            for _ in 0..5 {
+                e.tick();
+            }
+            let area = Rect::new(0, 0, 40, 8);
+            let mut buf = Buffer::empty(area);
+            e.render(&mut buf, area);
+        }
+        // Pulse has no particles: its wash must still tint the band.
+        let mut e = Engine::new(EffectKind::Pulse);
+        e.set_area(30, 8);
+        e.tick();
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buf = Buffer::empty(area);
+        e.render(&mut buf, area);
+        let tinted = buf
+            .content()
+            .iter()
+            .filter(|c| matches!(c.style().bg, Some(Color::Rgb(..))))
+            .count();
+        assert!(tinted > 0, "pulse wash must tint the band");
     }
 
     #[test]
@@ -670,6 +751,9 @@ mod tests {
             EffectKind::Bubbles,
             EffectKind::Embers,
             EffectKind::Confetti,
+            EffectKind::Leaves,
+            EffectKind::Drizzle,
+            EffectKind::Rainbow,
         ] {
             let mut e = Engine::new(kind);
             e.set_area(40, 6);

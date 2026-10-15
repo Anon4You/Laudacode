@@ -43,8 +43,8 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - 📝 **Custom slash commands** — drop a markdown file in `.laudacode/commands/`; `$ARGUMENTS` and `$1`…`$9` expand at call time
 - 🖼️ **Image input** — screenshots and photos for vision models (`-i`, `/image`)
 - 📡 **Streaming responses** with reasoning-model support
-- 🎨 **13 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker (`/theme`)
-- ✨ **Ambient effects** — petals, rain, snow, matrix rain, lightning, stars, fireflies, bubbles, embers, confetti, comets, aurora (`/effect`, banner only)
+- 🎨 **17 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker, catppuccin, rosepine, ayu, onedark (`/theme`)
+- ✨ **Ambient effects** — petals, rain, snow, matrix rain, lightning, stars, fireflies, bubbles, embers, confetti, comets, aurora, leaves, drizzle, rainbow, pulse (`/effect`, banner only)
 - 🌈 **Syntax highlighting** — code blocks and diffs, per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
 - ⌨️ **Prompt history** — ↑/↓ recall with draft restore, persisted
 - 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry` and more, plus `@file`, `#note` and `!<cmd>`

@@ -47,7 +47,7 @@ laudacode exec "list the files in this directory"
 | `src/patch.rs`   | V4A patch parser/applier (`*** Begin Patch` format)                   |
 | `src/session.rs` | conversation persistence (~/.local/share/laudacode/sessions), resume by unique id |
 | `src/repl.rs`    | interactive REPL, slash commands, streaming UI, provider flows        |
-| `src/theme.rs`   | 13 built-in color themes; one palette drives TUI, markdown, syntax and banner gradient |
+| `src/theme.rs`   | 17 built-in color themes; one palette drives TUI, markdown, syntax and banner gradient |
 | `src/effects.rs` | ambient particle effects in the banner band (petals/rain/lightning/…), xorshift PRNG, auto-pauses while streaming |
 | `src/markdown.rs`| assistant markdown → styled transcript lines (fences highlighted via `syntax.rs`) |
 | `src/syntax.rs`  | dependency-free syntax highlighter feeding code blocks and diff views  |
