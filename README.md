@@ -341,6 +341,7 @@ banner is suppressed automatically under `--json`.
 | `/reasoning`         | thinking depth: low · normal · medium · high · max |
 | `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
 | `/theme`             | switch color theme (live preview)            |
+| `/banner`            | roll a different banner logo                 |
 | `/effect`            | ambient effects (petals · rain · lightning…) |
 | `/status`            | provider/model/session + token, cost, budget, hook, log & network state |
 | `/update`            | check GitHub releases and install a newer binary |

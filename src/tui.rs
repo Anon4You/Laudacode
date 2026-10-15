@@ -1031,6 +1031,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit Laudacode"),
     ("/exit", "exit Laudacode (alias of /quit)"),
     ("/theme", "switch color theme"),
+    ("/banner", "roll a different banner logo"),
     ("/effect", "ambient effects (petals, rain, …)"),
     (
         "/skills",
@@ -1360,6 +1361,27 @@ impl Tui {
     /// Re-roll the banner logo (e.g. after a terminal resize).
     pub fn reroll_banner(&mut self) {
         self.logo = pick_logo(self.last_width);
+    }
+
+    /// Roll a *different* banner logo (`/banner`) and make sure the banner
+    /// shows. Pure random can hand back the same art twice, which reads as
+    /// "the command did nothing" — so the current logo is excluded when
+    /// alternatives fit.
+    pub fn roll_banner(&mut self) {
+        self.show_banner = true;
+        let fits: Vec<&Art> = LOGOS
+            .iter()
+            .filter(|a| composed_width(a) <= self.last_width)
+            .collect();
+        let others: Vec<&Art> = fits
+            .iter()
+            .filter(|a| a.name != self.logo.name)
+            .copied()
+            .collect();
+        let pool = if others.is_empty() { fits } else { others };
+        if !pool.is_empty() {
+            self.logo = pool[next_rand() as usize % pool.len()];
+        }
     }
 
     pub fn banner_visible(&self) -> bool {
@@ -5317,6 +5339,25 @@ mod tests {
             seen.insert(t.banner_logo().name);
         }
         assert!(seen.len() > 1, "logo never changed: {seen:?}");
+    }
+
+    #[test]
+    fn banner_roll_never_repeats_back_to_back() {
+        let mut t = Tui::new();
+        t.last_width = 500; // every variant fits
+        let mut prev = t.banner_logo().name;
+        for _ in 0..50 {
+            t.roll_banner();
+            let cur = t.banner_logo().name;
+            assert_ne!(cur, prev, "roll repeated the logo — reads as a no-op");
+            assert!(t.banner_visible(), "roll must show a hidden banner");
+            prev = cur;
+        }
+        // Degenerate width: only the most compact logo fits — must not panic
+        // and must still show the banner.
+        t.last_width = 0;
+        t.roll_banner();
+        assert!(t.banner_visible());
     }
 
     #[test]

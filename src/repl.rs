@@ -3561,6 +3561,13 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "archive" => {
             let _ = cmd.send(WorkerCmd::Archive(arg.first().map(|s| s.to_string())));
         }
+        "banner" => {
+            tui.roll_banner();
+            tui.push(Entry::Info(format!(
+                "banner: {} — /banner again for another",
+                tui.banner_logo().name
+            )));
+        }
         "update" => {
             tui.set_status("checking for updates");
             let _ = cmd.send(WorkerCmd::CheckUpdate);
@@ -4655,6 +4662,7 @@ mod tests {
             "doctor",
             "usage",
             "archive",
+            "banner",
         ];
         for name in DISPATCHED {
             let entry = format!("/{name}");
