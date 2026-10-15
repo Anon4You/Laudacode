@@ -342,6 +342,44 @@ pub const LOGOS: &[Art] = &[
             &[Seg::faint("               ╰──── ⚡")],
         ],
     },
+    // Adapted from asciiart.eu (Tux, jgs) — redrawn to fit the band.
+    Art {
+        name: "tux",
+        rows: &[
+            &[Seg::faint("   .--.")],
+            &[Seg::rule("  |"), Seg::glow("o_o"), Seg::rule(" |")],
+            &[Seg::rule("  |"), Seg::glow(":_/"), Seg::rule(" |")],
+            &[Seg::rule(" //   \\ ")],
+            &[Seg::rule("(|     | )")],
+            &[Seg::rule("/'\\_   _/`\\")],
+            &[Seg::rule("\\___"), Seg::accent(")="), Seg::rule("(___/)")],
+        ],
+    },
+    // Adapted from asciiart.eu (space saucer) — redrawn to fit the band.
+    Art {
+        name: "ufo",
+        rows: &[
+            &[Seg::faint("        ___")],
+            &[Seg::faint("    _.-'   '-._")],
+            &[Seg::rule("   /  "), Seg::glow("o  o  o"), Seg::rule("  \\")],
+            &[Seg::rule("   \\   ___   /")],
+            &[Seg::rule("    '-("), Seg::accent("___"), Seg::rule(")-'")],
+            &[Seg::faint("      '  '  '")],
+        ],
+    },
+    // Adapted from asciiart.eu (bug) — redrawn to fit the band.
+    Art {
+        name: "bug",
+        rows: &[
+            &[Seg::rule("\\ /")],
+            &[Seg::faint("    "), Seg::glow("oVo")],
+            &[Seg::rule("\\___"), Seg::accent("XXX"), Seg::rule("___/")],
+            &[Seg::rule(" __"), Seg::accent("XXXXX"), Seg::rule("__")],
+            &[Seg::rule("/__"), Seg::accent("XXXXX"), Seg::rule("__\\")],
+            &[Seg::rule("/   "), Seg::accent("XXX"), Seg::rule("   \\")],
+            &[Seg::faint("     V")],
+        ],
+    },
 ];
 
 /// Tallest variant — the banner band is sized to this and shorter logos are
