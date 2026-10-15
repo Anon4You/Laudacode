@@ -110,13 +110,13 @@ pub const LOGOS: &[Art] = &[
     Art {
         name: "wordmark",
         rows: &[
-            &[Seg::rule(" ╭───────────────────────────────────────────────────────╮")],
+            &[Seg::rule(" ╭                                                       ╮")],
             &[Seg::rule(" │ "), Seg::glow("█      ██   █   █ ████   ██    ████  ███  ████  █████"), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::glow("█     █████ █   █ █   █ █████ █     █   █ █   █ █    "), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::glow("█     █   █ █   █ █   █ █   █ █     █   █ █   █ ████ "), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::glow("█     █   █ █   █ █   █ █   █ █     █   █ █   █ █    "), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::glow("█████ █████  ███  ████  █████  ████  ███  ████  █████"), Seg::rule(" │")],
-            &[Seg::rule(" ╰───────────────────────────────────────────────────────╯")],
+            &[Seg::rule(" ╰                                                       ╯")],
         ],
     },
     Art {
@@ -268,7 +268,7 @@ pub const LOGOS: &[Art] = &[
     Art {
         name: "rocket",
         rows: &[
-            &[Seg::rule(" ╭────────────────╮")],
+            &[Seg::rule(" ╭                ╮")],
             &[Seg::rule(" │ "), Seg::faint("        "), Seg::glow("▲"), Seg::rule("      │")],
             &[Seg::rule(" │ "), Seg::faint("       "), Seg::glow("▲▲▲"), Seg::rule("     │")],
             &[Seg::rule(" │ "), Seg::faint("      "), Seg::glow("▲▲▲▲▲"), Seg::rule("    │")],
@@ -279,13 +279,13 @@ pub const LOGOS: &[Art] = &[
             &[Seg::rule(" │ "), Seg::faint("    "), Seg::rule("└───┬───┘  │")],
             &[Seg::rule(" │ "), Seg::faint("     "), Seg::glow("╽"), Seg::accent("▐█▌"), Seg::glow("╿"), Seg::faint(" ✧✦"), Seg::rule("  │")],
             &[Seg::rule(" │ "), Seg::faint("       "), Seg::accent("▀▀▀"), Seg::rule("     │")],
-            &[Seg::rule(" ╰────────────────╯")],
+            &[Seg::rule(" ╰                ╯")],
         ],
     },
     Art {
         name: "mount",
         rows: &[
-            &[Seg::rule(" ╭─────────────────────╮")],
+            &[Seg::rule(" ╭                     ╮")],
             &[Seg::rule(" │ "), Seg::faint("          "), Seg::glow("☀"), Seg::rule("         │")],
             &[Seg::rule(" │ "), Seg::glow("   ▂▃▄▅▆▇"), Seg::rule("           │")],
             &[Seg::rule(" │ "), Seg::glow("  ▃▄▅▆▇█"), Seg::rule("            │")],
@@ -293,13 +293,13 @@ pub const LOGOS: &[Art] = &[
             &[Seg::rule(" │ "), Seg::glow("▅▆▇█▄▅▆▇█▄▅▆"), Seg::rule("        │")],
             &[Seg::rule(" │ "), Seg::faint("▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁"), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::rule(" ❯ "), Seg::glow("▊"), Seg::rule("                │")],
-            &[Seg::rule(" ╰─────────────────────╯")],
+            &[Seg::rule(" ╰                     ╯")],
         ],
     },
     Art {
         name: "circuit",
         rows: &[
-            &[Seg::rule(" ╭────────────────────────╮")],
+            &[Seg::rule(" ╭                        ╮")],
             &[Seg::rule(" │ "), Seg::glow(" ●"), Seg::rule("───"), Seg::glow("●"), Seg::rule("────●"), Seg::rule("            │")],
             &[Seg::rule(" │ "), Seg::rule(" │"), Seg::faint("        │      ╭─╯"), Seg::rule("   │")],
             &[Seg::rule(" │ "), Seg::rule(" │   ┌────┤      │"), Seg::rule("     │")],
@@ -309,14 +309,14 @@ pub const LOGOS: &[Art] = &[
             &[Seg::rule(" │ "), Seg::faint("       ╰────●──╮"), Seg::rule("       │")],
             &[Seg::rule(" │ "), Seg::accent("            ╰─●"), Seg::rule("        │")],
             &[Seg::rule(" │ "), Seg::faint("               ╰──── ⚡"), Seg::rule(" │")],
-            &[Seg::rule(" ╰────────────────────────╯")],
+            &[Seg::rule(" ╰                        ╯")],
         ],
     },
     // Adapted from asciiart.eu (Tux, jgs) — redrawn to fit the band.
     Art {
         name: "tux",
         rows: &[
-            &[Seg::rule(" ╭──────────────╮")],
+            &[Seg::rule(" ╭              ╮")],
             &[Seg::rule(" │ "), Seg::faint("   .--."), Seg::rule("      │")],
             &[Seg::rule(" │ "), Seg::rule("  |"), Seg::glow("o_o"), Seg::rule(" |"), Seg::rule("     │")],
             &[Seg::rule(" │ "), Seg::rule("  |"), Seg::glow(":_/"), Seg::rule(" |"), Seg::rule("     │")],
@@ -324,28 +324,28 @@ pub const LOGOS: &[Art] = &[
             &[Seg::rule(" │ "), Seg::rule("(|     | )"), Seg::rule("   │")],
             &[Seg::rule(" │ "), Seg::rule("/'\\_   _/`\\"), Seg::rule("  │")],
             &[Seg::rule(" │ "), Seg::rule("\\___"), Seg::accent(")="), Seg::rule("(___/)"), Seg::rule(" │")],
-            &[Seg::rule(" ╰──────────────╯")],
+            &[Seg::rule(" ╰              ╯")],
         ],
     },
     // Adapted from asciiart.eu (space saucer) — redrawn to fit the band.
     Art {
         name: "ufo",
         rows: &[
-            &[Seg::rule(" ╭──────────────────╮")],
+            &[Seg::rule(" ╭                  ╮")],
             &[Seg::rule(" │ "), Seg::faint("        ___"), Seg::rule("      │")],
             &[Seg::rule(" │ "), Seg::faint("    _.-'   '-._"), Seg::rule("  │")],
             &[Seg::rule(" │ "), Seg::rule("   /  "), Seg::glow("o  o  o"), Seg::rule("  \\"), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::rule("   \\   ___   /"), Seg::rule("   │")],
             &[Seg::rule(" │ "), Seg::rule("    '-("), Seg::accent("___"), Seg::rule(")-'"), Seg::rule("    │")],
             &[Seg::rule(" │ "), Seg::faint("      '  '  '"), Seg::rule("    │")],
-            &[Seg::rule(" ╰──────────────────╯")],
+            &[Seg::rule(" ╰                  ╯")],
         ],
     },
     // Adapted from asciiart.eu (bug) — redrawn to fit the band.
     Art {
         name: "bug",
         rows: &[
-            &[Seg::rule(" ╭─────────────╮")],
+            &[Seg::rule(" ╭             ╮")],
             &[Seg::rule(" │ "), Seg::rule("\\ /"), Seg::rule("         │")],
             &[Seg::rule(" │ "), Seg::faint("    "), Seg::glow("oVo"), Seg::rule("     │")],
             &[Seg::rule(" │ "), Seg::rule("\\___"), Seg::accent("XXX"), Seg::rule("___/"), Seg::rule(" │")],
@@ -353,7 +353,7 @@ pub const LOGOS: &[Art] = &[
             &[Seg::rule(" │ "), Seg::rule("/__"), Seg::accent("XXXXX"), Seg::rule("__\\"), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::rule("/   "), Seg::accent("XXX"), Seg::rule("   \\"), Seg::rule(" │")],
             &[Seg::rule(" │ "), Seg::faint("     V"), Seg::rule("      │")],
-            &[Seg::rule(" ╰─────────────╯")],
+            &[Seg::rule(" ╰             ╯")],
         ],
     },
 ];
