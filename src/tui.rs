@@ -1018,6 +1018,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/branch", "branch a new session from a checkpoint"),
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
+    ("/update", "check for a new release and install it"),
     ("/mcp", "external MCP tool servers · status"),
     ("/lsp", "language servers · status"),
     ("/diff", "show uncommitted git changes"),
