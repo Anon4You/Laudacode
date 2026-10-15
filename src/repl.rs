@@ -466,6 +466,10 @@ pub enum WorkerCmd {
     CheckUpdate,
     /// Environment diagnostics for setup debugging (`/doctor`).
     Doctor,
+    /// Token/cost breakdown for this session (`/usage`).
+    Usage,
+    /// Park a session aside (`/archive`), or list parked ones.
+    Archive(Option<String>),
     Quit,
 }
 
@@ -1244,6 +1248,85 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 out.push_str("  note       provider not probed (that would spend tokens)");
                 let _ = ev_tx.send(WorkerEvent::Info(out));
             }
+            WorkerCmd::Usage => {
+                let a = &app.agent;
+                let (tp, tc) = a.tot_usage;
+                let rates = crate::budget::rate_for(&a.model, &a.pricing);
+                let cost = a.session_cost();
+                let mut out = format!(
+                    "usage (this session):\n  tokens   : {:.1}k prompt + {:.1}k completion\n  cost     : ~${cost:.4} ({} @ ${}/1M in, ${}/1M out)\n",
+                    tp as f64 / 1000.0,
+                    tc as f64 / 1000.0,
+                    a.model,
+                    rates.input,
+                    rates.output,
+                );
+                match (a.limits.max_tokens, a.limits.max_cost_usd) {
+                    (None, None) => out.push_str("  budget   : no limits set\n"),
+                    _ => {
+                        let cap_t = a
+                            .limits
+                            .max_tokens
+                            .map(|m| format!("{}/{m} tok", tp + tc))
+                            .unwrap_or_else(|| format!("{} tok", tp + tc));
+                        let cap_c = a
+                            .limits
+                            .max_cost_usd
+                            .map(|m| format!("${cost:.4}/${m}"))
+                            .unwrap_or_else(|| format!("${cost:.4}"));
+                        out.push_str(&format!("  budget   : {cap_t} · {cap_c}\n"));
+                    }
+                }
+                out.push_str(&format!(
+                    "  context  : {} tok window (compact at {})",
+                    a.ctx_window,
+                    crate::budget::compact_threshold(a.ctx_window)
+                ));
+                let _ = ev_tx.send(WorkerEvent::Info(out));
+            }
+            WorkerCmd::Archive(target) => match target {
+                None => {
+                    let list = Session::list_archived();
+                    if list.is_empty() {
+                        let _ = ev_tx.send(WorkerEvent::Info(
+                            "no archived sessions — /archive <id|name> parks one aside".into(),
+                        ));
+                    } else {
+                        let mut out = String::from("archived sessions:\n");
+                        for (id, name) in list {
+                            match name {
+                                Some(n) => out.push_str(&format!("  {id} ({n})\n")),
+                                None => out.push_str(&format!("  {id}\n")),
+                            }
+                        }
+                        out.push_str("move a file back into sessions/ to resume it");
+                        let _ = ev_tx.send(WorkerEvent::Info(out));
+                    }
+                }
+                Some(r) => match Session::resolve(&r) {
+                    None => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!(
+                            "no session '{r}' — /session list to browse"
+                        )));
+                    }
+                    Some(s) if s.id == app.session.id => {
+                        let _ = ev_tx.send(WorkerEvent::Error(
+                            "cannot archive the live session — resume another one first".into(),
+                        ));
+                    }
+                    Some(s) => match Session::archive(&s.id) {
+                        Ok(_) => {
+                            let _ = ev_tx.send(WorkerEvent::Info(format!(
+                                "archived {} — hidden from /resume until moved back",
+                                s.id
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                        }
+                    },
+                },
+            },
             WorkerCmd::Diff => {
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
                 let out = rt.block_on(tools::run_shell(
@@ -2139,6 +2222,31 @@ impl App {
             tui.mode.label(),
             config_note
         )));
+        // Update notice from cache only — never blocks launch or spends data
+        // on a miss. A detached thread refreshes the cache silently so the
+        // *next* launch can report; failures stay invisible.
+        if let Some(tag) = crate::update::cached_tag() {
+            if crate::update::is_newer(&tag, crate::update::current_version()) {
+                tui.push(Entry::Info(format!("update available: {tag} — /update to install")));
+            }
+        }
+        std::thread::spawn(|| {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let Ok(client) = crate::api::build_web_client(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
+            ) else {
+                return;
+            };
+            if let Ok(tag) = rt.block_on(crate::update::fetch_latest_tag(&client)) {
+                crate::update::store_tag(&tag);
+            }
+        });
         if needs_setup {
             let presets = PROVIDER_PRESETS
                 .iter()
@@ -3163,8 +3271,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                    /agents       pick a specialist agent (or /agents <name>)      /session   rename · search · list\n\
                    /skills       search & pick a skill to use                   /resume    restore a previous session\n\
                    /compact      summarize history to free context              /export    save transcript as markdown\n\
-                   /retry        re-run the previous task                       /image     attach an image\n\
-                   /clear        reset conversation                             /quit      exit Laudacode\n\
+                    /retry        re-run the previous task                       /image     attach an image\n\
+                    /clear        reset conversation                             /quit      exit Laudacode\n\
+                    /usage        tokens & cost this session                    /archive   park a session aside\n\
                  FILES & DIFF\n\
                    /diff         show uncommitted git changes\n\
                    /review       specialist review of uncommitted changes\n\
@@ -3444,6 +3553,12 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         }
         "doctor" => {
             let _ = cmd.send(WorkerCmd::Doctor);
+        }
+        "usage" => {
+            let _ = cmd.send(WorkerCmd::Usage);
+        }
+        "archive" => {
+            let _ = cmd.send(WorkerCmd::Archive(arg.first().map(|s| s.to_string())));
         }
         "update" => {
             tui.set_status("checking for updates");
@@ -4537,6 +4652,8 @@ mod tests {
             "undo",
             "update",
             "doctor",
+            "usage",
+            "archive",
         ];
         for name in DISPATCHED {
             let entry = format!("/{name}");

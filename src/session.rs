@@ -332,6 +332,42 @@ impl Session {
         Ok(Some(session.id))
     }
 
+    /// Parked sessions live here: invisible to resume/search (the scans only
+    /// read top-level `.json` files) until moved back.
+    pub fn archived_dir() -> PathBuf {
+        Self::dir().join("archived")
+    }
+
+    /// Move a session aside by id, prefix, or name. Returns its id.
+    pub fn archive(id_or_name: &str) -> Result<Option<String>> {
+        let Some(session) = Self::resolve(id_or_name) else {
+            return Ok(None);
+        };
+        let archived = Self::archived_dir();
+        fs::create_dir_all(&archived).context("creating archive dir")?;
+        fs::rename(Self::path_for(&session.id), archived.join(format!("{}.json", session.id)))
+            .with_context(|| format!("archiving session '{}'", session.id))?;
+        Ok(Some(session.id))
+    }
+
+    /// Ids + names of parked sessions, newest first.
+    pub fn list_archived() -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(u64, String, Option<String>)> = Vec::new();
+        for entry in fs::read_dir(Self::archived_dir()).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = fs::read_to_string(&p) {
+                if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
+                    out.push((sess.created_unix, sess.id, sess.name));
+                }
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.0));
+        out.into_iter().map(|(_, id, name)| (id, name)).collect()
+    }
+
     /// Sessions whose id or name contain `kw` (case-insensitive), newest
     /// first, paired with a preview of the first user prompt.
     pub fn find_by_keyword(kw: &str, limit: usize) -> Vec<(Session, String)> {
@@ -604,6 +640,23 @@ mod tests {
         let b = Session::new();
         assert_ne!(a.id, b.id, "ids built from distinct nanos must differ");
         assert!(a.id.contains('-'));
+    }
+
+    #[test]
+    fn archive_parks_and_hides_from_resume() {
+        let (_g, _dir) = test_env();
+        let mut s = Session::new();
+        s.messages.push(Message::user("park me"));
+        s.save().unwrap();
+        let id = s.id.clone();
+        assert!(Session::resolve(&id).is_some());
+        assert_eq!(Session::archive(&id).unwrap().as_deref(), Some(id.as_str()));
+        // Gone from resume/search, listed under archived instead.
+        assert!(Session::resolve(&id).is_none());
+        assert!(Session::list_recent(10).iter().all(|(i, _, _, _)| *i != id));
+        let archived = Session::list_archived();
+        assert!(archived.iter().any(|(i, _)| *i == id), "{archived:?}");
+        std::fs::remove_dir_all(Session::dir()).ok();
     }
 
     #[test]

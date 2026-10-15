@@ -1655,7 +1655,8 @@ fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
 }
 
 /// Collect AGENTS.md instructions: global config one, then nearest ancestors
-/// up to the repo root (max 3 files, 8 KB each).
+/// up to the repo root (max 3 files, 8 KB each), then `<cwd>/AGENTS.md.local`
+/// which always wins a slot as the uncommitted local override.
 fn load_agents_md(cwd: &std::path::Path) -> String {
     let mut blocks: Vec<String> = Vec::new();
     let mut push_file = |p: &std::path::Path, label: &str| {
@@ -1689,6 +1690,15 @@ fn load_agents_md(cwd: &std::path::Path) -> String {
     }
     for p in chain.into_iter().rev() {
         push_file(&p, &format!("{} instructions", p.display()));
+    }
+    // Local override: uncommitted, cwd-only, always last (highest precedence)
+    // and exempt from the 3-file cap so it can never be crowded out.
+    if let Ok(raw) = std::fs::read_to_string(cwd.join("AGENTS.md.local")) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let body: String = trimmed.chars().take(8 * 1024).collect();
+            blocks.push(format!("--- local AGENTS.md.local ---\n{body}\n"));
+        }
     }
     if blocks.is_empty() {
         String::new()
@@ -2403,6 +2413,22 @@ mod tests {
         let out = load_agents_md(&tmp);
         // May pick up global config AGENTS.md if present, but never panics.
         let _ = out;
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn agents_md_local_override_wins_last_slot() {
+        let tmp = std::env::temp_dir().join(format!("lc-override-{}", std::process::id()));
+        // Unique subdir: ancestors must not contribute their own AGENTS.md.
+        let dir = tmp.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "committed rules\n").unwrap();
+        std::fs::write(dir.join("AGENTS.md.local"), "local secret rules\n").unwrap();
+        let out = load_agents_md(&dir);
+        let local = out.find("local AGENTS.md.local").expect("local block present");
+        let committed = out.find("committed rules").expect("committed block present");
+        assert!(committed < local, "local override must come last (highest precedence)");
+        assert!(out.contains("local secret rules"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
