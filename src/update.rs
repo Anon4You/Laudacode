@@ -171,14 +171,24 @@ pub fn install_from_tarball(tgz: &Path, dest_exe: &Path) -> Result<PathBuf> {
     let staged = stage.join("laudacode");
     anyhow::ensure!(staged.is_file(), "archive has no laudacode binary");
     let backup = dir.join("laudacode.bak");
-    // Best-effort backup of the running binary; install proceeds regardless.
-    std::fs::copy(dest_exe, &backup).ok();
-    std::fs::copy(&staged, dest_exe).with_context(|| {
+    std::fs::remove_file(&backup).ok();
+    // Rename (never overwrite) the destination: it is the *running* binary,
+    // and writing to a running executable fails with ETXTBSY on Linux while
+    // renaming it aside and creating a fresh file is fine.
+    std::fs::rename(dest_exe, &backup).with_context(|| {
         format!(
-            "installing to {} — not writable? rerun with sudo or check $PREFIX",
+            "moving aside {} — not writable? rerun with sudo or check $PREFIX",
             dest_exe.display()
         )
     })?;
+    if std::fs::copy(&staged, dest_exe).is_err() {
+        // Dest is gone but the old binary survives as backup; say so.
+        let _ = std::fs::rename(&backup, dest_exe);
+        bail!(
+            "installing to {} — not writable? previous binary restored",
+            dest_exe.display()
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
