@@ -464,6 +464,8 @@ pub enum WorkerCmd {
     SetEffect(String),
     /// Check GitHub releases and install a newer binary (`/update`).
     CheckUpdate,
+    /// Environment diagnostics for setup debugging (`/doctor`).
+    Doctor,
     Quit,
 }
 
@@ -583,9 +585,15 @@ fn run_update_check(
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    let tag = match rt.block_on(crate::update::fetch_latest_tag(&client)) {
-        Ok(t) => t,
-        Err(e) => return fail(e),
+    let tag = match crate::update::cached_tag() {
+        Some(t) => t,
+        None => match rt.block_on(crate::update::fetch_latest_tag(&client)) {
+            Ok(t) => {
+                crate::update::store_tag(&t);
+                t
+            }
+            Err(e) => return fail(e),
+        },
     };
     let current = crate::update::current_version();
     if !crate::update::is_newer(&tag, current) {
@@ -1193,6 +1201,48 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
                 run_update_check(&rt, &ev_tx, &approve_rx);
                 let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::Doctor => {
+                let mut out = String::from("doctor:\n");
+                for (k, v) in crate::doctor::env_rows() {
+                    out.push_str(&format!("  {k:<10} {v}\n"));
+                }
+                let a = &app.active;
+                let src = |f: &str| a.sources.get(f).map(String::as_str).unwrap_or("none");
+                out.push_str(&format!(
+                    "  provider   {} ({}) · model {} · key from {}\n",
+                    a.name,
+                    a.base_url,
+                    a.model,
+                    src("api_key")
+                ));
+                let mcp = if app.agent.mcp.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    let up = app
+                        .agent
+                        .mcp
+                        .servers
+                        .iter()
+                        .filter(|s| s.last_error.is_none())
+                        .count();
+                    format!("{up}/{} up — /mcp for detail", app.agent.mcp.servers.len())
+                };
+                let lsp = if app.agent.lsp.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    let up = app
+                        .agent
+                        .lsp
+                        .servers
+                        .iter()
+                        .filter(|s| s.is_running())
+                        .count();
+                    format!("{up}/{} running — /lsp for detail", app.agent.lsp.servers.len())
+                };
+                out.push_str(&format!("  mcp        {mcp}\n  lsp        {lsp}\n"));
+                out.push_str("  note       provider not probed (that would spend tokens)");
+                let _ = ev_tx.send(WorkerEvent::Info(out));
             }
             WorkerCmd::Diff => {
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
@@ -3121,6 +3171,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                    /undo [N]     revert file changes from the last N turns\n\
                     /init         analyze the project and write AGENTS.md\n\
                     /update       check for a new release and install it\n\
+                    /doctor       environment diagnostics (no network, no tokens)\n\
                   PROVIDER\n\
                    /provider     menu: add · use · edit · list\n\
                  INPUT & KEYS\n\
@@ -3390,6 +3441,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "status" => {
             tui.set_status("gathering status");
             let _ = cmd.send(WorkerCmd::Status);
+        }
+        "doctor" => {
+            let _ = cmd.send(WorkerCmd::Doctor);
         }
         "update" => {
             tui.set_status("checking for updates");
@@ -4482,6 +4536,7 @@ mod tests {
             "effect",
             "undo",
             "update",
+            "doctor",
         ];
         for name in DISPATCHED {
             let entry = format!("/{name}");

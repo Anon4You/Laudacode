@@ -344,6 +344,7 @@ banner is suppressed automatically under `--json`.
 | `/effect`            | ambient effects (petals · rain · lightning…) |
 | `/status`            | provider/model/session + token, cost, budget, hook, log & network state |
 | `/update`            | check GitHub releases and install a newer binary |
+| `/doctor`            | environment diagnostics (no network, no tokens) |
 | `/mcp`               | external MCP tool servers · connected, failed, or disabled |
 | `/session …`         | `rename` · `search` · `list` · `delete` sessions |
 | `/checkpoint [label]`| snapshot the conversation as a branch point    |

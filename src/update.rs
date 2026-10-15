@@ -11,6 +11,45 @@ use std::path::{Path, PathBuf};
 pub const REPO: &str = "Anon4You/Laudacode";
 /// Biggest asset we will download — phones have tight RAM budgets.
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a cached latest-tag stays valid. Unauthenticated GitHub API calls
+/// are capped at 60/hour per IP, and mobile networks share IPs — so repeated
+/// `/update` checks must not each burn a call.
+pub const CACHE_TTL_SECS: u64 = 3600;
+
+fn cache_path() -> PathBuf {
+    crate::session::Session::dir().join("update-check.json")
+}
+
+/// Latest tag from cache when fresh, otherwise `None`.
+pub fn cached_tag() -> Option<String> {
+    let raw = std::fs::read_to_string(cache_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let tag = v.get("tag")?.as_str()?.to_string();
+    let when = v.get("unix")?.as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(when) <= CACHE_TTL_SECS {
+        Some(tag)
+    } else {
+        None
+    }
+}
+
+/// Remember a fresh lookup. Best-effort: a missing sessions dir is not an
+/// update failure.
+pub fn store_tag(tag: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = serde_json::json!({ "tag": tag, "unix": now }).to_string();
+    if let Some(parent) = cache_path().parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(cache_path(), body).ok();
+}
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -275,6 +314,28 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"precious download");
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(&dl).ok();
+    }
+
+    #[test]
+    fn cache_roundtrip_expires_on_ttl() {
+        // Serialized with every other env-flipping test via the shared lock.
+        let _g = crate::session::test_sync::env_lock();
+        let old = std::env::var("LAUDACODE_SESSIONS_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("lc-upd-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
+        assert!(cached_tag().is_none());
+        store_tag("v9.9.9");
+        assert_eq!(cached_tag().as_deref(), Some("v9.9.9"));
+        // Backdate past the TTL: must read as a miss, not stale data.
+        let stale = serde_json::json!({ "tag": "v1.0.0", "unix": 1 }).to_string();
+        std::fs::write(dir.join("update-check.json"), stale).unwrap();
+        assert!(cached_tag().is_none());
+        match old {
+            Some(v) => std::env::set_var("LAUDACODE_SESSIONS_DIR", v),
+            None => std::env::remove_var("LAUDACODE_SESSIONS_DIR"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod budget;
 mod cli;
 mod config;
 mod diff;
+mod doctor;
 mod effects;
 mod images;
 mod logging;
