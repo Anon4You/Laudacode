@@ -214,8 +214,41 @@ pub fn verify_against_sums(asset: &Path, sums: &str) -> Result<()> {
     bail!("no sha256 tool found (sha256sum/shasum) — refusing to install unverified binary")
 }
 
+/// True when we can write next to `dest_exe` without elevation. Probed with
+/// a real create+remove — permission bits alone lie (ACLs, root, mounts).
+pub fn dest_writable(dest_exe: &Path) -> bool {
+    let Some(dir) = dest_exe.parent() else {
+        return false;
+    };
+    let probe = dir.join(format!(".lc-write-test-{}", std::process::id()));
+    if std::fs::write(&probe, b"x").is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&probe);
+    true
+}
+
+/// Run `sudo` with the given argv, returning stderr on failure for the error
+/// message. Sudo may ask for a password on the terminal.
+fn sudo_run(args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new("sudo")
+        .args(args)
+        .output()
+        .context("running sudo — is it installed?")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.lines().next().unwrap_or("sudo failed").trim();
+    bail!("sudo {err}");
+}
+
 /// Extract the `laudacode` binary from `tgz` and install it over `dest_exe`.
 /// The previous binary is kept next to it as `laudacode.bak`.
+///
+/// On Linux the binary usually lives in a root-owned dir (`/usr/local/bin`),
+/// so an unwritable destination falls back to `sudo install` (Termux's
+/// `$PREFIX/bin` is user-writable and never takes this path).
 ///
 /// Extracts in its own staging dir: the caller downloads `tgz` into a
 /// *different* dir, and this must never delete it (wiping a shared dir here
@@ -238,7 +271,26 @@ pub fn install_from_tarball(tgz: &Path, dest_exe: &Path) -> Result<PathBuf> {
     let staged = stage.join("laudacode");
     anyhow::ensure!(staged.is_file(), "archive has no laudacode binary");
     let backup = dir.join("laudacode.bak");
-    std::fs::remove_file(&backup).ok();
+    if !dest_writable(dest_exe) {
+        if !crate::doctor::have("sudo") {
+            bail!(
+                "cannot write to {} and sudo is not installed — rerun laudacode as root or install to a user-owned dir",
+                dest_exe.display()
+            );
+        }
+        let dest = dest_exe.to_string_lossy();
+        let bak = backup.to_string_lossy();
+        let staged_s = staged.to_string_lossy();
+        sudo_run(&["rm", "-f", &bak])?;
+        // Rename aside first (dest may be the running binary — same ETXTBSY
+        // rule as the unprivileged path below).
+        sudo_run(&["mv", &dest, &bak])?;
+        if let Err(e) = sudo_run(&["install", "-m", "755", &staged_s, &dest]) {
+            let _ = sudo_run(&["mv", &bak, &dest]);
+            return Err(e.context("install failed — previous binary restored"));
+        }
+    } else {
+        std::fs::remove_file(&backup).ok();
     // Rename (never overwrite) the destination: it is the *running* binary,
     // and writing to a running executable fails with ETXTBSY on Linux while
     // renaming it aside and creating a fresh file is fine.
@@ -256,8 +308,11 @@ pub fn install_from_tarball(tgz: &Path, dest_exe: &Path) -> Result<PathBuf> {
             dest_exe.display()
         );
     }
+    }
     #[cfg(unix)]
     {
+        // No-op on the sudo path (already 755, and the file isn't ours) —
+        // required on the direct path.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dest_exe, std::fs::Permissions::from_mode(0o755)).ok();
     }
@@ -344,9 +399,27 @@ mod tests {
         std::fs::remove_dir_all(&dl).ok();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn pct_clamps_and_handles_unknown_totals() {
-        assert_eq!(pct(0, Some(100)), Some(0));
+    fn dest_writable_detects_read_only_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("lc-writable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let rw = base.join("rw");
+        let ro = base.join("ro");
+        std::fs::create_dir_all(&rw).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        assert!(dest_writable(&rw.join("laudacode")));
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(!dest_writable(&ro.join("laudacode")), "read-only dir must fail the probe");
+        // Missing parent dir is not writable either (probe must not create it).
+        assert!(!dest_writable(&base.join("nope").join("laudacode")));
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn pct_clamps_and_handles_unknown_totals() {        assert_eq!(pct(0, Some(100)), Some(0));
         assert_eq!(pct(50, Some(100)), Some(50));
         assert_eq!(pct(100, Some(100)), Some(100));
         assert_eq!(pct(999, Some(100)), Some(100));
