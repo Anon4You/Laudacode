@@ -606,13 +606,6 @@ fn run_update_check(
     if !crate::update::is_newer(&tag, current) {
         return info(format!("already on latest (v{current})"));
     }
-    // Reuse the y/n approval dialog: Enter and Esc both decline.
-    let _ = ev_tx.send(WorkerEvent::NeedApproval(format!(
-        "new version {tag} available (you have v{current}) — download and install now?"
-    )));
-    if approve_rx.lock().unwrap().recv() != Ok(true) {
-        return info("update skipped — run /update any time".into());
-    }
     let targets = crate::update::detect_targets();
     if targets.is_empty() {
         return fail(anyhow::anyhow!(
@@ -623,6 +616,28 @@ fn run_update_check(
         Ok(e) => e,
         Err(e) => return fail(e.into()),
     };
+    // Toll check before any download: a root-owned install dir without sudo
+    // fails late and wastes the download. (Termux $PREFIX/bin is writable,
+    // so phones never take the sudo path.)
+    let needs_sudo = !crate::update::dest_writable(&exe);
+    if needs_sudo && !crate::doctor::have("sudo") {
+        return fail(anyhow::anyhow!(
+            "cannot write to {} and sudo is not installed — rerun laudacode as root or install to a user-owned dir",
+            exe.display()
+        ));
+    }
+    // Reuse the y/n approval dialog: Enter and Esc both decline.
+    let _ = ev_tx.send(WorkerEvent::NeedApproval(format!(
+        "new version {tag} available (you have v{current}) — download and install now?{}",
+        if needs_sudo {
+            " (needs sudo — have your password ready)"
+        } else {
+            ""
+        }
+    )));
+    if approve_rx.lock().unwrap().recv() != Ok(true) {
+        return info("update skipped — run /update any time".into());
+    }
     let stage = crate::update::download_dir();
     std::fs::create_dir_all(&stage).ok();
     let mut staged: Option<PathBuf> = None;
