@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::api::Message;
 
@@ -27,7 +27,7 @@ pub struct Checkpoint {
 /// A persisted conversation, auto-saved to the local data directory.
 /// Sessions carry a unique id (`<unix>-<rand>`) so they can be resumed
 /// explicitly (`laudacode resume <id>` or `/resume` in the TUI).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default = "session_schema_version")]
     pub schema_version: u32,
@@ -55,6 +55,21 @@ pub struct Session {
 
 fn is_zero_u64(n: &u64) -> bool {
     *n == 0
+}
+
+/// Drop data-URI images from a persisted copy. One screenshot can be tens of
+/// MB and would be rewritten into the session file on every autosave; keep a
+/// text hint when the image was a user's only content.
+pub fn strip_image_payloads(messages: &mut [Message]) {
+    for m in messages {
+        if m.images.is_empty() {
+            continue;
+        }
+        if m.content.as_deref().unwrap_or("").trim().is_empty() {
+            m.content = Some("[image omitted from the saved session]".into());
+        }
+        m.images.clear();
+    }
 }
 
 fn session_schema_version() -> u32 {
@@ -116,14 +131,21 @@ impl Session {
         let label = label
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty());
+        let mut messages = self.messages.clone();
+        strip_image_payloads(&mut messages);
         let cp = Checkpoint {
             id: format!("{}-{}", now, uuid_short()),
             label,
             created_unix: now,
             message_count: self.messages.len(),
-            messages: self.messages.clone(),
+            messages,
         };
         self.checkpoints.push(cp.clone());
+        // Each checkpoint is a full copy; keep the list bounded.
+        const MAX_CHECKPOINTS: usize = 10;
+        if self.checkpoints.len() > MAX_CHECKPOINTS {
+            self.checkpoints.remove(0);
+        }
         self.save()?;
         Ok(cp)
     }
@@ -256,28 +278,19 @@ impl Session {
         if needle.is_empty() {
             return None;
         }
-        let mut entries: Vec<_> = fs::read_dir(Self::dir()).ok()?.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(raw) = fs::read_to_string(&p) else {
-                continue;
-            };
-            if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
-                if sess
+        let mut found = None;
+        scan_sessions(&Self::dir(), &mut |sess| {
+            if found.is_none()
+                && sess
                     .name
                     .as_deref()
                     .map(|n| n.trim().to_lowercase() == needle)
                     .unwrap_or(false)
-                {
-                    return Some(sess);
-                }
+            {
+                found = Some(sess);
             }
-        }
-        None
+        });
+        found
     }
 
     /// Resolve a session from an exact id, a unique id prefix, or its name.
@@ -292,26 +305,18 @@ impl Session {
 
         let mut prefix_match: Option<Self> = None;
         if key.len() >= 6 {
-            let mut entries: Vec<_> = fs::read_dir(Self::dir()).ok()?.flatten().collect();
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Ok(raw) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(session) = serde_json::from_str::<Session>(&raw) else {
-                    continue;
-                };
+            let mut duplicate = false;
+            scan_sessions(&Self::dir(), &mut |session| {
                 if session.id.starts_with(&key) {
                     if prefix_match.is_some() {
-                        prefix_match = None;
-                        break;
+                        duplicate = true;
+                    } else {
+                        prefix_match = Some(session);
                     }
-                    prefix_match = Some(session);
                 }
+            });
+            if duplicate {
+                prefix_match = None;
             }
         }
         if prefix_match.is_some() {
@@ -353,17 +358,9 @@ impl Session {
     /// Ids + names of parked sessions, newest first.
     pub fn list_archived() -> Vec<(String, Option<String>)> {
         let mut out: Vec<(u64, String, Option<String>)> = Vec::new();
-        for entry in fs::read_dir(Self::archived_dir()).into_iter().flatten().flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(raw) = fs::read_to_string(&p) {
-                if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
-                    out.push((sess.created_unix, sess.id, sess.name));
-                }
-            }
-        }
+        scan_sessions(&Self::archived_dir(), &mut |sess| {
+            out.push((sess.created_unix, sess.id, sess.name));
+        });
         out.sort_by_key(|a| std::cmp::Reverse(a.0));
         out.into_iter().map(|(_, id, name)| (id, name)).collect()
     }
@@ -373,32 +370,24 @@ impl Session {
     pub fn find_by_keyword(kw: &str, limit: usize) -> Vec<(Session, String)> {
         let kw = kw.trim().to_lowercase();
         let mut hits: Vec<(u64, Session, String)> = Vec::new();
-        for entry in fs::read_dir(Self::dir()).into_iter().flatten().flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
+        scan_sessions(&Self::dir(), &mut |sess| {
+            let id_matches = sess.id.to_lowercase().contains(&kw);
+            let name_matches = sess
+                .name
+                .as_deref()
+                .map(|n| n.to_lowercase().contains(&kw))
+                .unwrap_or(false);
+            if kw.is_empty() || id_matches || name_matches {
+                let preview = sess
+                    .messages
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .and_then(|m| m.content.clone())
+                    .map(|c| c.replace('\n', " ").chars().take(48).collect::<String>())
+                    .unwrap_or_else(|| "(no prompt)".into());
+                hits.push((sess.created_unix, sess, preview));
             }
-            if let Ok(s) = fs::read_to_string(&p) {
-                if let Ok(sess) = serde_json::from_str::<Session>(&s) {
-                    let id_matches = sess.id.to_lowercase().contains(&kw);
-                    let name_matches = sess
-                        .name
-                        .as_deref()
-                        .map(|n| n.to_lowercase().contains(&kw))
-                        .unwrap_or(false);
-                    if kw.is_empty() || id_matches || name_matches {
-                        let preview = sess
-                            .messages
-                            .iter()
-                            .find(|m| m.role == "user")
-                            .and_then(|m| m.content.clone())
-                            .map(|c| c.replace('\n', " ").chars().take(48).collect::<String>())
-                            .unwrap_or_else(|| "(no prompt)".into());
-                        hits.push((sess.created_unix, sess, preview));
-                    }
-                }
-            }
-        }
+        });
         hits.sort_by_key(|a| std::cmp::Reverse(a.0));
         hits.truncate(limit);
         hits.into_iter().map(|(_, s, p)| (s, p)).collect()
@@ -419,7 +408,16 @@ impl Session {
         let path = Self::path_for(&self.id);
         let tmp = dir.join(format!(".{}.{}.tmp", self.id, uuid_short()));
         let result = (|| -> Result<()> {
-            let raw = serde_json::to_string_pretty(self)?;
+            // Persist a stripped snapshot: data-URI images are huge and would
+            // be rewritten on every autosave.
+            let mut snapshot = self.clone();
+            strip_image_payloads(&mut snapshot.messages);
+            for cp in &mut snapshot.checkpoints {
+                strip_image_payloads(&mut cp.messages);
+            }
+            // Compact, not pretty: this file is machine-read only and is
+            // rewritten after every turn.
+            let raw = serde_json::to_string(&snapshot)?;
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -433,7 +431,8 @@ impl Session {
             }
             file.write_all(raw.as_bytes())
                 .context("writing session data")?;
-            file.sync_all().context("syncing session data")?;
+            // No per-turn fsync: the rename is still atomic, and losing the
+            // last autosave on power loss is acceptable.
             fs::rename(&tmp, &path)
                 .with_context(|| format!("replacing session {}", path.display()))?;
             Ok(())
@@ -449,24 +448,16 @@ impl Session {
     /// Entry: `(id, name, created_unix, preview)`.
     pub fn list_recent(limit: usize) -> Vec<(String, Option<String>, u64, String)> {
         let mut out: Vec<(u64, String, Option<String>, String)> = Vec::new();
-        for entry in fs::read_dir(Self::dir()).into_iter().flatten().flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(s) = fs::read_to_string(&p) {
-                if let Ok(sess) = serde_json::from_str::<Session>(&s) {
-                    let preview = sess
-                        .messages
-                        .iter()
-                        .find(|m| m.role == "user")
-                        .and_then(|m| m.content.clone())
-                        .map(|c| c.replace('\n', " ").chars().take(64).collect::<String>())
-                        .unwrap_or_else(|| "(no prompt)".into());
-                    out.push((sess.created_unix, sess.id, sess.name, preview));
-                }
-            }
-        }
+        scan_sessions(&Self::dir(), &mut |sess| {
+            let preview = sess
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.clone())
+                .map(|c| c.replace('\n', " ").chars().take(64).collect::<String>())
+                .unwrap_or_else(|| "(no prompt)".into());
+            out.push((sess.created_unix, sess.id, sess.name, preview));
+        });
         out.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         out.truncate(limit);
         out.into_iter()
@@ -477,19 +468,8 @@ impl Session {
     /// Load the most recent session (for `--continue`). Ties on created_unix
     /// are broken by id so same-second saves resolve newest-first.
     pub fn latest() -> Option<Session> {
-        let dir = Self::dir();
         let mut best: Option<(u64, String, Session)> = None;
-        for entry in fs::read_dir(dir).ok()?.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(raw) = fs::read_to_string(&p) else {
-                continue;
-            };
-            let Ok(session) = serde_json::from_str::<Session>(&raw) else {
-                continue;
-            };
+        scan_sessions(&Self::dir(), &mut |session| {
             let newer = match &best {
                 Some((created, id, _)) => {
                     session.created_unix > *created
@@ -500,8 +480,30 @@ impl Session {
             if newer {
                 best = Some((session.created_unix, session.id.clone(), session));
             }
-        }
+        });
         best.map(|(_, _, session)| session)
+    }
+}
+
+/// Feed every parseable top-level `.json` session in `dir` to `visit`, in
+/// stable filename order. Subdirectories (the archive) are not visited.
+fn scan_sessions(dir: &Path, visit: &mut dyn FnMut(Session)) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&p) else {
+            continue;
+        };
+        if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
+            visit(sess);
+        }
     }
 }
 
@@ -613,6 +615,19 @@ mod tests {
         assert_eq!(loaded.checkpoints[0].label.as_deref(), Some("cp"));
         assert!(loaded.checkpoint_list().contains("cp"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_files_do_not_store_image_payloads() {
+        let (_g, _dir) = test_env();
+        let mut s = Session::new();
+        s.messages
+            .push(Message::user_with_images("", vec!["data:image/png;base64,AAAA".into()]));
+        s.save().unwrap();
+        let raw = std::fs::read_to_string(Session::path_for(&s.id)).unwrap();
+        assert!(!raw.contains("base64"), "image payload was persisted: {raw}");
+        assert!(raw.contains("image omitted"), "{raw}");
+        std::fs::remove_dir_all(Session::dir()).ok();
     }
 
     #[test]

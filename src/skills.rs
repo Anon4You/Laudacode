@@ -161,7 +161,9 @@ fn picker_items_for(skills: &[Skill]) -> Vec<String> {
 /// prose away, so every such skill shows up in the picker as ">". Folded (`>`,
 /// spaces) and literal (`|`, newlines) scalars are both handled, with the
 /// `-`/`+` chomping indicators tolerated.
-fn split_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, String>, String) {
+pub(crate) fn split_frontmatter(
+    raw: &str,
+) -> (std::collections::BTreeMap<String, String>, String) {
     let mut map = std::collections::BTreeMap::new();
     let trimmed = raw.trim_start();
     let Some(rest) = trimmed.strip_prefix("---") else {

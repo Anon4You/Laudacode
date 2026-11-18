@@ -492,8 +492,6 @@ pub const MANUAL_MODEL_ITEM: &str = "(+ type a model name instead)";
 struct WorkerBridge {
     tx: Sender<WorkerEvent>,
     approve_rx: Arc<std::sync::Mutex<Receiver<bool>>>,
-    #[allow(dead_code)]
-    cancel: Arc<AtomicBool>,
 }
 
 impl UiSink for WorkerBridge {
@@ -524,7 +522,6 @@ impl UiSink for WorkerBridge {
             inner: WorkerBridge {
                 tx: self.tx.clone(),
                 approve_rx: self.approve_rx.clone(),
-                cancel: self.cancel.clone(),
             },
             prefix: format!("[{prefix}] "),
         })
@@ -1010,7 +1007,6 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let mut bridge = WorkerBridge {
                         tx: ev_tx.clone(),
                         approve_rx: approve_rx.clone(),
-                        cancel: cancel.clone(),
                     };
                     match rt.block_on(app.agent.run_turn(
                         INIT_PROMPT,
@@ -1407,7 +1403,6 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         inner: WorkerBridge {
                             tx: ev_tx.clone(),
                             approve_rx: approve_rx.clone(),
-                            cancel: cancel.clone(),
                         },
                         prefix: "[review] ".to_string(),
                     });
@@ -1415,8 +1410,16 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let model = app.agent.model.clone();
                     let cwd = app.agent.cwd.clone();
                     let mode = app.agent.mode;
+                    let permissions = app.agent.permissions.clone();
                     let res = rt.block_on(crate::agents::run_sub_agent(
-                        &client, &model, &cwd, mode, "reviewer", &task, sink,
+                        &client,
+                        &model,
+                        &cwd,
+                        mode,
+                        &permissions,
+                        "reviewer",
+                        &task,
+                        sink,
                     ));
                     // `/review` is a delegation too — charge it, or a free
                     // full-repo review bypasses `max_cost_usd` entirely.
@@ -1770,7 +1773,6 @@ fn run_agent_turn(
     let mut bridge = WorkerBridge {
         tx: ev_tx.clone(),
         approve_rx: approve_rx.clone(),
-        cancel: cancel.clone(),
     };
     let res = rt.block_on(app.agent.run_turn(text, images, &mut bridge, Some(cancel)));
     if let Err(e) = res {
@@ -1808,33 +1810,10 @@ fn add_memory(cwd: &std::path::Path, note: &str) -> Result<String> {
 }
 
 /// Load + base64-encode an image file into a data URI (vision input).
-pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
-    const ALLOWED: &[(&str, &str)] = &[
-        ("png", "image/png"),
-        ("jpg", "image/jpeg"),
-        ("jpeg", "image/jpeg"),
-        ("webp", "image/webp"),
-        ("gif", "image/gif"),
-    ];
-    let p = PathBuf::from(path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-    let mime = ALLOWED
-        .iter()
-        .find(|(e, _)| *e == ext)
-        .map(|(_, m)| *m)
-        .with_context(|| format!("unsupported image type '.{ext}' — use png/jpg/jpeg/webp/gif"))?;
-    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-    if bytes.len() > 8 * 1024 * 1024 {
-        bail!("image too large ({} bytes, limit 8 MiB)", bytes.len());
-    }
-    Ok(format!(
-        "data:{mime};base64,{}",
-        crate::api::base64_encode(&bytes)
-    ))
+pub fn load_image_data_uri(cwd: &std::path::Path, path: &str) -> Result<String> {
+    // Same bounded, signature-sniffing loader as view_image; the old CLI path
+    // read the whole file before checking its size.
+    crate::images::load_data_uri(cwd, path)
 }
 
 /// Replace the live conversation with a stored session. Returns a status
@@ -2009,7 +1988,8 @@ pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
             let Ok(raw) = std::fs::read_to_string(f.path()) else {
                 continue;
             };
-            let (description, template) = split_frontmatter(&raw);
+            let (fm, template) = crate::skills::split_frontmatter(&raw);
+            let description = fm.get("description").cloned().unwrap_or_default();
             let cmd_name = name.trim_end_matches(".md").to_string();
             out.retain(|c: &CustomCmd| c.name != cmd_name); // later dir wins
             out.push(CustomCmd {
@@ -2020,25 +2000,6 @@ pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
         }
     }
     out
-}
-
-/// Split optional `--- description: … ---` frontmatter from the body.
-fn split_frontmatter(raw: &str) -> (String, String) {
-    let trimmed = raw.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            let head = &rest[..end];
-            let body = rest[end + 4..].trim_start_matches('\n').to_string();
-            let mut description = String::new();
-            for line in head.lines() {
-                if let Some(v) = line.trim().strip_prefix("description:") {
-                    description = v.trim().to_string();
-                }
-            }
-            return (description, body);
-        }
-    }
-    (String::new(), trimmed.to_string())
 }
 
 /// Render a command template:
@@ -2129,8 +2090,6 @@ pub struct App {
     pub pending_images: Vec<String>,
     /// Entries to replay into the TUI on start (set by session restores).
     pub pending_transcript: Vec<Entry>,
-    /// Custom commands loaded at startup (kept for submission routing).
-    pending_custom_cmds: Vec<CustomCmd>,
 }
 
 /// Summary of a finished TUI session, used for the exit resume hint.
@@ -2217,7 +2176,6 @@ impl App {
                 .map(|c| (c.name.clone(), c.description.clone()))
                 .collect(),
         );
-        self.pending_custom_cmds = custom_cmds;
         let config_note = if placeholder_key(&self.active.api_key) {
             format!(
                 "\n⚠ API key looks like a placeholder — fix {} or unset OPENAI_API_KEY",
@@ -2639,27 +2597,25 @@ impl App {
                         tui.push(Entry::User(format!("⏳ {text}")));
                         tui.dash.messages += 1;
                         tui.set_status("queued");
-                        let prompt = if text.starts_with('/') {
-                            text
-                        } else {
-                            expand_at_files(&text, &project_cwd)
-                        };
+                        // A queued custom command must be rendered too; sending
+                        // the raw `/name` would hit "unknown command" later.
+                        let prompt = expand_custom_command(tui, &text, &project_cwd).unwrap_or_else(
+                            || {
+                                if text.starts_with('/') {
+                                    text
+                                } else {
+                                    expand_at_files(&text, &project_cwd)
+                                }
+                            },
+                        );
                         let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
                     } else {
-                        let mut prompt = text.clone();
+                        let prompt = text.clone();
                         // Custom commands take priority over built-ins.
-                        if prompt.starts_with('/') {
-                            let (head, rest) = match prompt.split_once(' ') {
-                                Some((h, r)) => (h.to_string(), r.to_string()),
-                                None => (prompt.clone(), String::new()),
-                            };
-                            let bare = head.trim_start_matches('/');
-                            if let Some(cc) = custom_lookup(tui, bare) {
-                                tui.push(Entry::User(text.clone()));
-                                prompt = render_command_template(&cc.template, &rest, &project_cwd);
-                                let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
-                                return true;
-                            }
+                        if let Some(rendered) = expand_custom_command(tui, &text, &project_cwd) {
+                            tui.push(Entry::User(text.clone()));
+                            let _ = ui_cmd.send(WorkerCmd::Submit(rendered));
+                            return true;
                         }
                         if text.starts_with('#') || text.starts_with('!') {
                             // Memory notes / shell passthrough run even while busy.
@@ -2869,7 +2825,6 @@ impl App {
             ctx_window,
             pending_images: vec![],
             pending_transcript: vec![],
-            pending_custom_cmds: vec![],
         })
     }
 
@@ -2908,7 +2863,6 @@ impl App {
             ctx_window,
             pending_images: vec![],
             pending_transcript: vec![],
-            pending_custom_cmds: vec![],
         })
     }
 
@@ -2954,6 +2908,7 @@ impl App {
             }
         }
         self.session.messages = self.agent.messages.clone();
+        crate::session::strip_image_payloads(&mut self.session.messages);
         // Carry the token totals so `/status` and `[limits]` survive a resume
         // instead of restarting from zero and letting the budget refill.
         self.session.prompt_tokens = self.agent.tot_usage.0;
@@ -3177,6 +3132,14 @@ fn home_shortened(p: &std::path::Path) -> String {
             .unwrap_or_else(|_| p.display().to_string()),
         None => p.display().to_string(),
     }
+}
+
+/// Render `/<name> args` when it names a user command, else None.
+fn expand_custom_command(tui: &Tui, text: &str, cwd: &std::path::Path) -> Option<String> {
+    let rest = text.strip_prefix('/')?;
+    let (head, args) = rest.split_once(' ').unwrap_or((rest, ""));
+    let cc = custom_lookup(tui, head)?;
+    Some(render_command_template(&cc.template, args, cwd))
 }
 
 /// Find a user-defined command by bare name in the TUI's loaded lists.

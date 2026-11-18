@@ -52,14 +52,18 @@ pub enum Hunk {
 }
 
 impl Hunk {
-    /// The path whose safety/danger classifies this hunk (move target wins).
-    pub fn classify_path(&self) -> &Path {
+    /// Every path this hunk can read or write. A move affects both the source
+    /// and the destination, so checking only the destination is a bypass.
+    pub fn paths(&self) -> Vec<&Path> {
         match self {
-            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => path,
-            Hunk::UpdateFile {
-                move_path: Some(p), ..
-            } => p,
-            Hunk::UpdateFile { path, .. } => path,
+            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path],
+            Hunk::UpdateFile { path, move_path, .. } => {
+                let mut out = vec![path.as_path()];
+                if let Some(dest) = move_path {
+                    out.push(dest.as_path());
+                }
+                out
+            }
         }
     }
 

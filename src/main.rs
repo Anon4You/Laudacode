@@ -98,24 +98,39 @@ struct Overrides {
 /// Merge `[profiles.<name>]` defaults underneath the CLI flags.
 /// Precedence: CLI flags > profile > env > config (env is handled later
 /// inside `Config::resolve_active`).
-fn apply_profile(config: &Config, cli: &Cli) -> Result<Overrides> {
-    let profile: Option<&Profile> = match cli.profile.as_deref() {
-        Some(name) => Some(config.profiles.get(name).with_context(|| {
-            format!(
-                "profile '{name}' not found in {}",
-                Config::toml_path().display()
-            )
-        })?),
+fn apply_profile(config: &mut Config, cli: &Cli) -> Result<Overrides> {
+    let profile: Option<Profile> = match cli.profile.as_deref() {
+        Some(name) => Some(
+            config
+                .profiles
+                .get(name)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "profile '{name}' not found in {}",
+                        Config::toml_path().display()
+                    )
+                })?,
+        ),
         None => None,
     };
     let provider = cli
         .provider
         .clone()
-        .or_else(|| profile.and_then(|p| p.provider.clone()));
+        .or_else(|| profile.as_ref().and_then(|p| p.provider.clone()));
     let model = cli
         .model
         .clone()
-        .or_else(|| profile.and_then(|p| p.model.clone()));
+        .or_else(|| profile.as_ref().and_then(|p| p.model.clone()));
+    // Reasoning effort is not a CLI override; it becomes the config-level
+    // default. A provider-specific setting and OPENAI_REASONING_EFFORT still
+    // take precedence inside `resolve_active`.
+    if let Some(effort) = profile
+        .as_ref()
+        .and_then(|p| p.model_reasoning_effort.clone())
+    {
+        config.model_reasoning_effort = Some(effort);
+    }
     let mode =
         if cli.full_auto {
             Some(ApprovalMode::FullAuto)
@@ -125,6 +140,7 @@ fn apply_profile(config: &Config, cli: &Cli) -> Result<Overrides> {
             })?)
         } else {
             profile
+                .as_ref()
                 .and_then(|p| p.approval_policy.as_deref())
                 .and_then(ApprovalMode::parse)
         };
@@ -151,10 +167,10 @@ fn load_images(cli: &Cli) -> Result<Vec<String>> {
 
 fn build_app(cli: &Cli) -> Result<App> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     // Transport settings must be installed before any client is built.
     api::set_default_network(&config.network);
-    let ov = apply_profile(&config, cli)?;
+    let ov = apply_profile(&mut config, cli)?;
     let mut app = App::build_with_config(
         cwd,
         config,

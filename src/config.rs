@@ -49,7 +49,11 @@ pub struct Profile {
         alias = "approval_mode"
     )]
     pub approval_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning_effort"
+    )]
     pub model_reasoning_effort: Option<String>,
 }
 
@@ -884,6 +888,16 @@ mod tests {
         assert!(!serde_json::to_string(&a.sources)
             .unwrap()
             .contains("env-key"));
+    }
+
+    #[test]
+    fn profile_accepts_reasoning_effort_alias() {
+        let cfg: Config =
+            toml::from_str("[profiles.fast]\nreasoning_effort = \"low\"").unwrap();
+        assert_eq!(
+            cfg.profiles["fast"].model_reasoning_effort.as_deref(),
+            Some("low")
+        );
     }
 
     #[test]

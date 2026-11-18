@@ -109,11 +109,10 @@ impl Logger {
         }
     }
 
-    pub fn tool(&self, name: &str, ok: bool, detail: &str) {
-        // Tool arguments/outputs can be huge or sensitive; record a short
-        // label only.
-        let detail: String = detail.chars().take(200).collect();
-        self.event("tool", json!({ "tool": name, "ok": ok, "detail": detail }));
+    pub fn tool(&self, name: &str, ok: bool) {
+        // Tool output is file contents or command output and can contain
+        // secrets; the outcome and name are all that belongs in a run log.
+        self.event("tool", json!({ "tool": name, "ok": ok }));
     }
 
     /// `prompt`/`completion` are cumulative session totals; `cost` is the
@@ -139,7 +138,7 @@ mod tests {
     fn inactive_logger_is_inert() {
         let l = Logger::from_config(&Logging::default());
         assert!(!l.is_active());
-        l.tool("grep", true, "x"); // must not panic or write anywhere
+        l.tool("grep", true); // must not panic or write anywhere
     }
 
     #[test]
@@ -155,7 +154,7 @@ mod tests {
         let l = Logger::from_config(&cfg);
         assert!(l.is_active());
         l.usage("gpt-x", 100, 20, 0.09);
-        l.tool("read_file", true, "src/main.rs");
+        l.tool("read_file", true);
         let raw = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = raw.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -164,6 +163,10 @@ mod tests {
         assert_eq!(first["prompt_tokens"], 100);
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["tool"], "read_file");
+        assert!(
+            second.get("detail").is_none(),
+            "tool output must not be logged: {second}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
