@@ -273,6 +273,15 @@ impl Agent {
         self.tot_usage.1 = self.tot_usage.1.saturating_add(completion);
     }
 
+    /// Forget undo history: switching conversations must not let `/undo`
+    /// restore pre-images captured under a different session.
+    pub(crate) fn reset_undo(&mut self) {
+        self.undo_stack.clear();
+        self.undo_bytes = 0;
+        self.last_undone = None;
+        self.turn_seq = 0;
+    }
+
     /// Revert file changes from the last `n` distinct agent turns (most recent
     /// first). Returns a summary of how many files were restored per turn.
     pub fn undo_turns(&mut self, n: usize) -> Result<String> {
@@ -342,60 +351,23 @@ impl Agent {
     /// there is nothing meaningful to snapshot. Git is in the same category:
     /// the user drives those with `git restore` / `git stash pop`.
     fn snapshot_for_undo(&mut self, action: &tools::Action) {
-        use tools::Action;
-        let paths: Vec<PathBuf> = match action {
-            Action::ListDir { .. }
-            | Action::ReadFile { .. }
-            | Action::ViewImage { .. }
-            | Action::FetchUrl { .. }
-            | Action::WebSearch { .. }
-            | Action::Grep { .. }
-            | Action::Glob { .. }
-            | Action::Git { .. }
-            | Action::RunCommand { .. }
-            | Action::StartProcess { .. }
-            | Action::PollProcess { .. }
-            | Action::WriteProcess { .. }
-            | Action::StopProcess { .. }
-            | Action::UpdatePlan { .. }
-            // An LSP query reads a file but never mutates one, so it must not
-            // drag a path into the post-edit hook set or the undo snapshot.
-            | Action::Lsp { .. } => Vec::new(),
-            Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
-                match tools::resolve_path_in(&self.cwd, path) {
-                    Ok(p) => vec![p],
-                    Err(_) => vec![],
-                }
-            }
-            Action::ApplyPatch { patch } => {
-                let Ok(hunks) = crate::patch::parse_patch(patch) else {
-                    return;
-                };
-                hunks
-                    .iter()
-                    .flat_map(|h| h.paths())
-                    .filter_map(|p| {
-                        tools::resolve_path_in(&self.cwd, &p.to_string_lossy()).ok()
-                    })
-                    .collect()
-            }
-        };
         // Even when nothing is snapshotted, clear the previous action's list
         // so hooks never fire against a stale set of files.
-        self.last_touched = paths.clone();
-        for p in paths {
-            let prev = match std::fs::read(&p) {
-                Ok(bytes) => {
-                    if bytes.len() as u64 > MAX_UNDO_FILE_BYTES {
-                        continue;
-                    }
-                    Some(bytes)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                // A pre-existing file we cannot read must not be recorded as
-                // "did not exist": undo would then delete it.
-                Err(_) => continue,
-            };
+        self.last_touched = mutation_paths(&self.cwd, action);
+        let snapshots = self
+            .last_touched
+            .clone()
+            .into_iter()
+            .filter_map(|p| snapshot_preimage(&p).map(|before| (p, before)))
+            .collect();
+        self.record_snapshots(snapshots);
+    }
+
+    /// Add pre-images captured by delegated sub-agents to this agent's undo
+    /// stack. They run in their own loops, so their mutations would otherwise
+    /// be invisible to `/undo`.
+    pub(crate) fn record_snapshots(&mut self, snapshots: Vec<(PathBuf, Option<Vec<u8>>)>) {
+        for (p, prev) in snapshots {
             let size = prev.as_ref().map_or(0, |b| b.len());
             while self.undo_bytes.saturating_add(size) > MAX_UNDO_TOTAL_BYTES {
                 let oldest = self
@@ -544,6 +516,18 @@ Working rules:
             .sum()
     }
 
+    /// Keep the newest part of the transcript: compaction runs when the
+    /// conversation is over budget, and the current task lives at the end.
+    fn compact_excerpt(transcript: &str) -> String {
+        const MAX_CHARS: usize = 24_000;
+        let total = transcript.chars().count();
+        if total <= MAX_CHARS {
+            transcript.to_string()
+        } else {
+            transcript.chars().skip(total - MAX_CHARS).collect()
+        }
+    }
+
     /// Replace history with a short summary to free context window space.
     pub async fn compact(&mut self) -> Result<String> {
         if self.messages.len() <= 2 {
@@ -572,7 +556,7 @@ Working rules:
                  task(s), key decisions, files touched with paths, current state, and next steps. \
                  Max 300 words. Output only the summary.",
             ),
-            Message::user(transcript.chars().take(24_000).collect::<String>()),
+            Message::user(Self::compact_excerpt(&transcript)),
         ];
         let turn = self
             .client
@@ -625,7 +609,12 @@ Working rules:
 
     /// Fan a delegate call out to its specialists concurrently and collect
     /// their reports into one tool result.
-    async fn execute_delegate(&mut self, arguments: &str, ui: &mut dyn UiSink) -> String {
+    async fn execute_delegate(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn UiSink,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> String {
         let tasks = match crate::agents::parse_delegate_args(arguments) {
             Ok(t) => t,
             Err(e) => return format!("Error parsing delegate call: {e:#}"),
@@ -647,13 +636,24 @@ Working rules:
         let client = self.client.clone();
         let model = self.model.clone();
         let permissions = self.permissions.clone();
+        let budget = crate::agents::BudgetGuard::new(
+            &self.limits,
+            &self.model,
+            &self.pricing,
+            self.tot_usage.0,
+            self.tot_usage.1,
+        );
 
-        let futures = tasks.into_iter().map(|(name, task)| {
+        let sequential = budget.has_ceiling();
+        let futures: Vec<_> = tasks
+            .into_iter()
+            .map(|(name, task)| {
             let sink = ui.fork(&format!("[{name}]"));
             let client = client.clone();
             let model = model.clone();
             let cwd = cwd.clone();
             let permissions = permissions.clone();
+            let budget = budget.clone();
             async move {
                 crate::agents::run_sub_agent(
                     &client,
@@ -664,23 +664,58 @@ Working rules:
                     &name,
                     &task,
                     sink,
+                    cancel,
+                    budget,
                 )
                 .await
             }
-        });
-        let results = futures_util::future::join_all(futures).await;
+            })
+            .collect();
+        // With a token/cost ceiling, run one specialist at a time: a
+        // concurrent fan-out checks the same under-budget snapshot and can
+        // overshoot by one full round per sub-agent before any usage lands.
+        let results = if sequential {
+            let mut out = Vec::with_capacity(futures.len());
+            for f in futures {
+                out.push(f.await);
+            }
+            out
+        } else {
+            futures_util::future::join_all(futures).await
+        };
         // A delegate fan-out is real spend and must count against
         // `[limits] max_cost_usd` — before this, a 5-way delegation billed
         // as if it were free.
         let mut sub = (0u64, 0u64);
         let mut reports = Vec::with_capacity(results.len());
+        let mut mutations = Vec::new();
+        let mut touched: Vec<PathBuf> = Vec::new();
         for r in results {
             sub.0 = sub.0.saturating_add(r.usage.0);
             sub.1 = sub.1.saturating_add(r.usage.1);
             reports.push(r.report);
+            for m in r.mutations {
+                if !touched.contains(&m.path) {
+                    touched.push(m.path.clone());
+                }
+                mutations.push((m.path, m.before));
+            }
         }
         self.add_usage(sub.0, sub.1);
-        reports.join("\n\n")
+        self.record_snapshots(mutations);
+        self.last_touched = touched.clone();
+        let mut report = reports.join("\n\n");
+        if !touched.is_empty() {
+            if !self.hooks.post_edit.is_empty() {
+                let files: Vec<String> =
+                    touched.iter().map(|p| p.display().to_string()).collect();
+                report.push_str(&self.run_post_edit_hooks(&files).await);
+            }
+            if !self.lsp.is_empty() {
+                report.push_str(&self.post_edit_diagnostics(&touched).await);
+            }
+        }
+        report
     }
 
     /// Run one full agent turn: user input -> (tool calls)* -> final answer.
@@ -914,14 +949,16 @@ Working rules:
             // `delegate` spawns a whole sub-agent loop; keep it on the
             // sequential path so its progress and approvals interleave sanely.
             if tc.tool_name() == "delegate" {
-                let out = self.execute_delegate(&tc.function.arguments, ui).await;
+                let out = self
+                    .execute_delegate(&tc.function.arguments, ui, cancel)
+                    .await;
                 slots.push(Slot::Done(out));
                 continue;
             }
             // `lsp` needs the agent's live server connections, so it runs here
             // rather than in the standalone `Action` path.
             if tc.tool_name() == "lsp" {
-                let out = self.execute_lsp(&tc.function.arguments, ui).await;
+                let out = self.execute_lsp(&tc.function.arguments, ui, cancel).await;
                 slots.push(Slot::Done(out));
                 continue;
             }
@@ -929,7 +966,7 @@ Working rules:
             // tool is not a workspace mutation we can reason about.
             if tc.tool_name().starts_with(crate::mcp::PREFIX) {
                 let out = self
-                    .execute_mcp(tc.tool_name(), &tc.function.arguments, ui)
+                    .execute_mcp(tc.tool_name(), &tc.function.arguments, ui, cancel)
                     .await;
                 slots.push(Slot::Done(out));
                 continue;
@@ -968,12 +1005,16 @@ Working rules:
         // its action, so the futures borrow the slots in place; the borrow ends
         // once `join_all` has collected the owned outcomes.
         let cwd = self.cwd.clone();
+        let permissions = self.permissions.clone();
+        let filter = |p: &Path| read_path_allowed(&permissions, &cwd, p);
         if deferred.len() > 1 {
             // The payoff: overlapping process spawns and file reads instead of
             // one strictly-after-another round trip each.
             let outcomes =
                 futures_util::future::join_all(deferred.iter().map(|&i| match &slots[i] {
-                    Slot::Deferred(a, _) => a.perform_with_diff(&cwd, cancel),
+                    Slot::Deferred(a, _) => {
+                        a.perform_with_diff_filtered(&cwd, cancel, Some(&filter))
+                    }
                     Slot::Done(_) => unreachable!("only deferred slots are held back"),
                 }))
                 .await;
@@ -991,7 +1032,9 @@ Working rules:
                     Slot::Deferred(a, _) => a,
                     Slot::Done(_) => unreachable!(),
                 };
-                let outcome = action.perform_with_diff(&cwd, cancel).await;
+                let outcome = action
+                    .perform_with_diff_filtered(&cwd, cancel, Some(&filter))
+                    .await;
                 slots[i] = Slot::Deferred(action, outcome);
             }
         }
@@ -1016,7 +1059,12 @@ Working rules:
     /// which matters more here than it looks: a language server can hand back
     /// the contents of any file it has open, so a user who denied reading
     /// `.env` must not be able to route around that with `hover`.
-    async fn execute_lsp(&mut self, arguments: &str, ui: &mut dyn UiSink) -> String {
+    async fn execute_lsp(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn UiSink,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> String {
         let action = match tools::parse_tool_action("lsp", arguments) {
             Ok(a) => a,
             Err(e) => return format!("Error parsing lsp call: {e:#}"),
@@ -1102,20 +1150,20 @@ Working rules:
         });
 
         let out = match op.as_str() {
-            "diagnostics" => self.lsp_diagnostics(path.as_deref()).await,
+            "diagnostics" => self.lsp_diagnostics(path.as_deref(), cancel).await,
             "definition" => match &path {
-                Some(p) => self.lsp.definition(p, pos).await,
+                Some(p) => self.lsp.definition(p, pos, cancel).await,
                 None => Err(anyhow::anyhow!("definition needs a file")),
             },
             "references" => match &path {
-                Some(p) => self.lsp.references(p, pos).await,
+                Some(p) => self.lsp.references(p, pos, cancel).await,
                 None => Err(anyhow::anyhow!("references needs a file")),
             },
             "hover" => match &path {
-                Some(p) => self.lsp.hover(p, pos).await,
+                Some(p) => self.lsp.hover(p, pos, cancel).await,
                 None => Err(anyhow::anyhow!("hover needs a file")),
             },
-            "symbols" => self.lsp.symbols(path.as_deref(), query.as_deref()).await,
+            "symbols" => self.lsp.symbols(path.as_deref(), query.as_deref(), cancel).await,
             other => Err(anyhow::anyhow!("unsupported lsp op '{other}'")),
         };
 
@@ -1123,6 +1171,7 @@ Working rules:
             Ok(t) => (true, t),
             Err(e) => (false, format!("Error: {e:#}")),
         };
+        let text = crate::tools::truncate(&text);
         let preview: String = text
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -1141,8 +1190,12 @@ Working rules:
 
     /// Render diagnostics so an unfinished analysis can never be mistaken for
     /// a clean file.
-    async fn lsp_diagnostics(&mut self, path: Option<&std::path::Path>) -> anyhow::Result<String> {
-        let (files, settled) = self.lsp.diagnostics(path).await?;
+    async fn lsp_diagnostics(
+        &mut self,
+        path: Option<&std::path::Path>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<String> {
+        let (files, settled) = self.lsp.diagnostics(path, cancel).await?;
         if files.is_empty() {
             return Ok(if settled {
                 "(no diagnostics — the language server reported no problems)".to_string()
@@ -1234,7 +1287,13 @@ Working rules:
     /// BUILD and PLAN, silent only in FULL AUTO. Deny/ask/allow rules under
     /// `[permission.mcp]` are keyed on the qualified name, so a user can single
     /// out one tool without disabling the whole server.
-    async fn execute_mcp(&mut self, name: &str, arguments: &str, ui: &mut dyn UiSink) -> String {
+    async fn execute_mcp(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        ui: &mut dyn UiSink,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> String {
         let Some((idx, tool)) = self.mcp.resolve(name) else {
             return format!(
                 "Error: '{name}' is not a known MCP tool. It may belong to a server \
@@ -1285,7 +1344,7 @@ Working rules:
             serde_json::json!({ "tool": name, "summary": summary }),
         );
 
-        let result = self.mcp.call_tool(idx, &tool, arguments).await;
+        let result = self.mcp.call_tool(idx, &tool, arguments, cancel).await;
         match result {
             Ok(out) => {
                 let preview: String = out
@@ -1381,11 +1440,6 @@ Working rules:
             name: name.to_string(),
             summary: summary.clone(),
         });
-        self.logger.event(
-            "tool_start",
-            serde_json::json!({ "tool": name, "summary": summary }),
-        );
-
         // Approval gate. Permission rules take precedence for ordinary work,
         // but an allow rule never disables the outside-workspace barrier.
         let danger = action.danger(&self.cwd);
@@ -1397,7 +1451,15 @@ Working rules:
             match danger {
                 tools::Danger::Safe => true,
                 tools::Danger::High => ui.approve(action, danger),
-                tools::Danger::Moderate => true,
+                // BUILD auto-approves file edits, not shell commands. Only
+                // FULL AUTO may run commands and process control silently.
+                tools::Danger::Moderate => {
+                    if action.mutates_files() {
+                        self.mode != ApprovalMode::Suggest
+                    } else {
+                        self.mode == ApprovalMode::FullAuto || ui.approve(action, danger)
+                    }
+                }
             }
         };
         if !approved {
@@ -1406,6 +1468,10 @@ Working rules:
                     .to_string(),
             );
         }
+        self.logger.event(
+            "tool_start",
+            serde_json::json!({ "tool": name, "summary": summary }),
+        );
 
         // Snapshot pre-images so /undo can revert this turn's file changes.
         self.snapshot_for_undo(action);
@@ -1464,7 +1530,13 @@ Working rules:
             tools::Action::StopProcess { id } => {
                 self.processes.stop(*id).await.map(|s| (s, vec![]))
             }
-            _ => action.perform_with_diff(&self.cwd, cancel).await,
+            _ => {
+                let filter =
+                    |p: &Path| read_path_allowed(&self.permissions, &self.cwd, p);
+                action
+                    .perform_with_diff_filtered(&self.cwd, cancel, Some(&filter))
+                    .await
+            }
         }
     }
 
@@ -1514,6 +1586,7 @@ Working rules:
                         out.push_str(&diags);
                     }
                 }
+                let out = crate::tools::truncate(&out);
                 let preview: String = out
                     .lines()
                     .filter(|l| !l.trim().is_empty())
@@ -1554,7 +1627,7 @@ Working rules:
             if self.lsp.server_for_path(path).is_none() {
                 continue;
             }
-            match self.lsp_diagnostics(Some(path.as_path())).await {
+            match self.lsp_diagnostics(Some(path.as_path()), None).await {
                 Ok(text) if text.starts_with('(') && text.contains("no diagnostics") => {
                     out.push_str(&format!("\n[lsp] {}: {text}\n", path.display()));
                 }
@@ -1681,13 +1754,77 @@ fn real_path(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Paths an action may write. Used by both the orchestrator and delegated
+/// sub-agents so the undo stack sees every mutation.
+pub(crate) fn mutation_paths(cwd: &Path, action: &tools::Action) -> Vec<PathBuf> {
+    use tools::Action;
+    match action {
+        Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
+            tools::resolve_path_in(cwd, path).ok().into_iter().collect()
+        }
+        Action::ApplyPatch { patch } => {
+            let Ok(hunks) = crate::patch::parse_patch(patch) else {
+                return Vec::new();
+            };
+            hunks
+                .iter()
+                .flat_map(|h| h.paths())
+                .filter_map(|p| tools::resolve_path_in(cwd, &p.to_string_lossy()).ok())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Read pre-images (or `None` for a new file) for every path an action may
+/// write. Unreadable and over-cap files are skipped so undo never deletes or
+/// resurrects content it cannot faithfully restore.
+fn snapshot_preimage(path: &Path) -> Option<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= MAX_UNDO_FILE_BYTES => Some(Some(bytes)),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+pub(crate) fn mutation_snapshots(
+    cwd: &Path,
+    action: &tools::Action,
+) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    mutation_paths(cwd, action)
+        .into_iter()
+        .filter_map(|p| snapshot_preimage(&p).map(|before| (p, before)))
+        .collect()
+}
+
+/// Whether a file visited by a recursive search may be read. The root gate
+/// only sees the search root, so per-file deny/ask rules have to be applied to
+/// every candidate. Unapproved `ask` rules are skipped: a search cannot prompt
+/// once per file, and silently reading the file would bypass the rule.
+pub(crate) fn read_path_allowed(
+    permissions: &crate::permissions::Permissions,
+    cwd: &Path,
+    path: &Path,
+) -> bool {
+    use crate::permissions::Rule;
+    let inputs = path_inputs(cwd, path.to_string_lossy().as_ref());
+    if permissions.secret_blocked(&inputs).is_some() {
+        return false;
+    }
+    for input in &inputs {
+        match permissions.resolve("read", input) {
+            Some(Rule::Deny | Rule::Ask) => return false,
+            Some(Rule::Allow) | None => {}
+        }
+    }
+    true
+}
+
 /// (tool-key, input) pairs a given action should be permission-checked against.
 /// File paths are expanded to all their spellings; tool keys mirror config
 /// section names.
-pub(crate) fn permission_inputs(
-    action: &tools::Action,
-    cwd: &Path,
-) -> Vec<(&'static str, String)> {
+pub(crate) fn permission_inputs(action: &tools::Action, cwd: &Path) -> Vec<(&'static str, String)> {
     use tools::Action;
     let read = |p: &str| -> Vec<(&'static str, String)> {
         path_inputs(cwd, p)
@@ -1763,7 +1900,7 @@ pub(crate) fn permission_inputs(
     }
 }
 
-fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+pub(crate) fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
     cancel
         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(false)
@@ -1917,6 +2054,55 @@ mod tests {
         );
         assert_eq!(ApprovalMode::parse("ASK"), Some(ApprovalMode::Suggest));
         assert_eq!(ApprovalMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn compaction_keeps_the_recent_transcript() {
+        let joined = format!("{}{}", "old ".repeat(8_000), "recent decision");
+        let excerpt = Agent::compact_excerpt(&joined);
+        assert!(excerpt.ends_with("recent decision"));
+        assert!(!excerpt.starts_with("old "));
+        assert!(excerpt.chars().count() <= 24_000);
+        assert_eq!(Agent::compact_excerpt("short"), "short");
+    }
+
+    #[test]
+    fn auto_edit_asks_for_shell_but_not_file_edits() {
+        let mut agent = test_agent(&crate::config::Config::default());
+        agent.mode = ApprovalMode::AutoEdit;
+        let mut ui = RecordingUi::new(true);
+        let cmd = tools::Action::RunCommand {
+            command: "echo hi".into(),
+        };
+        assert!(agent.gate(&cmd, "run_command", &mut ui).is_ok());
+        assert!(
+            ui.events.iter().any(|e| e.starts_with("ask:$ echo hi")),
+            "BUILD auto-approved a shell command: {:?}",
+            ui.events
+        );
+
+        ui.events.clear();
+        let path = agent.cwd.join("gate-edit.txt");
+        let edit = tools::Action::EditFile {
+            path: path.to_string_lossy().into_owned(),
+            old: "a".into(),
+            new: "b".into(),
+        };
+        assert!(agent.gate(&edit, "edit_file", &mut ui).is_ok());
+        assert!(
+            !ui.events.iter().any(|e| e.starts_with("ask:")),
+            "BUILD prompted for an in-workspace edit: {:?}",
+            ui.events
+        );
+
+        ui.events.clear();
+        agent.mode = ApprovalMode::FullAuto;
+        assert!(agent.gate(&cmd, "run_command", &mut ui).is_ok());
+        assert!(
+            !ui.events.iter().any(|e| e.starts_with("ask:")),
+            "FULL AUTO prompted for a moderate command: {:?}",
+            ui.events
+        );
     }
 
     /// Records what the agent told the UI, and answers every approval with a
@@ -2255,7 +2441,6 @@ mod tests {
 
     #[test]
     fn mcp_calls_obey_plan_mode_and_permission_rules() {
-        use std::collections::BTreeMap;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2287,9 +2472,9 @@ mod tests {
         // PLAN mode: the server that did not opt in is refused outright, and
         // the one that did is asked for consent rather than silently run.
         agent.mode = ApprovalMode::Suggest;
-        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui));
+        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui, None));
         assert!(out.starts_with("Blocked:"), "got: {out}");
-        let out = rt.block_on(agent.execute_mcp("mcp__safe__read", "{}", &mut ui));
+        let out = rt.block_on(agent.execute_mcp("mcp__safe__read", "{}", &mut ui, None));
         assert!(
             ui.events.iter().any(|e| e == "ask:mcp__safe__read"),
             "{:?}",
@@ -2299,7 +2484,7 @@ mod tests {
         assert!(out.contains("DECLINED"), "got: {out}");
 
         // Unknown tool: a clear error, not a panic or a silent no-op.
-        let out = rt.block_on(agent.execute_mcp("mcp__ghost__read", "{}", &mut ui));
+        let out = rt.block_on(agent.execute_mcp("mcp__ghost__read", "{}", &mut ui, None));
         assert!(out.contains("not a known MCP tool"), "got: {out}");
 
         // Deny wins over everything, including FULL AUTO.
@@ -2311,7 +2496,7 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui));
+        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui, None));
         assert!(out.contains("denied in config"), "got: {out}");
 
         // An explicit ask rule still prompts under FULL AUTO, which is the
@@ -2324,7 +2509,7 @@ mod tests {
             ..Default::default()
         };
         let before = ui.events.len();
-        let _ = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui));
+        let _ = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui, None));
         assert!(
             ui.events[before..]
                 .iter()
@@ -2336,7 +2521,7 @@ mod tests {
         // And declining stops the call.
         ui.approve = false;
         let before = ui.events.len();
-        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui));
+        let out = rt.block_on(agent.execute_mcp("mcp__files__read", "{}", &mut ui, None));
         assert!(out.contains("DECLINED"), "got: {out}");
         assert!(
             !ui.events[before..].iter().any(|e| e.starts_with("start:")),
@@ -2376,7 +2561,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let text = match rt.block_on(agent.lsp_diagnostics(Some(&path))) {
+        let text = match rt.block_on(agent.lsp_diagnostics(Some(&path), None)) {
             Ok(t) => t,
             // A server that cannot even start is the loudest possible
             // failure, which is a fine outcome here.
@@ -2576,11 +2761,50 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "committed rules\n").unwrap();
         std::fs::write(dir.join("AGENTS.md.local"), "local secret rules\n").unwrap();
         let out = load_agents_md(&dir);
-        let local = out.find("local AGENTS.md.local").expect("local block present");
-        let committed = out.find("committed rules").expect("committed block present");
-        assert!(committed < local, "local override must come last (highest precedence)");
+        let local = out
+            .find("local AGENTS.md.local")
+            .expect("local block present");
+        let committed = out
+            .find("committed rules")
+            .expect("committed block present");
+        assert!(
+            committed < local,
+            "local override must come last (highest precedence)"
+        );
         assert!(out.contains("local secret rules"));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn recursive_read_filter_honours_per_file_rules_and_secrets() {
+        let cwd = std::env::temp_dir().join(format!("lc-read-filter-{}", std::process::id()));
+        let permissions: crate::permissions::Permissions = toml::from_str(
+            r#"
+[read]
+"*" = "allow"
+"secret/*" = "deny"
+"ask/*" = "ask"
+"#,
+        )
+        .unwrap();
+        assert!(!read_path_allowed(&permissions, &cwd, &cwd.join(".env")));
+        assert!(!read_path_allowed(&permissions, &cwd, &cwd.join("secret/x.txt")));
+        assert!(!read_path_allowed(&permissions, &cwd, &cwd.join("ask/x.txt")));
+        assert!(read_path_allowed(&permissions, &cwd, &cwd.join("ok.txt")));
+    }
+
+    #[test]
+    fn reset_undo_forgets_previous_session_preimages() {
+        let mut agent = test_agent(&crate::config::Config::default());
+        agent.turn_seq = 7;
+        agent.undo_bytes = 42;
+        agent.last_undone = Some(7);
+        agent.undo_stack.push((7, PathBuf::from("x"), None));
+        agent.reset_undo();
+        assert!(agent.undo_stack.is_empty());
+        assert_eq!(agent.undo_bytes, 0);
+        assert_eq!(agent.turn_seq, 0);
+        assert_eq!(agent.last_undone, None);
     }
 
     #[test]
@@ -2779,7 +3003,7 @@ mod tests {
         }
 
         async fn perform(&mut self, action: &tools::Action) -> anyhow::Result<String> {
-            let (out, _) = action.perform_with_diff(&self.cwd, None).await?;
+            let (out, _) = action.perform_with_diff_filtered(&self.cwd, None, None).await?;
             Ok(out)
         }
 

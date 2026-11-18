@@ -332,17 +332,9 @@ fn split_lines(contents: &str) -> Vec<String> {
     v
 }
 
-fn apply_update(
-    cwd: &Path,
-    path: &Path,
-    move_path: &Option<PathBuf>,
-    chunks: &[Chunk],
-) -> Result<String> {
-    let abs = cwd.join(path);
-    let raw = std::fs::read_to_string(&abs)
-        .with_context(|| format!("Failed to read file to update {}", abs.display()))?;
-    let original = split_lines(&raw);
-    let reps = compute_replacements(&original, &abs, chunks)?;
+fn updated_contents(raw: &str, path: &Path, chunks: &[Chunk]) -> Result<String> {
+    let original = split_lines(raw);
+    let reps = compute_replacements(&original, path, chunks)?;
     let mut lines = original;
     for (start_idx, old_len, new_segment) in reps.iter().rev() {
         for _ in 0..*old_len {
@@ -358,34 +350,98 @@ fn apply_update(
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    std::fs::write(&abs, out.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
-    if let Some(dest) = move_path {
-        let dest_abs = cwd.join(dest);
-        if let Some(parent) = dest_abs.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::rename(&abs, &dest_abs)
-            .with_context(|| format!("moving {} to {}", abs.display(), dest_abs.display()))?;
-    }
     Ok(out)
+}
+
+/// Resolve against `cwd` and remove `.`/`..` so two spellings of the same
+/// path cannot stage as different files.
+fn absolute(cwd: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+#[derive(Debug, Clone)]
+struct Staged {
+    original: Option<Vec<u8>>,
+    current: Option<Vec<u8>>,
+}
+
+fn stage<'a>(
+    states: &'a mut std::collections::BTreeMap<PathBuf, Staged>,
+    abs: &Path,
+) -> Result<&'a mut Staged> {
+    if !states.contains_key(abs) {
+        if let Ok(meta) = std::fs::symlink_metadata(abs) {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "refusing to patch through symlink {} — replace it with a normal file first",
+                    abs.display()
+                );
+            }
+        }
+        let original = match std::fs::read(abs) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", abs.display()));
+            }
+        };
+        states.insert(
+            abs.to_path_buf(),
+            Staged {
+                current: original.clone(),
+                original,
+            },
+        );
+    }
+    Ok(states.get_mut(abs).expect("just inserted"))
+}
+
+fn write_bytes(cwd: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::fsutil::write_in(cwd, path, bytes)
 }
 
 /// Apply parsed hunks under `cwd`. Returns a human-readable summary plus a
 /// per-file unified diff so the UI can render colored edits.
+///
+/// Every hunk is staged in memory first, so a bad hunk late in the patch
+/// leaves every earlier file untouched. Add/move destinations that already
+/// exist are refused rather than overwritten.
 pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
+    let mut states: std::collections::BTreeMap<PathBuf, Staged> =
+        std::collections::BTreeMap::new();
     let mut changed: Vec<String> = Vec::new();
     let mut files: Vec<crate::diff::FileDiff> = Vec::new();
+
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
-                let abs = cwd.join(path);
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("creating {}", parent.display()))?;
+                let abs = absolute(cwd, path);
+                if states.get(&abs).is_some_and(|s| s.current.is_some()) || exists(&abs) {
+                    bail!("refusing to add {}: it already exists", abs.display());
                 }
-                std::fs::write(&abs, contents.as_bytes())
-                    .with_context(|| format!("writing {}", abs.display()))?;
+                let st = states.entry(abs.clone()).or_insert(Staged {
+                    original: None,
+                    current: None,
+                });
+                st.current = Some(contents.as_bytes().to_vec());
                 files.push(crate::diff::unified_diff(
                     &path.display().to_string(),
                     "",
@@ -395,11 +451,14 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
                 changed.push(hunk.describe());
             }
             Hunk::DeleteFile { path } => {
-                let abs = cwd.join(path);
-                let old = std::fs::read_to_string(&abs)
-                    .with_context(|| format!("reading {}", abs.display()))?;
-                std::fs::remove_file(&abs)
-                    .with_context(|| format!("deleting {}", abs.display()))?;
+                let abs = absolute(cwd, path);
+                let st = stage(&mut states, &abs)?;
+                let old = st
+                    .current
+                    .take()
+                    .with_context(|| format!("{} does not exist", abs.display()))?;
+                let old = String::from_utf8(old)
+                    .with_context(|| format!("{} is not UTF-8", abs.display()))?;
                 files.push(crate::diff::unified_diff(
                     &path.display().to_string(),
                     &old,
@@ -413,18 +472,67 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
                 move_path,
                 chunks,
             } => {
-                // Snapshot the pre-image BEFORE mutating for the diff.
-                let old = std::fs::read_to_string(cwd.join(path)).unwrap_or_default();
-                let new_contents = apply_update(cwd, path, move_path, chunks)?;
-                let display = move_path
-                    .as_ref()
-                    .map(|m| format!("{} -> {}", path.display(), m.display()))
-                    .unwrap_or_else(|| path.display().to_string());
+                let abs = absolute(cwd, path);
+                let (old, new_contents) = {
+                    let st = stage(&mut states, &abs)?;
+                    let old_bytes = st
+                        .current
+                        .as_ref()
+                        .with_context(|| format!("{} does not exist", abs.display()))?;
+                    let old = String::from_utf8(old_bytes.clone())
+                        .with_context(|| format!("{} is not UTF-8", abs.display()))?;
+                    let new_contents = updated_contents(&old, &abs, chunks)?;
+                    (old, new_contents)
+                };
+
+                let display = if let Some(dest) = move_path {
+                    let dest_abs = absolute(cwd, dest);
+                    if dest_abs == abs {
+                        path.display().to_string()
+                    } else {
+                        if states.get(&dest_abs).is_some_and(|s| s.current.is_some())
+                            || exists(&dest_abs)
+                        {
+                            bail!(
+                                "refusing to move {} to {}: destination already exists",
+                                abs.display(),
+                                dest_abs.display()
+                            );
+                        }
+                        states.get_mut(&abs).expect("staged").current = None;
+                        let dest_st = states.entry(dest_abs).or_insert(Staged {
+                            original: None,
+                            current: None,
+                        });
+                        dest_st.current = Some(new_contents.as_bytes().to_vec());
+                        display_for_move(path, dest)
+                    }
+                } else {
+                    path.display().to_string()
+                };
+                let stays_put = match &move_path {
+                    None => true,
+                    Some(dest) => absolute(cwd, dest) == abs,
+                };
+                if stays_put {
+                    states.get_mut(&abs).expect("staged").current =
+                        Some(new_contents.as_bytes().to_vec());
+                }
                 files.push(crate::diff::unified_diff(&display, &old, &new_contents, 3));
                 changed.push(hunk.describe());
             }
         }
     }
+
+    // Write only after every hunk validated. Roll back on the first failure;
+    // a multi-file patch must not leave a half-applied tree behind.
+    if let Err(e) = commit(cwd, &states) {
+        if let Err(rollback) = restore(cwd, &states) {
+            bail!("{e:#}\nrollback also failed: {rollback:#}");
+        }
+        return Err(e);
+    }
+
     Ok(AppliedPatch {
         summary: format!(
             "Success. Updated the following files:\n{}",
@@ -436,6 +544,47 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
         ),
         files,
     })
+}
+
+fn display_for_move(path: &Path, dest: &Path) -> String {
+    format!("{} -> {}", path.display(), dest.display())
+}
+
+fn commit(cwd: &Path, states: &std::collections::BTreeMap<PathBuf, Staged>) -> Result<()> {
+    for (path, st) in states {
+        if st.original == st.current {
+            continue;
+        }
+        if let Some(bytes) = &st.current {
+            write_bytes(cwd, path, bytes)?;
+        }
+    }
+    for (path, st) in states {
+        if st.original == st.current {
+            continue;
+        }
+        if st.current.is_none() && st.original.is_some() {
+            std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn restore(cwd: &Path, states: &std::collections::BTreeMap<PathBuf, Staged>) -> Result<()> {
+    for (path, st) in states {
+        if st.original == st.current {
+            continue;
+        }
+        match &st.original {
+            Some(bytes) => write_bytes(cwd, path, bytes)?,
+            None => match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Result of applying a whole patch: text summary for the model + diffs for the UI.
@@ -550,6 +699,35 @@ mod tests {
             std::fs::read_to_string(dir.join("sub/g.txt")).unwrap(),
             "ONE\n"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_hunk_leaves_earlier_files_untouched() {
+        let dir = std::env::temp_dir().join(format!("lc-patch-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "keep\n").unwrap();
+        let p = "*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** Update File: b.txt\n-missing\n+gone\n*** End Patch";
+        let hunks = parse_patch(p).unwrap();
+        assert!(apply_hunks(&dir, &hunks).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "keep\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_and_move_refuse_to_clobber() {
+        let dir = std::env::temp_dir().join(format!("lc-patch-clobber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        let add = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch";
+        assert!(apply_hunks(&dir, &parse_patch(add).unwrap()).is_err());
+        let mv = "*** Begin Patch\n*** Update File: a.txt\n*** Move to: b.txt\n-a\n+z\n*** End Patch";
+        assert!(apply_hunks(&dir, &parse_patch(mv).unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

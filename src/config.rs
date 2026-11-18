@@ -341,8 +341,15 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
+        use std::io::Write;
         let dir = Self::dir();
         fs::create_dir_all(&dir).context("creating config directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .context("restricting config directory permissions")?;
+        }
         // Preserve whichever format already exists; default to TOML.
         let json_exists = Self::json_path().exists();
         let toml_exists = Self::toml_path().exists();
@@ -361,14 +368,37 @@ impl Config {
             s.push_str(&toml::to_string_pretty(self)?);
             s.into_bytes()
         };
-        fs::write(&path, raw).with_context(|| format!("writing {}", path.display()))?;
-        // The file holds API keys — restrict to owner-only on unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        // The file holds API keys. Write a private temp file and rename it
+        // into place so a crash cannot leave a truncated config behind.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(".config.{}.{stamp}.tmp", std::process::id()));
+        let result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .with_context(|| format!("creating temporary config {}", tmp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .context("restricting temporary config permissions")?;
+            }
+            file.write_all(&raw)
+                .with_context(|| format!("writing temporary config {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing temporary config {}", tmp.display()))?;
+            fs::rename(&tmp, &path)
+                .with_context(|| format!("replacing config {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        Ok(())
+        result
     }
 
     /// Resolve which provider to actually use.
@@ -580,6 +610,19 @@ mod tests {
         cfg.save().unwrap();
 
         let raw = std::fs::read_to_string(Config::toml_path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = Config::toml_path();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "config holds API keys");
+            let leftovers = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .count();
+            assert_eq!(leftovers, 0, "temporary config was not renamed");
+        }
         assert!(
             raw.contains("max_retries"),
             "[limits] was dropped on save; file was:\n{raw}"
@@ -892,8 +935,7 @@ mod tests {
 
     #[test]
     fn profile_accepts_reasoning_effort_alias() {
-        let cfg: Config =
-            toml::from_str("[profiles.fast]\nreasoning_effort = \"low\"").unwrap();
+        let cfg: Config = toml::from_str("[profiles.fast]\nreasoning_effort = \"low\"").unwrap();
         assert_eq!(
             cfg.profiles["fast"].model_reasoning_effort.as_deref(),
             Some("low")

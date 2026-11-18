@@ -61,8 +61,23 @@ impl Logger {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match OpenOptions::new().create(true).append(true).open(&p) {
-                Ok(f) => Some(Mutex::new(f)),
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&p) {
+                Ok(f) => {
+                    // `mode` only applies on create; tighten an existing file too.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                    }
+                    Some(Mutex::new(f))
+                }
                 Err(e) => {
                     // Never fail the session over the log file, but do say so.
                     eprintln!(
@@ -156,6 +171,12 @@ mod tests {
         l.usage("gpt-x", 100, 20, 0.09);
         l.tool("read_file", true);
         let raw = std::fs::read_to_string(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "logs may contain command summaries");
+        }
         let lines: Vec<&str> = raw.lines().collect();
         assert_eq!(lines.len(), 2);
         let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();

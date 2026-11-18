@@ -51,8 +51,13 @@ const MIN_SETTLE: Duration = Duration::from_millis(1_500);
 const DEFAULT_DIAG_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+/// A server that stops draining stdin must not wedge the agent forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_DIAGNOSTICS_PER_FILE: usize = 40;
 const MAX_STDERR_LINES: usize = 50;
+/// A server publishing for the whole dependency tree must not grow this map
+/// without bound. Oldest URIs are evicted first.
+const MAX_DIAGNOSTIC_FILES: usize = 256;
 /// Cap on a single file's text, matching the workspace read cap.
 const MAX_DOC_BYTES: usize = 512 * 1024;
 
@@ -238,9 +243,12 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Work on bytes: `%` followed by a multi-byte char is not a valid
+        // escape and must be copied through, not sliced at a char boundary.
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(((hi << 4) as u8) | lo as u8);
                 i += 3;
                 continue;
             }
@@ -333,6 +341,9 @@ struct Child {
     /// `None` only while a request has it checked out, so exactly one reader
     /// ever owns the stdout pipe.
     reader: Option<BufReader<tokio::process::ChildStdout>>,
+    /// Bytes already read but not yet forming a complete frame. Kept across
+    /// request/diagnostics timeouts so a cancelled read cannot desync framing.
+    frame_buf: Vec<u8>,
     stderr: Arc<tokio::sync::Mutex<Vec<String>>>,
     next_id: u64,
 }
@@ -345,6 +356,8 @@ pub struct Server {
     /// Files we have sent `didOpen` for, with the version counter LSP wants.
     open: HashMap<String, u64>,
     inter_file_deps: bool,
+    /// Servers may negotiate `utf-8` positions; the default is UTF-16.
+    utf8_positions: bool,
     last_error: Option<String>,
     child: Option<Child>,
 }
@@ -421,6 +434,7 @@ impl Lsp {
                 diagnostics: HashMap::new(),
                 open: HashMap::new(),
                 inter_file_deps: false,
+                utf8_positions: false,
                 last_error: None,
                 child: None,
             });
@@ -485,10 +499,18 @@ impl Lsp {
     }
 
     pub async fn start(&mut self, idx: usize) -> Result<()> {
+        self.start_with_cancel(idx, None).await
+    }
+
+    async fn start_with_cancel(
+        &mut self,
+        idx: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         if self.servers[idx].is_running() {
             return Ok(());
         }
-        match self.start_inner(idx).await {
+        match self.start_inner(idx, cancel).await {
             Ok(()) => {
                 self.servers[idx].last_error = None;
                 Ok(())
@@ -505,7 +527,11 @@ impl Lsp {
         }
     }
 
-    async fn start_inner(&mut self, idx: usize) -> Result<()> {
+    async fn start_inner(
+        &mut self,
+        idx: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         let spec = self.servers[idx].spec.clone();
         let root = match &spec.root {
             Some(r) => {
@@ -525,8 +551,8 @@ impl Lsp {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .env_remove("RUST_LOG");
+            .kill_on_drop(true);
+        crate::child_env::scrub(&mut cmd);
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -558,6 +584,7 @@ impl Lsp {
             proc,
             stdin,
             reader: Some(BufReader::new(stdout)),
+            frame_buf: Vec::new(),
             stderr: sink,
             next_id: 0,
         };
@@ -577,7 +604,7 @@ impl Lsp {
             },
         });
         let res = self
-            .request(idx, "initialize", init, spec.init_timeout())
+            .request(idx, "initialize", init, spec.init_timeout(), cancel)
             .await
             .context("initialize")?;
         let parsed: InitializeResult =
@@ -595,6 +622,7 @@ impl Lsp {
             "server negotiated positionEncoding '{enc}', which this client does \
              not implement (it speaks utf-16/utf-8 only)"
         );
+        self.servers[idx].utf8_positions = enc.eq_ignore_ascii_case("utf-8");
         self.servers[idx].inter_file_deps = parsed
             .capabilities
             .diagnostic_provider
@@ -623,6 +651,7 @@ impl Lsp {
                     "shutdown",
                     serde_json::Value::Null,
                     Duration::from_secs(2),
+                    None,
                 )
                 .await;
             let _ = self
@@ -699,9 +728,17 @@ impl Lsp {
         Ok(())
     }
 
-    async fn ensure(&mut self, idx: usize, path: &Path) -> Result<()> {
+    async fn ensure(
+        &mut self,
+        idx: usize,
+        path: &Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         if !self.servers[idx].is_running() {
-            self.start(idx).await?;
+            self.start_with_cancel(idx, cancel).await?;
+        }
+        if crate::agent::is_cancelled(cancel) {
+            bail!("cancelled");
         }
         self.sync(idx, path).await
     }
@@ -717,6 +754,7 @@ impl Lsp {
     pub async fn diagnostics(
         &mut self,
         path: Option<&Path>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Vec<(PathBuf, Vec<Diagnostic>)>, bool)> {
         let idx = match path {
             Some(p) => self
@@ -732,7 +770,7 @@ impl Lsp {
             }
         };
         if let Some(p) = path {
-            self.ensure(idx, p).await?;
+            self.ensure(idx, p, cancel).await?;
         }
         if !self.servers[idx].is_running() {
             bail!(
@@ -751,19 +789,33 @@ impl Lsp {
 
         // Pump messages until the cap, tracking how long the target has been
         // quiet. The reader is checked out so nothing else races for it.
-        let mut reader = self.servers[idx]
-            .child
-            .as_mut()
-            .and_then(|c| c.reader.take())
-            .context("language server stdout is unavailable")?;
+        let (mut reader, mut frame_buf) = {
+            let c = self.servers[idx]
+                .child
+                .as_mut()
+                .context("language server is not running")?;
+            let reader = c
+                .reader
+                .take()
+                .context("language server stdout is unavailable")?;
+            (reader, std::mem::take(&mut c.frame_buf))
+        };
         let deadline = tokio::time::Instant::now() + cap;
         let outcome = loop {
+            if crate::agent::is_cancelled(cancel) {
+                break Err(anyhow::anyhow!("cancelled"));
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break Ok(());
             }
-            match tokio::time::timeout(remaining, read_message(&mut reader)).await {
-                Err(_) => break Ok(()),
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(200)),
+                read_message(&mut reader, &mut frame_buf),
+            )
+            .await
+            {
+                Err(_) => continue,
                 Ok(Err(e)) => break Err(e),
                 Ok(Ok(None)) => break Ok(()), // server closed stdout
                 Ok(Ok(Some(msg))) => {
@@ -775,6 +827,7 @@ impl Lsp {
         };
         if let Some(c) = self.servers[idx].child.as_mut() {
             c.reader = Some(reader);
+            c.frame_buf = frame_buf;
         }
         outcome?;
 
@@ -812,31 +865,42 @@ impl Lsp {
         Ok((out, settled))
     }
 
-    pub async fn definition(&mut self, path: &Path, pos: Pos) -> Result<String> {
+    pub async fn definition(
+        &mut self,
+        path: &Path,
+        pos: Pos,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         let idx = self
             .server_for(path)
             .with_context(|| format!("no LSP server handles {}", path.display()))?;
-        self.ensure(idx, path).await?;
+        self.ensure(idx, path, cancel).await?;
         let text = read_text(path)?;
-        let lsp = to_lsp(&text, pos)?;
+        let lsp = to_lsp(&text, pos, self.servers[idx].utf8_positions)?;
         let res = self
             .request(
                 idx,
                 "textDocument/definition",
                 serde_json::json!({"textDocument":{"uri":path_to_uri(path)},"position":lsp}),
                 self.servers[idx].spec.timeout(),
+                cancel,
             )
             .await?;
         render_locations(path, &res, &self.cwd)
     }
 
-    pub async fn references(&mut self, path: &Path, pos: Pos) -> Result<String> {
+    pub async fn references(
+        &mut self,
+        path: &Path,
+        pos: Pos,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         let idx = self
             .server_for(path)
             .with_context(|| format!("no LSP server handles {}", path.display()))?;
-        self.ensure(idx, path).await?;
+        self.ensure(idx, path, cancel).await?;
         let text = read_text(path)?;
-        let lsp = to_lsp(&text, pos)?;
+        let lsp = to_lsp(&text, pos, self.servers[idx].utf8_positions)?;
         let res = self
             .request(
                 idx,
@@ -844,24 +908,31 @@ impl Lsp {
                 serde_json::json!({"textDocument":{"uri":path_to_uri(path)},
                     "position":lsp, "context":{"includeDeclaration":true}}),
                 self.servers[idx].spec.timeout(),
+                cancel,
             )
             .await?;
         render_locations(path, &res, &self.cwd)
     }
 
-    pub async fn hover(&mut self, path: &Path, pos: Pos) -> Result<String> {
+    pub async fn hover(
+        &mut self,
+        path: &Path,
+        pos: Pos,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         let idx = self
             .server_for(path)
             .with_context(|| format!("no LSP server handles {}", path.display()))?;
-        self.ensure(idx, path).await?;
+        self.ensure(idx, path, cancel).await?;
         let text = read_text(path)?;
-        let lsp = to_lsp(&text, pos)?;
+        let lsp = to_lsp(&text, pos, self.servers[idx].utf8_positions)?;
         let res = self
             .request(
                 idx,
                 "textDocument/hover",
                 serde_json::json!({"textDocument":{"uri":path_to_uri(path)},"position":lsp}),
                 self.servers[idx].spec.timeout(),
+                cancel,
             )
             .await?;
         if res.is_null() {
@@ -891,13 +962,18 @@ impl Lsp {
     }
 
     /// Document outline for one file, or a workspace symbol search.
-    pub async fn symbols(&mut self, path: Option<&Path>, query: Option<&str>) -> Result<String> {
+    pub async fn symbols(
+        &mut self,
+        path: Option<&Path>,
+        query: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         let (idx, method, params) = match path {
             Some(p) => {
                 let idx = self
                     .server_for(p)
                     .with_context(|| format!("no LSP server handles {}", p.display()))?;
-                self.ensure(idx, p).await?;
+                self.ensure(idx, p, cancel).await?;
                 (
                     idx,
                     "textDocument/documentSymbol",
@@ -917,7 +993,7 @@ impl Lsp {
             },
         };
         let res = self
-            .request(idx, method, params, self.servers[idx].spec.timeout())
+            .request(idx, method, params, self.servers[idx].spec.timeout(), cancel)
             .await?;
         if res.is_null() {
             return Ok("(no symbols)".to_string());
@@ -976,6 +1052,16 @@ impl Lsp {
                 self.servers[idx]
                     .diagnostics
                     .insert(uri.to_string(), (ds, std::time::Instant::now()));
+                let map = &mut self.servers[idx].diagnostics;
+                if map.len() > MAX_DIAGNOSTIC_FILES {
+                    if let Some(oldest) = map
+                        .iter()
+                        .min_by_key(|(_, (_, at))| *at)
+                        .map(|(k, _)| k.clone())
+                    {
+                        map.remove(&oldest);
+                    }
+                }
                 true
             }
             // Servers hand us capabilities they expect us to honour. We decline
@@ -1040,15 +1126,25 @@ impl Lsp {
             .child
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("language server is not running"))?;
-        c.stdin
-            .write_all(&framed)
-            .await
-            .context("writing to language server")?;
-        c.stdin
-            .flush()
-            .await
-            .context("flushing language server stdin")?;
-        Ok(())
+        let write = async {
+            c.stdin
+                .write_all(&framed)
+                .await
+                .context("writing to language server")?;
+            c.stdin
+                .flush()
+                .await
+                .context("flushing language server stdin")?;
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                self.reap(idx).await;
+                bail!("timed out writing to language server")
+            }
+        }
     }
 
     /// Send a request and read until its id comes back, stashing notifications
@@ -1059,6 +1155,7 @@ impl Lsp {
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<serde_json::Value> {
         let id = {
             let c = self.servers[idx]
@@ -1073,14 +1170,23 @@ impl Lsp {
         });
         self.notify(idx, &msg).await?;
 
-        let mut reader = self.servers[idx]
-            .child
-            .as_mut()
-            .and_then(|c| c.reader.take())
-            .ok_or_else(|| anyhow::anyhow!("language server stdout is unavailable"))?;
+        let (mut reader, mut frame_buf) = {
+            let c = self.servers[idx]
+                .child
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("language server is not running"))?;
+            let reader = c
+                .reader
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("language server stdout is unavailable"))?;
+            (reader, std::mem::take(&mut c.frame_buf))
+        };
 
         let deadline = tokio::time::Instant::now() + timeout;
         let outcome: Result<serde_json::Value> = loop {
+            if crate::agent::is_cancelled(cancel) {
+                break Err(anyhow::anyhow!("cancelled"));
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break Err(anyhow::anyhow!(
@@ -1088,8 +1194,18 @@ impl Lsp {
                     self.io_error(idx)
                 ));
             }
-            match tokio::time::timeout(remaining, read_message(&mut reader)).await {
-                Err(_) => continue,
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(200)),
+                read_message(&mut reader, &mut frame_buf),
+            )
+            .await
+            {
+                Err(_) => {
+                    if crate::agent::is_cancelled(cancel) {
+                        break Err(anyhow::anyhow!("cancelled"));
+                    }
+                    continue;
+                }
                 Ok(Err(e)) => break Err(e).context("reading from language server"),
                 Ok(Ok(None)) => {
                     break Err(anyhow::anyhow!(
@@ -1116,6 +1232,7 @@ impl Lsp {
         };
         if let Some(c) = self.servers[idx].child.as_mut() {
             c.reader = Some(reader);
+            c.frame_buf = frame_buf;
         }
         outcome
     }
@@ -1145,11 +1262,16 @@ fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
 }
 
-fn to_lsp(text: &str, pos: Pos) -> Result<serde_json::Value> {
+fn to_lsp(text: &str, pos: Pos, utf8: bool) -> Result<serde_json::Value> {
     let off = to_byte_offset(text, pos)?;
     let line = text[..off].matches('\n').count();
     let start = byte_offset_of_line(text, line);
-    let character: usize = text[start..off].chars().map(char::len_utf16).sum();
+    // LSP `utf-8` counts bytes; the default `utf-16` counts UTF-16 units.
+    let character = if utf8 {
+        off - start
+    } else {
+        text[start..off].chars().map(char::len_utf16).sum()
+    };
     Ok(serde_json::json!({"line": line, "character": character}))
 }
 
@@ -1258,47 +1380,84 @@ fn render_locations(origin: &Path, res: &serde_json::Value, cwd: &Path) -> Resul
     Ok(out.trim_end().to_string())
 }
 
-/// Read one `Content-Length`-framed JSON-RPC message. `None` means the pipe
-/// closed.
-async fn read_message(
-    reader: &mut BufReader<tokio::process::ChildStdout>,
-) -> Result<Option<serde_json::Value>> {
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Find the end of an LSP header block. The spec says CRLF, but some servers
+/// emit bare LF; accepting both is harmless and keeps a quirky server usable.
+fn header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((i, 4));
+    }
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|i| (i, 2))
+}
+
+/// Parse one complete frame from `pending`, draining exactly its bytes. `None`
+/// means more input is needed.
+fn take_frame(pending: &mut Vec<u8>) -> Result<Option<serde_json::Value>> {
+    let Some((end, sep)) = header_end(pending) else {
+        if pending.len() > MAX_HEADER_BYTES {
+            bail!("language server header block is too long");
+        }
+        return Ok(None);
+    };
+    if end > MAX_HEADER_BYTES {
+        bail!("language server header block is too long");
+    }
     let mut len: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("reading header")?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(rest) = trimmed
-            .split_once(':')
-            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .map(|(_, v)| v.trim().to_string())
-        {
-            len = rest.parse().ok();
+    for line in pending[..end].split(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse().ok();
+            }
         }
     }
     let Some(len) = len else {
         bail!("language server sent a message with no Content-Length header");
     };
-    // Guard against a server announcing a length that would blow up memory.
-    if len > 32 * 1024 * 1024 {
+    if len > MAX_BODY_BYTES {
         bail!("language server announced an implausible Content-Length: {len}");
     }
-    let mut buf = vec![0u8; len];
-    tokio::io::AsyncReadExt::read_exact(reader, &mut buf)
-        .await
-        .context("reading message body")?;
+    let body_start = end + sep;
+    if pending.len() < body_start + len {
+        return Ok(None);
+    }
+    let body: Vec<u8> = pending[body_start..body_start + len].to_vec();
+    pending.drain(..body_start + len);
     Ok(Some(
-        serde_json::from_slice(&buf).context("malformed JSON-RPC body")?,
+        serde_json::from_slice(&body).context("malformed JSON-RPC body")?,
     ))
+}
+
+/// Read one `Content-Length`-framed JSON-RPC message. `None` means the pipe
+/// closed. `pending` is owned across calls, so a timed-out read resumes where
+/// it stopped instead of eating the next message's header.
+async fn read_message(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    pending: &mut Vec<u8>,
+) -> Result<Option<serde_json::Value>> {
+    loop {
+        if let Some(msg) = take_frame(pending)? {
+            return Ok(Some(msg));
+        }
+        let available = reader.fill_buf().await.context("reading header")?;
+        if available.is_empty() {
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            bail!("language server closed stdout mid-message");
+        }
+        if pending.len() + available.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES + 4 {
+            bail!("language server message buffer exceeded its cap");
+        }
+        pending.extend_from_slice(available);
+        let n = available.len();
+        reader.consume(n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,13 +1499,23 @@ mod tests {
     // -- pure logic, no server needed --------------------------------------
 
     #[test]
+    fn percent_decode_tolerates_malformed_escapes() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        // `%` followed by a multi-byte character used to slice inside UTF-8.
+        assert_eq!(percent_decode("%\u{20ac}"), "%\u{20ac}");
+    }
+
+    #[test]
     fn positions_are_one_based_and_utf16_aware() {
         // "let x = 1;" — column 5 is the `x` in 1-based counting.
         let text = "let x = 1;\n";
         assert_eq!(to_byte_offset(text, Pos { line: 1, column: 5 }).unwrap(), 4);
-        assert_eq!(to_lsp(text, Pos { line: 1, column: 5 }).unwrap()["line"], 0);
         assert_eq!(
-            to_lsp(text, Pos { line: 1, column: 5 }).unwrap()["character"],
+            to_lsp(text, Pos { line: 1, column: 5 }, false).unwrap()["line"],
+            0
+        );
+        assert_eq!(
+            to_lsp(text, Pos { line: 1, column: 5 }, false).unwrap()["character"],
             4
         );
 
@@ -1360,9 +1529,14 @@ mod tests {
         // UTF-16 unit 7. LSP wants the last one, and only that one round-trips
         // through a real server.
         assert_eq!(
-            to_lsp(text, Pos { line: 1, column: 7 }).unwrap()["character"],
+            to_lsp(text, Pos { line: 1, column: 7 }, false).unwrap()["character"],
             7,
             "LSP character must be UTF-16 units, not bytes or chars"
+        );
+        assert_eq!(
+            to_lsp(text, Pos { line: 1, column: 7 }, true).unwrap()["character"],
+            9,
+            "a utf-8 server counts bytes"
         );
 
         // CJK: 1 char, 3 bytes, 1 UTF-16 unit.
@@ -1520,7 +1694,7 @@ mod tests {
         )]);
         let mut lsp = Lsp::from_specs(&dir, specs).unwrap();
         rt(async {
-            let (files, settled) = lsp.diagnostics(Some(&bad)).await.unwrap();
+            let (files, settled) = lsp.diagnostics(Some(&bad), None).await.unwrap();
             let ds = &files[0].1;
             assert!(
                 ds.iter().any(|d| d.message.contains("undefined_fn")),
@@ -1576,6 +1750,32 @@ mod tests {
         });
     }
 
+    #[test]
+    fn framing_keeps_partial_frames_and_queues_the_next_one() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let frame = [
+            format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes(),
+            body.to_vec(),
+        ]
+        .concat();
+        let mut pending = Vec::new();
+        for byte in &frame {
+            pending.push(*byte);
+            if pending.len() < frame.len() {
+                assert!(take_frame(&mut pending).unwrap().is_none());
+            }
+        }
+        assert_eq!(take_frame(&mut pending).unwrap().unwrap()["id"], 1);
+        assert!(pending.is_empty());
+
+        // Two complete frames in one buffer are drained in order.
+        let mut two = frame.clone();
+        two.extend_from_slice(&frame);
+        assert_eq!(take_frame(&mut two).unwrap().unwrap()["id"], 1);
+        assert_eq!(take_frame(&mut two).unwrap().unwrap()["id"], 1);
+        assert!(two.is_empty());
+    }
+
     /// ~90s of real indexing, so it is opt-in: `cargo test -- --ignored`.
     /// The point of the test is the settle contract on a slow server, which is
     /// exactly the case a fast mock cannot reproduce.
@@ -1613,7 +1813,7 @@ mod tests {
         )]);
         let mut lsp = Lsp::from_specs(&dir, specs).unwrap();
         rt(async {
-            let (files, settled) = lsp.diagnostics(Some(&good)).await.unwrap();
+            let (files, settled) = lsp.diagnostics(Some(&good), None).await.unwrap();
             assert!(settled, "clean file should settle within the budget");
             let errors: Vec<_> = files
                 .iter()

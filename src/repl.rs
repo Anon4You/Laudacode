@@ -1411,6 +1411,13 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let cwd = app.agent.cwd.clone();
                     let mode = app.agent.mode;
                     let permissions = app.agent.permissions.clone();
+                    let budget = crate::agents::BudgetGuard::new(
+                        &app.agent.limits,
+                        &app.agent.model,
+                        &app.agent.pricing,
+                        app.agent.tot_usage.0,
+                        app.agent.tot_usage.1,
+                    );
                     let res = rt.block_on(crate::agents::run_sub_agent(
                         &client,
                         &model,
@@ -1420,6 +1427,8 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         "reviewer",
                         &task,
                         sink,
+                        None,
+                        budget,
                     ));
                     // `/review` is a delegation too — charge it, or a free
                     // full-repo review bypasses `max_cost_usd` entirely.
@@ -1861,6 +1870,10 @@ fn resume_session(app: &mut App, id: &str) -> Result<(String, Vec<Entry>)> {
     ));
     app.agent.todos.clear();
     app.session = sess;
+    // A resumed conversation inherits its spend, not the previous session's.
+    app.agent.tot_usage = (app.session.prompt_tokens, app.session.completion_tokens);
+    app.agent.last_usage = None;
+    app.agent.reset_undo();
     app.persist();
     // Replay what happened so the user sees their earlier work on screen.
     let entries = transcript_entries(&app.agent.messages);
@@ -3813,7 +3826,14 @@ fn append_prompt_history(line: &str) {
     }
     use std::fs::OpenOptions;
     use std::io::Write;
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
         let _ = writeln!(f, "{line}");
     }
     // The file holds everything the user typed — owner-only on unix.
@@ -5210,6 +5230,12 @@ mod tests {
         append_prompt_history("second task");
         append_prompt_history("   ");
         assert_eq!(load_prompt_history(), vec!["first task", "second task"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(history_path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "history must stay owner-only");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

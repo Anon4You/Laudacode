@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Minimal stdio MCP server: handshake, paged tools/list, tools/call.
-import json, sys
+import json, sys, time
 import os
 # `--silent` accepts the handshake and then never answers, so the client-side
 # timeout is exercised for real. `--name` sets the advertised server name.
 SILENT = "--silent" in sys.argv
+SLOW_CALL = "--slow-call" in sys.argv
 NAME = "tiny"
 for i, a in enumerate(sys.argv):
     if a == "--name" and i + 1 < len(sys.argv): NAME = sys.argv[i+1]
@@ -45,6 +46,8 @@ for line in sys.stdin:
                 "nextCursor":"p2"}})
     elif method == "tools/call":
         name = msg.get("params",{}).get("name")
+        if SLOW_CALL and name != "boom":
+            time.sleep(30)
         if name == "boom":
             send({"jsonrpc":"2.0","id":mid,"error":{"code":-32000,"message":"tool exploded"}})
         else:

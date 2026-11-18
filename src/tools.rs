@@ -431,7 +431,8 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                 let a: WebSearchArgs = serde_json::from_value(v)?;
                 Ok(Action::WebSearch {
                     query: a.query,
-                    max_results: a.max_results.unwrap_or(5),
+                    // The schema says 1-10; enforce it for calls that ignore it.
+                    max_results: a.max_results.unwrap_or(5).clamp(1, 10),
                 })
             }
             "grep" => {
@@ -717,7 +718,9 @@ impl Action {
         match self {
             // Reads outside the workspace can expose anything the user can
             // read, so they are not "safe" just because they do not write.
-            Action::ListDir { path } | Action::ReadFile { path, .. } | Action::ViewImage { path } => {
+            Action::ListDir { path }
+            | Action::ReadFile { path, .. }
+            | Action::ViewImage { path } => {
                 if contained_in_workspace(cwd, path) {
                     Danger::Safe
                 } else {
@@ -787,10 +790,7 @@ impl Action {
                                 .map(|t| contained_in_workspace_path(cwd, &t))
                                 .unwrap_or(false)
                         };
-                        let all_inside = hunks
-                            .iter()
-                            .flat_map(|h| h.paths())
-                            .all(inside);
+                        let all_inside = hunks.iter().flat_map(|h| h.paths()).all(inside);
                         if all_inside {
                             Danger::Moderate
                         } else {
@@ -822,22 +822,26 @@ impl Action {
 
     /// Execute the action inside `cwd`, returning output plus unified diffs
     /// of any files this action mutated (empty for read-only actions).
-    pub async fn perform_with_diff(
+    /// Execute the action, returning output plus unified diffs. `file_filter`
+    /// may veto individual files walked by `grep`/`glob`; the root permission
+    /// gate cannot see those files.
+    pub async fn perform_with_diff_filtered(
         &self,
         cwd: &Path,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        file_filter: Option<&dyn Fn(&Path) -> bool>,
     ) -> Result<(String, Vec<crate::diff::FileDiff>)> {
         match self {
             // Mutating: capture pre-image → mutate → diff.
             Action::WriteFile { path, content } => {
                 let p = resolve_in(cwd, path)?;
+                crate::fsutil::no_symlink(&p)?;
                 let old = std::fs::read_to_string(&p).unwrap_or_default();
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating {}", parent.display()))?;
                 }
-                std::fs::write(&p, content.as_bytes())
-                    .with_context(|| format!("writing {}", p.display()))?;
+                crate::fsutil::write_in(cwd, &p, content.as_bytes())?;
                 let diff = crate::diff::unified_diff(path, &old, content, 3);
                 Ok((
                     format!("wrote {} ({} bytes)", p.display(), content.len()),
@@ -846,6 +850,7 @@ impl Action {
             }
             Action::EditFile { path, old, new } => {
                 let p = resolve_in(cwd, path)?;
+                crate::fsutil::no_symlink(&p)?;
                 let raw = std::fs::read_to_string(&p)
                     .with_context(|| format!("reading {}", p.display()))?;
                 let count = raw.matches(old.as_str()).count();
@@ -859,8 +864,7 @@ impl Action {
                     ),
                 }
                 let updated = raw.replacen(old.as_str(), new.as_str(), 1);
-                std::fs::write(&p, updated.as_bytes())
-                    .with_context(|| format!("writing {}", p.display()))?;
+                crate::fsutil::write_in(cwd, &p, updated.as_bytes())?;
                 let diff = crate::diff::unified_diff(path, &raw, &updated, 3);
                 Ok((
                     format!(
@@ -891,17 +895,18 @@ impl Action {
             }
             // Everything else has no file mutation — reuse plain perform().
             other => {
-                let out = Self::perform_plain(other, cwd, cancel).await?;
+                let out = Self::perform_plain_filtered(other, cwd, cancel, file_filter).await?;
                 Ok((out, Vec::new()))
             }
         }
     }
 
     /// The original read-only/command paths (no diff capture).
-    async fn perform_plain(
+    async fn perform_plain_filtered(
         &self,
         cwd: &Path,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        file_filter: Option<&dyn Fn(&Path) -> bool>,
     ) -> Result<String> {
         match self {
             Action::ViewImage { .. } => {
@@ -924,11 +929,70 @@ impl Action {
                     return Ok(format!("[directory] {}", build_tree(&p, 0, 1)));
                 }
                 if meta.len() > MAX_READ_BYTES {
-                    bail!(
-                        "file too large ({}, limit {}). Read specific parts with run_command.",
-                        meta.len(),
-                        MAX_READ_BYTES
-                    );
+                    if offset.is_none() && limit.is_none() {
+                        bail!(
+                            "file too large ({}, limit {}). Pass offset/limit to page through it.",
+                            meta.len(),
+                            MAX_READ_BYTES
+                        );
+                    }
+                    // Page without loading the whole file into memory.
+                    use std::io::BufRead;
+                    let file = std::fs::File::open(&p)
+                        .with_context(|| format!("opening {}", p.display()))?;
+                    let mut reader = std::io::BufReader::new(file);
+                    let start = offset.unwrap_or(1).saturating_sub(1) as usize;
+                    let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
+                    let mut out = String::new();
+                    let mut raw = String::new();
+                    let (mut n, mut shown, mut first) = (0usize, 0usize, 0usize);
+                    let mut eof = false;
+                    loop {
+                        raw.clear();
+                        let read = reader
+                            .read_line(&mut raw)
+                            .with_context(|| format!("reading {}", p.display()))?;
+                        if read == 0 {
+                            eof = true;
+                            break;
+                        }
+                        n += 1;
+                        if n <= start {
+                            continue;
+                        }
+                        if shown == 0 {
+                            first = n;
+                        }
+                        shown += 1;
+                        out.push_str(&format!("{n:>5}| {}\n", raw.trim_end_matches(['\r', '\n'])));
+                        if shown >= take || out.len() > MAX_TOOL_OUTPUT {
+                            break;
+                        }
+                    }
+                    if shown == 0 {
+                        if n == 0 {
+                            return Ok(String::new());
+                        }
+                        bail!(
+                            "offset {} is past end of file ({n} lines)",
+                            offset.unwrap_or(1)
+                        );
+                    }
+                    if out.len() > MAX_TOOL_OUTPUT {
+                        let mut t = truncate(&out);
+                        t.push_str(&format!(
+                            "\n[stopped at line {n}; pass offset={} for more]",
+                            n + 1
+                        ));
+                        return Ok(t);
+                    }
+                    if limit.is_some() && !eof {
+                        out.push_str(&format!(
+                            "[showing lines {first}-{n} — pass offset={} for the next page]\n",
+                            n + 1
+                        ));
+                    }
+                    return Ok(out);
                 }
                 let raw = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
                 let text = String::from_utf8_lossy(&raw);
@@ -1004,11 +1068,20 @@ impl Action {
                 regex,
             } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
-                run_grep(&root, pattern, *ignore_case, context.unwrap_or(0), *regex)
+                ensure_search_root(cwd, &root)?;
+                run_grep(
+                    &root,
+                    pattern,
+                    *ignore_case,
+                    context.unwrap_or(0),
+                    *regex,
+                    file_filter,
+                )
             }
             Action::Glob { pattern, path } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
-                run_glob(&root, pattern)
+                ensure_search_root(cwd, &root)?;
+                run_glob(&root, pattern, file_filter)
             }
             Action::Git {
                 subcommand,
@@ -1078,10 +1151,23 @@ fn run_grep(
     ignore_case: bool,
     context: u32,
     regex: bool,
+    file_filter: Option<&dyn Fn(&Path) -> bool>,
 ) -> Result<String> {
     const MAX_HITS: usize = 200;
     const MAX_OUTPUT_LINES: usize = 400;
     const MAX_FILES_SCANNED: usize = 5000;
+    const MAX_LINE_CHARS: usize = 2048;
+    // A minified bundle can put a whole file on one line; keep g/re/p legible
+    // and bounded without dropping the match itself.
+    fn clip(s: &str) -> String {
+        if s.chars().count() <= MAX_LINE_CHARS {
+            s.to_string()
+        } else {
+            let mut t: String = s.chars().take(MAX_LINE_CHARS).collect();
+            t.push('…');
+            t
+        }
+    }
     // Compiled matcher, or `None` for the literal fast path.
     let compiled = if regex {
         Some(
@@ -1102,6 +1188,7 @@ fn run_grep(
     // (relative path, 1-based line no, line text) for each hit.
     let mut hits: Vec<(String, usize, String)> = Vec::new();
     let mut files_searched = 0usize;
+    let mut skipped = 0usize;
     let mut visited = 0usize;
     let mut scan_capped = false;
     let mut stop = false;
@@ -1109,6 +1196,10 @@ fn run_grep(
         if stop || hits.len() >= MAX_HITS {
             stop = true;
             return false; // halt the whole walk
+        }
+        if file_filter.is_some_and(|allow| !allow(p)) {
+            skipped += 1;
+            return true;
         }
         visited += 1;
         if visited > MAX_FILES_SCANNED {
@@ -1132,7 +1223,7 @@ fn run_grep(
                 None => line.contains(&needle),
             };
             if hit {
-                hits.push((rel.clone(), i + 1, line.trim_end().to_string()));
+                hits.push((rel.clone(), i + 1, clip(line.trim_end())));
                 if hits.len() >= MAX_HITS {
                     stop = true;
                     break;
@@ -1154,8 +1245,13 @@ fn run_grep(
         } else {
             String::new()
         };
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} skipped by read rules")
+        } else {
+            String::new()
+        };
         return Ok(format!(
-            "no matches for '{pattern}' ({files_searched} files searched{cap}){hint}"
+            "no matches for '{pattern}' ({files_searched} files searched{skip_note}{cap}){hint}"
         ));
     }
 
@@ -1210,7 +1306,7 @@ fn run_grep(
                     if out_lines >= MAX_OUTPUT_LINES {
                         break 'files;
                     }
-                    let text = content.lines().nth(ln - 1).unwrap_or("").trim_end();
+                    let text = clip(content.lines().nth(ln - 1).unwrap_or("").trim_end());
                     let is_hit = lines.iter().any(|(n, _)| *n == ln);
                     let prefix = if is_hit { ":" } else { "-" };
                     out.push_str(&format!("{rel}{prefix}{ln}{prefix}{text}\n"));
@@ -1228,12 +1324,19 @@ fn run_grep(
     if scan_capped {
         footer.push_str(&format!(" [scan stopped after {MAX_FILES_SCANNED} files]"));
     }
+    if skipped > 0 {
+        footer.push_str(&format!(" [{skipped} files skipped by read rules]"));
+    }
     out.push_str(&footer);
-    Ok(out)
+    Ok(truncate(&out))
 }
 
 /// Glob-style file search supporting `*`, `**`, and `?` via simple matching.
-fn run_glob(root: &Path, pattern: &str) -> Result<String> {
+fn run_glob(
+    root: &Path,
+    pattern: &str,
+    file_filter: Option<&dyn Fn(&Path) -> bool>,
+) -> Result<String> {
     const MAX_HITS: usize = 300;
     const MAX_FILES_SCANNED: usize = 5000;
     let mut hits: Vec<String> = Vec::new();
@@ -1243,6 +1346,9 @@ fn run_glob(root: &Path, pattern: &str) -> Result<String> {
         if hits.len() >= MAX_HITS {
             capped = true;
             return false;
+        }
+        if file_filter.is_some_and(|allow| !allow(p)) {
+            return true;
         }
         visited += 1;
         if visited > MAX_FILES_SCANNED {
@@ -1431,7 +1537,6 @@ async fn capture_child(
     cancel_msg: &str,
     what: &str,
 ) -> Result<String> {
-    use tokio::io::AsyncReadExt;
     let mut child = child;
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
@@ -1452,18 +1557,18 @@ async fn capture_child(
     };
     let res = tokio::select! {
         r = tokio::time::timeout(timeout, async {
-    let o = async {
-        if let Some(o) = stdout_pipe.as_mut() {
-            let _ = o.read_to_end(&mut out_buf).await;
-        }
-    };
-    let e = async {
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut err_buf).await;
-        }
-    };
-        let ((), (), status) = tokio::join!(o, e, child.wait());
-        status
+            let o = async {
+                if let Some(o) = stdout_pipe.as_mut() {
+                    out_buf = read_capped(o).await;
+                }
+            };
+            let e = async {
+                if let Some(p) = stderr_pipe.as_mut() {
+                    err_buf = read_capped(p).await;
+                }
+            };
+            let ((), (), status) = tokio::join!(o, e, child.wait());
+            status
         }) => r,
         _ = check => {
             #[cfg(unix)]
@@ -1512,13 +1617,32 @@ async fn capture_child(
     Ok(report)
 }
 
+/// Drain a pipe to EOF but retain only enough for the tool transcript.
+/// Reading continues after the cap so a chatty child never blocks on a full
+/// pipe; only the stored bytes are bounded.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let limit = MAX_TOOL_OUTPUT + 1;
+    let mut out = Vec::with_capacity(limit);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < limit {
+                    let take = (limit - out.len()).min(n);
+                    out.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Revisions are operands, not options: `git diff --output=...` writes a file,
 /// so a leading `-` must never reach git as model input.
 fn validate_git_rev(rev: &str) -> Result<()> {
-    anyhow::ensure!(
-        !rev.starts_with('-'),
-        "git revision may not start with '-'"
-    );
+    anyhow::ensure!(!rev.starts_with('-'), "git revision may not start with '-'");
     Ok(())
 }
 
@@ -1663,7 +1787,7 @@ async fn run_git(
     Ok(report)
 }
 
-fn truncate(s: &str) -> String {
+pub(crate) fn truncate(s: &str) -> String {
     if s.chars().count() <= MAX_TOOL_OUTPUT {
         s.to_string()
     } else {
@@ -1677,16 +1801,117 @@ const FETCH_LIMIT: usize = 16 * 1024;
 /// Hard cap on downloaded bytes — phones (Termux) have tight RAM budgets.
 const FETCH_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-async fn fetch_url(url: &str) -> Result<String> {
-    use futures_util::StreamExt;
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+/// Refuse URLs whose host resolves to this machine or a private network.
+/// DNS is checked here, before the request; redirects are followed manually
+/// in `fetch_url` so every hop gets the same check.
+async fn ensure_public_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>> {
+    if url.scheme() != "http" && url.scheme() != "https" {
         bail!("only http(s) URLs are supported");
     }
-    let client = crate::api::build_web_client(
-        std::time::Duration::from_secs(20),
-        std::time::Duration::from_secs(45),
-    )?;
-    let resp = client.get(url).send().await.context("request failed")?;
+    let host = url.host_str().context("URL has no host")?;
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".local") {
+        bail!("blocked local host '{host}'");
+    }
+    let port = url.port_or_known_default().context("URL has no port")?;
+    // `Url::host_str` keeps the brackets on IPv6 literals.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if is_local_ip(ip) {
+            bail!("blocked local address {ip}");
+        }
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let mut out = Vec::new();
+    for addr in tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("resolving {host}"))?
+    {
+        if is_local_ip(addr.ip()) {
+            bail!("blocked local address {} for {host}", addr.ip());
+        }
+        out.push(addr);
+    }
+    anyhow::ensure!(!out.is_empty(), "could not resolve {host}");
+    Ok(out)
+}
+
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_local_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+async fn fetch_url(url: &str) -> Result<String> {
+    use futures_util::StreamExt;
+    let mut current = reqwest::Url::parse(url).context("invalid URL")?;
+    let mut hops = 0usize;
+    let resp = loop {
+        let addrs = ensure_public_url(&current).await?;
+        let host = current
+            .host_str()
+            .context("URL has no host")?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host);
+        // IP literals already have no DNS step to pin; domains must use the
+        // exact addresses that passed `ensure_public_url`.
+        let client = if bare.parse::<std::net::IpAddr>().is_ok() {
+            crate::api::build_web_client_no_redirect(
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(45),
+            )?
+        } else {
+            crate::api::build_web_client_no_redirect_pinned(
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(45),
+                &host,
+                &addrs,
+            )?
+        };
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .context("request failed")?;
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        if hops >= 5 {
+            bail!("too many redirects");
+        }
+        hops += 1;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .context("redirect without a Location header")?;
+        current = current.join(location).context("invalid redirect URL")?;
+    };
     let status = resp.status();
     if let Some(len) = resp.content_length() {
         if len > FETCH_MAX_BYTES {
@@ -1712,7 +1937,7 @@ async fn fetch_url(url: &str) -> Result<String> {
     }
     let body = String::from_utf8_lossy(&body).into_owned();
 
-    let header = format!("[{url}] [HTTP {status}]\n");
+    let header = format!("[{current}] [HTTP {status}]\n");
     let text = if ctype.contains("text/html") || ctype.contains("application/xhtml") {
         html_to_text(&body)
     } else {
@@ -2065,6 +2290,51 @@ pub fn is_dangerous_command(cmd: &str) -> bool {
     false
 }
 
+/// Hidden entries that are part of the project, not local state. Everything
+/// else starting with `.` is skipped: `grep` reads contents, and a root-level
+/// permission rule cannot tell `.env` from the rest of the tree.
+const ALLOW_HIDDEN: &[&str] = &[
+    ".github",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".env.example",
+];
+
+fn hidden_name(name: &str) -> bool {
+    name.starts_with('.') && !ALLOW_HIDDEN.contains(&name)
+}
+
+fn skip_entry(name: &str) -> bool {
+    SKIP_DIRS.contains(&name) || hidden_name(name)
+}
+
+/// A hidden directory explicitly named as the search root bypasses
+/// `walk_files` (which only filters children). Refuse it unless it is the
+/// workspace itself, so `.ssh` cannot be read by `grep(path: ".ssh")`.
+fn ensure_search_root(cwd: &Path, root: &Path) -> Result<()> {
+    // Check every component below the workspace, not just the last one:
+    // `.ssh/nested` names a hidden ancestor just as much as `.ssh` does.
+    // Resolve both sides so a symlinked workspace root cannot hide the prefix
+    // by making `strip_prefix` fail.
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let real_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let hidden_below = |base: &Path, path: &Path| {
+        path.strip_prefix(base).ok().is_some_and(|rel| {
+            rel.components().any(|c| {
+                matches!(c, std::path::Component::Normal(n) if hidden_name(&n.to_string_lossy()))
+            })
+        })
+    };
+    if hidden_below(cwd, root) || hidden_below(&real_cwd, &real_root) {
+        bail!(
+            "refusing to search hidden path '{}': name it directly with read_file",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
@@ -2114,7 +2384,7 @@ fn build_tree_into(
             return;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') && name != ".env.example" {
+        if skip_entry(&name) {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -2469,7 +2739,8 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
         .collect()
 }
 
-/// Recursively visit files under `root`, skipping junk dirs and dotfiles.
+/// Recursively visit files under `root`, skipping junk dirs and private
+/// dotfiles.
 /// Returns `false` when the visitor asked to abort, and propagates that
 /// through parent directories instead of finishing their walk.
 pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
@@ -2480,10 +2751,7 @@ pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        if name.starts_with('.') && name != ".env.example" {
+        if skip_entry(&name) {
             continue;
         }
         let path = entry.path();
@@ -2503,6 +2771,24 @@ pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_files_keeps_project_hidden_files_but_not_secrets() {
+        let dir = std::env::temp_dir().join(format!("lc-walk-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "target\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=x\n").unwrap();
+        let mut seen = Vec::new();
+        assert!(walk_files(&dir, &mut |p| {
+            seen.push(p.strip_prefix(&dir).unwrap().to_string_lossy().to_string());
+            true
+        }));
+        assert!(seen.iter().any(|p| p == ".github/workflows/ci.yml"));
+        assert!(seen.iter().any(|p| p == ".gitignore"));
+        assert!(!seen.iter().any(|p| p == ".env"), "grep must not read .env");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn build_tree_budget_is_global_not_per_directory() {
@@ -2541,6 +2827,49 @@ mod tests {
         assert!(!completed);
         assert_eq!(seen, 1, "the walk kept going after an abort");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_url_refuses_loopback_and_private_targets() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for url in [
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://[::1]/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = rt.block_on(fetch_url(url)).unwrap_err().to_string();
+            assert!(err.contains("blocked"), "{url} was not blocked: {err}");
+        }
+        assert!(is_local_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_local_ip("fd00::1".parse().unwrap()));
+        assert!(!is_local_ip("1.1.1.1".parse().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_is_capped_while_draining() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt
+            .block_on(run_shell_cancellable(
+                "yes x | head -c 100000",
+                &std::env::temp_dir(),
+                None,
+            ))
+            .expect("command");
+        assert!(out.contains("[output truncated]"), "missing marker");
+        assert!(
+            out.chars().count() < MAX_TOOL_OUTPUT + 500,
+            "captured {} chars",
+            out.chars().count()
+        );
     }
 
     #[cfg(unix)]
@@ -2582,7 +2911,10 @@ mod tests {
         // A killed orphan may linger as a zombie until reaped; "running" is
         // the failure. /proc is absent on some platforms, so skip then.
         if !stat.is_empty() {
-            let state = stat.rsplit(')').next().and_then(|s| s.trim().chars().next());
+            let state = stat
+                .rsplit(')')
+                .next()
+                .and_then(|s| s.trim().chars().next());
             assert!(
                 matches!(state, Some('Z') | Some('X')),
                 "grandchild {pid} survived the timeout: {stat}"
@@ -2619,27 +2951,68 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "let total = 41;\nlet x = 7;\n").unwrap();
         // Literal (default): the metacharacters are matched as-is.
-        let literal = run_grep(&dir, r"\d+", false, 0, false).unwrap();
+        let literal = run_grep(&dir, r"\d+", false, 0, false, None).unwrap();
         assert!(
             literal.contains("no matches"),
             "literal mode must not interpret regex: {literal}"
         );
         // Regex: \d+ matches the numbers.
-        let re = run_grep(&dir, r"\d+", false, 0, true).unwrap();
+        let re = run_grep(&dir, r"\d+", false, 0, true, None).unwrap();
         assert!(re.contains("a.rs:1: let total = 41;"), "{re}");
         assert!(re.contains("a.rs:2: let x = 7;"), "{re}");
         // Regex ignore_case.
-        let ic = run_grep(&dir, "LET", true, 0, true).unwrap();
+        let ic = run_grep(&dir, "LET", true, 0, true, None).unwrap();
         assert!(ic.contains("2 matches"), "{ic}");
         // Context window rendering still works in regex mode.
-        let ctx = run_grep(&dir, r"let x", false, 1, true).unwrap();
+        let ctx = run_grep(&dir, r"let x", false, 1, true, None).unwrap();
         assert!(
             ctx.contains("a.rs-1-let total = 41;"),
             "context line: {ctx}"
         );
         assert!(ctx.contains("a.rs:2:let x = 7;"), "hit line: {ctx}");
         // An invalid regex is a clean error, not a panic.
-        assert!(run_grep(&dir, "(unclosed", false, 0, true).is_err());
+        assert!(run_grep(&dir, "(unclosed", false, 0, true, None).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grep_and_glob_skip_files_rejected_by_the_read_filter() {
+        let dir = std::env::temp_dir().join(format!("lc-grep-filter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), "needle\n").unwrap();
+        std::fs::write(dir.join("secret.txt"), "needle\n").unwrap();
+        let allow = |p: &Path| p.file_name().and_then(|n| n.to_str()) != Some("secret.txt");
+        let out = run_grep(&dir, "needle", false, 0, false, Some(&allow)).unwrap();
+        assert!(out.contains("ok.txt:1"), "{out}");
+        assert!(!out.contains("secret.txt"), "{out}");
+        assert!(out.contains("1 files skipped"), "{out}");
+        let files = run_glob(&dir, "*.txt", Some(&allow)).unwrap();
+        assert!(files.contains("ok.txt"), "{files}");
+        assert!(!files.contains("secret.txt"), "{files}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hidden_search_root_is_refused_but_the_workspace_itself_is_not() {
+        let root = std::env::temp_dir().join(format!("lc-hidden-root-{}", std::process::id()));
+        let hidden = root.join(".ssh");
+        let nested = hidden.join("keys");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(ensure_search_root(&root, &hidden).is_err());
+        assert!(ensure_search_root(&root, &nested).is_err());
+        assert!(ensure_search_root(&hidden, &hidden).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_search_root_cannot_hide_behind_a_workspace_symlink() {
+        let dir = std::env::temp_dir().join(format!("lc-hidden-link-{}", std::process::id()));
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::fs::create_dir_all(real.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(ensure_search_root(&link, &link.join(".ssh")).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3007,7 +3380,7 @@ mod tests {
             ),
         };
         assert_eq!(action.danger(&cwd), Danger::High);
-        let err = block_on(action.perform_with_diff(&cwd, None)).unwrap_err();
+        let err = block_on(action.perform_with_diff_filtered(&cwd, None, None)).unwrap_err();
         assert!(
             format!("{err:#}").contains("outside the workspace"),
             "{err:#}"
@@ -3049,6 +3422,31 @@ mod tests {
         assert!(page.contains("   27| line27"));
         assert!(!page.contains("line28"));
         assert!(page.contains("offset=28"), "should hint next page: {page}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_pages_files_over_the_memory_limit() {
+        let dir = std::env::temp_dir().join(format!("lc-big-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = (1..=30_000)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.len() as u64 > MAX_READ_BYTES);
+        std::fs::write(dir.join("big.txt"), &body).unwrap();
+        let page = perform_sync(
+            Action::ReadFile {
+                path: "big.txt".into(),
+                offset: Some(25_000),
+                limit: Some(3),
+            },
+            &dir,
+        );
+        assert!(page.contains("25000| line25000"), "{page}");
+        assert!(page.contains("25002| line25002"));
+        assert!(!page.contains("line25003"));
+        assert!(page.contains("offset=25003"), "{page}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3095,7 +3493,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
-        rt.block_on(action.perform_with_diff(cwd, None))
+        rt.block_on(action.perform_with_diff_filtered(cwd, None, None))
             .expect("perform should succeed")
             .0
     }
@@ -3294,6 +3692,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_to_follow_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("lc-symlink-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "safe").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let action = Action::WriteFile {
+            path: "link.txt".into(),
+            content: "overwritten".into(),
+        };
+        let err = block_on(action.perform_with_diff_filtered(&dir, None, None)).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn html_to_text_strips_tags_and_decodes_entities() {
         let out = html_to_text("<p>Hello &amp; welcome</p><script>evil()</script>");
@@ -3352,6 +3769,17 @@ mod tests {
                 assert_eq!(max_results, 3);
             }
             other => panic!("wrong action: {other:?}"),
+        }
+        for (given, want) in [(0, 1), (100, 10)] {
+            match parse_tool_action(
+                "web_search",
+                &format!(r#"{{"query":"q","max_results":{given}}}"#),
+            )
+            .unwrap()
+            {
+                Action::WebSearch { max_results, .. } => assert_eq!(max_results, want),
+                other => panic!("wrong action: {other:?}"),
+            }
         }
     }
 

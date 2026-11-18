@@ -9,6 +9,9 @@ use crate::api::{FunctionDef, ToolDef};
 use serde::Deserialize;
 use serde_json::json;
 use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Definition of one specialist the orchestrator can spawn.
 #[derive(Debug, Clone, Copy)]
@@ -310,6 +313,66 @@ pub struct SubAgentResult {
     /// (prompt, completion) tokens, including the round that failed — a
     /// sub-agent that errors out still cost money.
     pub usage: (u64, u64),
+    /// Pre-images captured before each delegated write, so the parent can add
+    /// them to `/undo` and run post-edit hooks/LSP on the touched files.
+    pub mutations: Vec<Mutation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    pub path: PathBuf,
+    pub before: Option<Vec<u8>>,
+}
+
+/// Shared ceiling check for a delegation fan-out. Every sub-agent adds its own
+/// round usage here, seeded with the parent's totals, so the aggregate cannot
+/// outrun `[limits]` while `join_all` is still running.
+#[derive(Clone)]
+pub struct BudgetGuard {
+    limits: crate::config::Limits,
+    model: String,
+    pricing: crate::config::Pricing,
+    prompt: Arc<AtomicU64>,
+    completion: Arc<AtomicU64>,
+}
+
+impl BudgetGuard {
+    pub fn new(
+        limits: &crate::config::Limits,
+        model: &str,
+        pricing: &crate::config::Pricing,
+        prompt: u64,
+        completion: u64,
+    ) -> Self {
+        Self {
+            limits: limits.clone(),
+            model: model.to_string(),
+            pricing: pricing.clone(),
+            prompt: Arc::new(AtomicU64::new(prompt)),
+            completion: Arc::new(AtomicU64::new(completion)),
+        }
+    }
+
+    pub fn add(&self, prompt: u64, completion: u64) {
+        self.prompt.fetch_add(prompt, Ordering::Relaxed);
+        self.completion.fetch_add(completion, Ordering::Relaxed);
+    }
+
+    /// A real ceiling is configured, so a concurrent fan-out could put more
+    /// than one round in flight before any of them records its spend.
+    pub fn has_ceiling(&self) -> bool {
+        self.limits.max_tokens.is_some() || self.limits.max_cost_usd.is_some()
+    }
+
+    pub fn exceeded(&self) -> Option<String> {
+        crate::budget::exceeded(
+            &self.limits,
+            &self.model,
+            &self.pricing,
+            self.prompt.load(Ordering::Relaxed),
+            self.completion.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Run one specialist to completion. Events stream through `ui` (already
@@ -324,11 +387,14 @@ pub async fn run_sub_agent(
     spec_name: &str,
     task: &str,
     mut ui: Box<dyn UiSink>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    budget: BudgetGuard,
 ) -> SubAgentResult {
     let Some(spec) = find_role(spec_name) else {
         return SubAgentResult {
             report: format!("error: unknown agent '{spec_name}'"),
             usage: (0, 0),
+            mutations: Vec::new(),
         };
     };
     let messages = vec![
@@ -337,6 +403,7 @@ pub async fn run_sub_agent(
     ];
     // Accumulated across rounds; owned here so it survives an `Err` return.
     let mut usage = (0u64, 0u64);
+    let mut mutations = Vec::new();
     let report = match run_loop(
         client,
         model,
@@ -347,13 +414,20 @@ pub async fn run_sub_agent(
         messages,
         &mut ui,
         &mut usage,
+        &budget,
+        cancel,
+        &mut mutations,
     )
     .await
     {
         Ok(report) => report,
         Err(e) => format!("[{spec_name} failed] {e:#}"),
     };
-    SubAgentResult { report, usage }
+    SubAgentResult {
+        report,
+        usage,
+        mutations,
+    }
 }
 
 /// Apply the orchestrator's permission/secret/role gate to one sub-agent tool.
@@ -413,7 +487,15 @@ fn check_action(
     } else {
         match danger {
             Danger::Safe => true,
-            Danger::Moderate => !spec.read_only && mode != ApprovalMode::Suggest,
+            // Edits follow BUILD; shell commands and process control need FULL AUTO.
+            Danger::Moderate => {
+                !spec.read_only
+                    && if action.mutates_files() {
+                        mode != ApprovalMode::Suggest
+                    } else {
+                        mode == ApprovalMode::FullAuto || ui.approve(action, danger)
+                    }
+            }
             Danger::High => ui.approve(action, danger),
         }
     })
@@ -430,9 +512,18 @@ async fn run_loop(
     mut messages: Vec<Message>,
     ui: &mut Box<dyn UiSink>,
     usage: &mut (u64, u64),
+    budget: &BudgetGuard,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    mutations: &mut Vec<Mutation>,
 ) -> anyhow::Result<String> {
     let tools = toolset_for(spec);
     for _round in 0..MAX_SUB_ROUNDS {
+        if crate::agent::is_cancelled(cancel) {
+            anyhow::bail!("interrupted by user");
+        }
+        if let Some(reason) = budget.exceeded() {
+            anyhow::bail!(reason);
+        }
         let turn = client
             .stream_chat(
                 model,
@@ -444,12 +535,17 @@ async fn run_loop(
                     StreamEvent::Usage(u) => ui.on_event(AgentEvent::Usage(u)),
                     StreamEvent::Notice(s) => ui.on_event(AgentEvent::Notice(s)),
                 },
-                None,
+                cancel,
             )
             .await?;
         if let Some(u) = turn.usage {
-            usage.0 = usage.0.saturating_add(u.billable_prompt());
+            let prompt = u.billable_prompt();
+            usage.0 = usage.0.saturating_add(prompt);
             usage.1 = usage.1.saturating_add(u.completion_tokens);
+            budget.add(prompt, u.completion_tokens);
+        }
+        if let Some(reason) = budget.exceeded() {
+            anyhow::bail!(reason);
         }
         if turn.tool_calls.is_empty() {
             if turn.content.trim().is_empty() {
@@ -466,6 +562,9 @@ async fn run_loop(
             },
         ));
         for tc in turn.tool_calls {
+            if crate::agent::is_cancelled(cancel) {
+                anyhow::bail!("interrupted by user");
+            }
             // tool_name() strips provider namespaces (Gemini `default_api:`).
             let tool_name = tc.tool_name().to_string();
             // Toolset restriction is enforced again at execution time.
@@ -487,18 +586,33 @@ async fn run_loop(
             let result = match check_action(&action, spec, mode, permissions, cwd, ui.as_mut()) {
                 Err(reason) => reason,
                 Ok(false) => "User DECLINED this action.".to_string(),
-                Ok(true) => match action.perform_with_diff(cwd, None).await {
-                    Ok((out, files)) => {
-                        if !files.is_empty() {
-                            ui.on_event(AgentEvent::ToolEdit {
-                                name: format!("{}/{tool_name}", spec.name),
-                                files,
-                            });
-                        }
-                        out
+                Ok(true) => {
+                    if action.mutates_files() {
+                        mutations.extend(
+                            crate::agent::mutation_snapshots(cwd, &action)
+                                .into_iter()
+                                .map(|(path, before)| Mutation { path, before }),
+                        );
                     }
-                    Err(e) => format!("Command failed: {e:#}"),
-                },
+                    let filter = |p: &std::path::Path| {
+                        crate::agent::read_path_allowed(permissions, cwd, p)
+                    };
+                    match action
+                        .perform_with_diff_filtered(cwd, cancel, Some(&filter))
+                        .await
+                    {
+                        Ok((out, files)) => {
+                            if !files.is_empty() {
+                                ui.on_event(AgentEvent::ToolEdit {
+                                    name: format!("{}/{tool_name}", spec.name),
+                                    files,
+                                });
+                            }
+                            out
+                        }
+                        Err(e) => format!("Command failed: {e:#}"),
+                    }
+                }
             };
             ui.on_event(AgentEvent::ToolDone {
                 name: format!("{}/{tool_name}", spec.name),
@@ -597,9 +711,15 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let err =
-            check_action(&read_env, &coder, ApprovalMode::FullAuto, &denied, &dir, &mut ui)
-                .unwrap_err();
+        let err = check_action(
+            &read_env,
+            &coder,
+            ApprovalMode::FullAuto,
+            &denied,
+            &dir,
+            &mut ui,
+        )
+        .unwrap_err();
         assert!(err.contains("denied"), "{err}");
 
         let err = check_action(
@@ -637,6 +757,34 @@ mod tests {
             "an allow rule must not bypass a High outside-workspace write"
         );
 
+        let cmd = crate::tools::Action::RunCommand {
+            command: "echo hi".into(),
+        };
+        assert_eq!(
+            check_action(
+                &cmd,
+                &coder,
+                ApprovalMode::AutoEdit,
+                &crate::permissions::Permissions::default(),
+                &dir,
+                &mut ui,
+            ),
+            Ok(false),
+            "BUILD must ask before a sub-agent shell command"
+        );
+        assert_eq!(
+            check_action(
+                &cmd,
+                &coder,
+                ApprovalMode::FullAuto,
+                &crate::permissions::Permissions::default(),
+                &dir,
+                &mut ui,
+            ),
+            Ok(true),
+            "FULL AUTO should allow a moderate command"
+        );
+
         let plan_write = crate::tools::Action::WriteFile {
             path: "x".into(),
             content: "x".into(),
@@ -653,6 +801,24 @@ mod tests {
         assert!(err.contains("read-only"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn budget_guard_blocks_aggregate_delegated_spend() {
+        let limits = crate::config::Limits {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let guard = BudgetGuard::new(
+            &limits,
+            "unknown-model",
+            &crate::config::Pricing::default(),
+            60,
+            0,
+        );
+        assert!(guard.exceeded().is_none());
+        guard.add(50, 0);
+        assert!(guard.exceeded().unwrap().contains("token budget reached"));
     }
 
     #[test]

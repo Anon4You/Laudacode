@@ -330,6 +330,9 @@ impl Session {
         let Some(session) = Self::resolve(id_or_name) else {
             return Ok(None);
         };
+        if !valid_session_id(&session.id) {
+            bail!("invalid session id '{}'", session.id);
+        }
         let path = Self::path_for(&session.id);
         if path.exists() {
             fs::remove_file(&path).with_context(|| format!("removing session '{}'", session.id))?;
@@ -348,6 +351,9 @@ impl Session {
         let Some(session) = Self::resolve(id_or_name) else {
             return Ok(None);
         };
+        if !valid_session_id(&session.id) {
+            bail!("invalid session id '{}'", session.id);
+        }
         let archived = Self::archived_dir();
         fs::create_dir_all(&archived).context("creating archive dir")?;
         fs::rename(Self::path_for(&session.id), archived.join(format!("{}.json", session.id)))
@@ -501,7 +507,16 @@ fn scan_sessions(dir: &Path, visit: &mut dyn FnMut(Session)) {
         let Ok(raw) = fs::read_to_string(&p) else {
             continue;
         };
-        if let Ok(sess) = serde_json::from_str::<Session>(&raw) {
+        let Ok(sess) = serde_json::from_str::<Session>(&raw) else {
+            continue;
+        };
+        // The id in the JSON is attacker-controlled. It must be a safe path
+        // component *and* match this file, or `path_for(id)` could escape the
+        // sessions directory during delete/archive.
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if valid_session_id(&sess.id) && sess.id == stem {
             visit(sess);
         }
     }
@@ -646,6 +661,23 @@ mod tests {
         assert!(s.checkpoints.is_empty());
         assert!(s.branched_from.is_none());
         assert!(s.checkpoint_list().contains("no checkpoints yet"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scans_ignore_sessions_whose_json_id_escapes_the_directory() {
+        let (_g, dir) = test_env();
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::json!({
+            "id": "../escaped",
+            "created_unix": 1,
+            "messages": []
+        })
+        .to_string();
+        std::fs::write(dir.join("hack.json"), raw).unwrap();
+        assert!(Session::resolve("../escaped").is_none());
+        assert!(Session::delete("../escaped").unwrap().is_none());
+        assert!(Session::load_by_name("../escaped").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

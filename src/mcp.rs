@@ -33,6 +33,11 @@ const INIT_TIMEOUT_SECS: u64 = 20;
 /// Bound on retained stderr/notifications. A chatty server must not grow these
 /// without limit over a long session.
 const LOG_CAP: usize = 50;
+/// One JSON-RPC reply may not exceed this. A malformed or hostile server must
+/// not be able to exhaust memory with a single newline-free line.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// A server that stops draining stdin must not wedge the agent forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ServerSpec {
@@ -170,6 +175,9 @@ struct Child {
     /// `None` only while a request has it checked out, so exactly one reader
     /// ever owns the stdout pipe.
     reader: Option<BufReader<tokio::process::ChildStdout>>,
+    /// Bytes already read but not yet terminated by a newline. Kept across
+    /// request timeouts so a cancelled read cannot swallow the next reply.
+    line_buf: Vec<u8>,
     /// Server→client notifications seen while waiting for a response.
     notifications: Arc<Mutex<Vec<serde_json::Value>>>,
     /// First stderr lines, for diagnosing a server that dies on startup.
@@ -349,7 +357,15 @@ impl Mcp {
     /// Any failure is recorded on the server so `/mcp` can explain itself; a
     /// dead server must not look like a server with no tools.
     pub async fn connect(&mut self, idx: usize) -> Result<()> {
-        match self.connect_inner(idx).await {
+        self.connect_with_cancel(idx, None).await
+    }
+
+    async fn connect_with_cancel(
+        &mut self,
+        idx: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        match self.connect_inner(idx, cancel).await {
             Ok(()) => {
                 self.servers[idx].last_error = None;
                 Ok(())
@@ -367,7 +383,11 @@ impl Mcp {
         }
     }
 
-    async fn connect_inner(&mut self, idx: usize) -> Result<()> {
+    async fn connect_inner(
+        &mut self,
+        idx: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         if self.servers[idx].is_running() {
             return Ok(());
         }
@@ -389,8 +409,7 @@ impl Mcp {
             .as_ref()
             .map_or_else(|| self.cwd.clone(), |c| self.cwd.join(c));
         cmd.current_dir(&dir);
-        // Env is additive: servers need PATH and HOME, so replacing the
-        // environment wholesale would break most of them.
+        crate::child_env::scrub(&mut cmd);
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
@@ -430,6 +449,7 @@ impl Mcp {
             proc,
             stdin,
             reader: Some(BufReader::new(stdout)),
+            line_buf: Vec::new(),
             notifications: Arc::new(Mutex::new(Vec::new())),
             stderr: stderr_buf,
             next_id: 0,
@@ -451,6 +471,7 @@ impl Mcp {
             } else {
                 budget
             }),
+            cancel,
         )
         .await
         .with_context(|| format!("initializing MCP server '{name}'"))?;
@@ -462,12 +483,16 @@ impl Mcp {
         )
         .await?;
 
-        self.list_tools(idx).await?;
+        self.list_tools(idx, cancel).await?;
         Ok(())
     }
 
     /// `tools/list`, following `nextCursor` until the server stops paging.
-    async fn list_tools(&mut self, idx: usize) -> Result<()> {
+    async fn list_tools(
+        &mut self,
+        idx: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
         let name = self.servers[idx].name.clone();
         let mut tools: Vec<McpTool> = Vec::new();
         let mut cursor: Option<String> = None;
@@ -478,7 +503,7 @@ impl Mcp {
                 None => serde_json::json!({}),
             };
             let reply = self
-                .request(idx, "tools/list", params, self.timeout(idx))
+                .request(idx, "tools/list", params, self.timeout(idx), cancel)
                 .await
                 .with_context(|| format!("tools/list on MCP server '{name}'"))?;
             let parsed: ToolsListResult = serde_json::from_value(reply)
@@ -518,10 +543,19 @@ impl Mcp {
     }
 
     /// Invoke a tool and flatten the MCP content blocks into text.
-    pub async fn call_tool(&mut self, idx: usize, tool: &str, arguments: &str) -> Result<String> {
+    pub async fn call_tool(
+        &mut self,
+        idx: usize,
+        tool: &str,
+        arguments: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
         let name = self.servers[idx].name.clone();
         if !self.servers[idx].is_running() {
-            self.connect(idx).await.ok();
+            self.connect_with_cancel(idx, cancel).await.ok();
+        }
+        if crate::agent::is_cancelled(cancel) {
+            bail!("cancelled");
         }
         if !self.servers[idx].is_running() {
             bail!("MCP server '{name}' is not running");
@@ -535,7 +569,7 @@ impl Mcp {
         };
         let params = serde_json::json!({ "name": tool, "arguments": args });
         let reply = self
-            .request(idx, "tools/call", params, self.timeout(idx))
+            .request(idx, "tools/call", params, self.timeout(idx), cancel)
             .await
             .with_context(|| format!("tools/call '{tool}' on MCP server '{name}'"))?;
         Ok(flatten_content(&reply))
@@ -548,12 +582,22 @@ impl Mcp {
             .child
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("MCP server is not running"))?;
-        c.stdin
-            .write_all(&line)
-            .await
-            .context("writing to MCP server")?;
-        c.stdin.flush().await.context("flushing MCP server stdin")?;
-        Ok(())
+        let write = async {
+            c.stdin
+                .write_all(&line)
+                .await
+                .context("writing to MCP server")?;
+            c.stdin.flush().await.context("flushing MCP server stdin")?;
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                self.servers[idx].shutdown().await;
+                bail!("timed out writing to MCP server")
+            }
+        }
     }
 
     /// Send a request and read until its response arrives, answering any
@@ -564,6 +608,7 @@ impl Mcp {
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<serde_json::Value> {
         let id = {
             let c = self.servers[idx]
@@ -579,27 +624,46 @@ impl Mcp {
         self.notify(idx, &msg).await?;
 
         // Check the reader out so exactly one owner touches the stdout pipe.
-        let mut reader = self.servers[idx]
-            .child
-            .as_mut()
-            .and_then(|c| c.reader.take())
-            .ok_or_else(|| anyhow::anyhow!("MCP server stdout is unavailable"))?;
+        // The pending buffer comes too: a timeout may cancel `fill_buf` mid-line.
+        let (mut reader, mut line_buf) = {
+            let c = self.servers[idx]
+                .child
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("MCP server stdout is unavailable"))?;
+            let reader = c
+                .reader
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("MCP server stdout is unavailable"))?;
+            (reader, std::mem::take(&mut c.line_buf))
+        };
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut line = String::new();
         let outcome: Result<serde_json::Value> = loop {
+            if crate::agent::is_cancelled(cancel) {
+                break Err(anyhow::anyhow!("cancelled"));
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break Err(self
                     .timeout_error(idx, timeout)
                     .context("MCP request timed out"));
             }
-            line.clear();
-            match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
-                Err(_) => continue, // deadline re-checked at the top
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(200)),
+                read_line_capped(&mut reader, &mut line_buf, &mut line),
+            )
+            .await
+            {
+                Err(_) => {
+                    if crate::agent::is_cancelled(cancel) {
+                        break Err(anyhow::anyhow!("cancelled"));
+                    }
+                    continue; // deadline and cancel re-checked at the top
+                }
                 Ok(Err(e)) => break Err(e).context("reading from MCP server"),
-                Ok(Ok(0)) => break Err(self.closed_error(idx)),
-                Ok(Ok(_)) => {}
+                Ok(Ok(None)) => break Err(self.closed_error(idx)),
+                Ok(Ok(Some(_))) => {}
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -635,6 +699,7 @@ impl Mcp {
         // Hand the reader back even on failure, or the server is unusable.
         if let Some(c) = self.servers[idx].child.as_mut() {
             c.reader = Some(reader);
+            c.line_buf = line_buf;
         }
         outcome
     }
@@ -713,6 +778,60 @@ impl Mcp {
     }
 }
 
+/// Read one newline-terminated message without `read_line`'s unbounded
+/// allocation. Returns `None` at EOF.
+async fn read_line_capped(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    pending: &mut Vec<u8>,
+    out: &mut String,
+) -> std::io::Result<Option<usize>> {
+    loop {
+        if let Some(n) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=n).collect();
+            *out = String::from_utf8(line).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MCP message is not UTF-8",
+                )
+            })?;
+            return Ok(Some(out.len()));
+        }
+        if pending.len() > MAX_MESSAGE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP message exceeds {} bytes", MAX_MESSAGE_BYTES),
+            ));
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            let line = std::mem::take(pending);
+            *out = String::from_utf8(line).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MCP message is not UTF-8",
+                )
+            })?;
+            return Ok(Some(out.len()));
+        }
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|n| n + 1)
+            .unwrap_or(available.len());
+        if pending.len() + take > MAX_MESSAGE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP message exceeds {} bytes", MAX_MESSAGE_BYTES),
+            ));
+        }
+        pending.extend_from_slice(&available[..take]);
+        reader.consume(take);
+    }
+}
+
 /// MCP returns content blocks; the model only wants text.
 fn flatten_content(result: &serde_json::Value) -> String {
     let is_error = result
@@ -746,11 +865,12 @@ fn flatten_content(result: &serde_json::Value) -> String {
         out.push(result.to_string());
     }
     let body = out.join("\n");
-    if is_error {
+    let text = if is_error {
         format!("[mcp tool reported an error] {body}")
     } else {
         body
-    }
+    };
+    crate::tools::truncate(&text)
 }
 
 #[cfg(test)]
@@ -784,6 +904,16 @@ mod tests {
         assert_eq!(split_qualified("files__read"), None);
         assert_eq!(split_qualified("mcp__nope"), None);
         assert_eq!(split_qualified("mcp____read"), None);
+    }
+
+    #[test]
+    fn flatten_caps_hostile_output() {
+        let big = "x".repeat(100_000);
+        let out = flatten_content(&serde_json::json!({
+            "content": [{"type": "text", "text": big}]
+        }));
+        assert!(out.chars().count() <= 8 * 1024 + 32, "{}", out.len());
+        assert!(out.contains("[output truncated]"));
     }
 
     #[test]
@@ -936,14 +1066,14 @@ mod tests {
 
             // Content blocks flatten to text.
             let out = m
-                .call_tool(0, "echo", r#"{"text":"hi"}"#)
+                .call_tool(0, "echo", r#"{"text":"hi"}"#, None)
                 .await
                 .expect("tools/call");
             assert!(out.contains("ECHO:hi"), "{out}");
             assert!(out.contains("second block"), "{out}");
 
             // A JSON-RPC error surfaces as an error, not as a silent empty.
-            let err = m.call_tool(0, "boom", "{}").await.unwrap_err();
+            let err = m.call_tool(0, "boom", "{}", None).await.unwrap_err();
             assert!(format!("{err:#}").contains("tool exploded"), "{err:#}");
 
             m.shutdown_all().await;
@@ -1017,6 +1147,32 @@ mod tests {
         // Unknown names must not be treated as allowed, or Plan mode would
         // hand a model a tool we cannot attribute to any server.
         assert!(!m.server_allows_plan("mcp__ghost__read"));
+    }
+
+    #[test]
+    fn cancellation_stops_waiting_for_a_slow_tool() {
+        let Some(script) = tiny_server() else {
+            eprintln!("skipping: tiny MCP server script not present");
+            return;
+        };
+        let mut specs = BTreeMap::new();
+        specs.insert("tiny".to_string(), spec("python3"));
+        specs.get_mut("tiny").unwrap().args = vec![script, "--slow-call".into()];
+        let mut m = Mcp::from_specs(Path::new("."), specs);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        rt(async {
+            m.connect(0).await.expect("handshake");
+            let e = m
+                .call_tool(0, "echo", r#"{"text":"hi"}"#, Some(&cancel))
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+        });
     }
 
     #[test]

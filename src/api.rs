@@ -495,6 +495,11 @@ const POWERBRAIN_URL: &str = "https://powerbrainai.com/app/backend/api/api.php";
 /// A healthy SSE stream emits keepalives/frames constantly; a silent gap this
 /// long means the connection is effectively dead.
 const STREAM_IDLE: Duration = Duration::from_secs(75);
+/// After `finish_reason` the server may still send one usage-only chunk and
+/// then `[DONE]`. Wait briefly for it, but never for the full idle timeout.
+const DONE_GRACE: Duration = Duration::from_secs(1);
+/// An SSE frame this large is a runaway/malformed server, not a tool call.
+const MAX_SSE_FRAME: usize = 16 * 1024 * 1024;
 
 /// Process-wide transport settings from `[network]`. Installed once at startup
 /// so every client — including provider probes and sub-agents — honors the
@@ -696,6 +701,37 @@ fn root_cause(e: &reqwest::Error) -> String {
 /// shared `[network]` settings, with caller-chosen timeouts. Streaming model
 /// requests use [`build_http`] directly — they must not have a total timeout.
 pub fn build_web_client(connect: Duration, total: Duration) -> Result<reqwest::Client> {
+    web_client(connect, total)?
+        .build()
+        .context("building http client")
+}
+
+/// Same client, but no automatic redirects: `fetch_url` checks every hop so a
+/// public page cannot bounce the agent into `localhost`/a LAN address.
+pub fn build_web_client_no_redirect(connect: Duration, total: Duration) -> Result<reqwest::Client> {
+    web_client(connect, total)?
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building http client")
+}
+
+/// Same client, but pin `host` to the addresses we already checked. Without
+/// this, a DNS response can change between validation and `reqwest`'s own
+/// lookup, turning an SSRF check into a TOCTOU race.
+pub fn build_web_client_no_redirect_pinned(
+    connect: Duration,
+    total: Duration,
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> Result<reqwest::Client> {
+    web_client(connect, total)?
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .context("building http client")
+}
+
+fn web_client(connect: Duration, total: Duration) -> Result<reqwest::ClientBuilder> {
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("laudacode/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(connect)
@@ -703,7 +739,7 @@ pub fn build_web_client(connect: Duration, total: Duration) -> Result<reqwest::C
     if let Some(net) = default_network() {
         b = apply_network(b, net)?;
     }
-    b.build().context("building http client")
+    Ok(b)
 }
 
 impl ChatClient {
@@ -924,10 +960,26 @@ impl ChatClient {
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         let mut turn = Turn::default();
         let mut acc: Vec<ToolCallAcc> = Vec::new();
+        let mut done = false;
+        let mut saw_done = false;
+        let mut done_at: Option<std::time::Instant> = None;
 
         loop {
-            let next = tokio::time::timeout(STREAM_IDLE, stream.next()).await;
+            let wait = match done_at {
+                Some(at) => DONE_GRACE.saturating_sub(at.elapsed()),
+                None => STREAM_IDLE,
+            };
+            if wait.is_zero() {
+                break;
+            }
+            let next = tokio::time::timeout(wait, stream.next()).await;
             let item = match next {
+                Err(_) if done => {
+                    if is_cancelled(cancel) {
+                        bail!("cancelled");
+                    }
+                    break;
+                }
                 Err(_) => bail!(
                     "stream stalled — no data for {}s (server hung up?)",
                     STREAM_IDLE.as_secs()
@@ -940,6 +992,12 @@ impl ChatClient {
             }
             let chunk = item.context("connection lost while streaming")?;
             buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_SSE_FRAME {
+                bail!(
+                    "SSE frame exceeded {} bytes — server is not speaking the protocol",
+                    MAX_SSE_FRAME
+                );
+            }
             // SSE frames are separated by a blank line ("\n\n" or "\r\n\r\n").
             while let Some((_sep, consume)) = find_frame_end(&buf) {
                 let frame: Vec<u8> = buf.drain(..consume).collect();
@@ -951,6 +1009,9 @@ impl ChatClient {
                     }
                     let data = line[5..].trim();
                     if data == "[DONE]" {
+                        done = true;
+                        saw_done = true;
+                        done_at.get_or_insert_with(std::time::Instant::now);
                         continue;
                     }
                     if let Ok(c) = serde_json::from_str::<Chunk>(data) {
@@ -990,14 +1051,34 @@ impl ChatClient {
                             if let Some(fr) = choice.finish_reason {
                                 if !fr.is_empty() {
                                     turn.finish_reason = Some(fr);
+                                    done = true;
+                                    done_at.get_or_insert_with(std::time::Instant::now);
                                 }
                             }
                         }
                     }
                 }
             }
+            if saw_done {
+                break;
+            }
         }
 
+        // A connection that closes between frames is indistinguishable from a
+        // complete reply unless the provider signalled the end. Never persist
+        // a half answer as final.
+        if !buf.is_empty() {
+            let leftover = String::from_utf8_lossy(&buf);
+            let leftover = leftover.trim();
+            if leftover == "data: [DONE]" {
+                done = true;
+            } else if !leftover.is_empty() && !done {
+                bail!("stream ended in the middle of an SSE frame (truncated response)");
+            }
+        }
+        if !done {
+            bail!("stream ended before [DONE]/finish_reason (truncated response)");
+        }
         turn.tool_calls = acc.into_iter().map(ToolCallAcc::finish).collect();
 
         Ok(turn)
@@ -1801,6 +1882,64 @@ mod tests {
         )
     }
 
+    /// A server that sends a terminal frame but keeps the socket open.
+    /// Reading until EOF would hang; the client must stop on finish_reason.
+    fn spawn_open_stream_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let body = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {"content": "whole"}, "finish_reason": "stop"}]
+                })
+            );
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.flush();
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn usage_after_finish_reason_is_kept() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, _server) = spawn_canned_server(vec![resp]);
+        let c = ChatClient::new(&url, "k", &Default::default(), None, "openai").expect("client");
+        let turn = c
+            .stream_chat("m", &[Message::user("hi")], &[], |_| {}, None)
+            .await
+            .expect("complete stream");
+        assert_eq!(turn.content, "x");
+        assert_eq!(turn.usage.unwrap().total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn stops_after_finish_reason_without_waiting_for_eof() {
+        let url = spawn_open_stream_server();
+        let c = ChatClient::new(&url, "k", &Default::default(), None, "openai").expect("client");
+        let turn = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            c.stream_chat("m", &[Message::user("hi")], &[], |_| {}, None),
+        )
+        .await
+        .expect("must not wait for the server to close")
+        .expect("turn");
+        assert_eq!(turn.content, "whole");
+    }
+
     #[test]
     fn usage_tolerates_missing_fields() {
         // A provider that omits `completion_tokens` used to fail the whole
@@ -1887,6 +2026,47 @@ mod tests {
         assert_eq!(seen.len(), 2, "one notice per retry: {seen:?}");
         assert!(seen[0].contains("rate limited"), "{seen:?}");
         assert!(seen[0].contains("429"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_stream_is_not_a_complete_answer() {
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "half"}}]})
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, _server) = spawn_canned_server(vec![response]);
+        let c = ChatClient::new(&url, "k", &Default::default(), None, "openai").expect("client");
+        let err = c
+            .stream_chat("m", &[Message::user("hi")], &[], |_| {}, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn trailing_whitespace_after_done_is_not_truncation() {
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "whole"}}]})
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, _server) = spawn_canned_server(vec![response]);
+        let c = ChatClient::new(&url, "k", &Default::default(), None, "openai").expect("client");
+        let turn = c
+            .stream_chat("m", &[Message::user("hi")], &[], |_| {}, None)
+            .await
+            .expect("complete stream");
+        assert_eq!(turn.content, "whole");
     }
 
     #[tokio::test]
