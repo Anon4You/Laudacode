@@ -2,146 +2,247 @@
 
 # Laudacode
 
-**A fast, lightweight AI coding agent for your terminal.**<br/>
-Pure Rust, no Node.js, tiny binary, built for Termux.
+**A terminal-native AI coding agent built in Rust.**
 
-<img src="./img/laudacode.jpg" alt="Laudacode" width="100%"/>
+Read, edit, search, run, and verify code through a fast, approval-driven TUI.<br/>
+Runs on Termux, Linux, and macOS. Connects to any OpenAI-compatible API.
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://rust-lang.org)
+[![CI](https://github.com/Anon4You/Laudacode/actions/workflows/ci.yml/badge.svg)](https://github.com/Anon4You/Laudacode/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Anon4You/Laudacode?sort=semver)](https://github.com/Anon4You/Laudacode/releases)
+[![Rust 1.75+](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green)](#install)
+
+<img src="./img/laudacode.jpg" alt="Laudacode terminal interface" width="100%"/>
 
 </div>
 
 ---
 
-Laudacode is an AI agent that lives in your terminal. It reads your project,
-edits files, runs commands and fetches web docs — all under your approval —
-using **any OpenAI-compatible API**: OpenAI, OpenRouter, Groq, DeepSeek,
-Together, Ollama, LM Studio, llama.cpp server, vLLM…
+## Overview
+
+Laudacode is a coding agent that runs entirely in your terminal. It reads the
+workspace, edits files, runs commands, searches code, queries language servers,
+and fetches documentation, with every mutation governed by configurable
+approval rules.
+
+It is distributed as a single Rust binary. There is no Node.js runtime, no
+bundled toolchain, and no OpenSSL dependency. Requests are made over rustls and
+work with OpenAI, OpenRouter, Groq, DeepSeek, Together, Ollama, LM Studio,
+llama.cpp, vLLM, and any other OpenAI-compatible endpoint.
+
+| | |
+|---|---|
+| **Runtime** | Rust 1.75+, Tokio, reqwest with rustls |
+| **Platforms** | Termux/Android, Linux, macOS |
+| **Interface** | Interactive TUI, one-shot execution, JSON event output |
+| **Providers** | Any OpenAI-compatible API; keyless presets included |
+| **License** | MIT |
+
+### Design principles
+
+- **Local execution, explicit network traffic.** Tools operate on your machine;
+  Laudacode's own network calls are limited to model requests and tools you
+  invoke. MCP servers and hooks run as separate programs under your rules.
+- **Review before mutation.** Edits produce diffs, dangerous commands are
+  classified, and every write path is containment-checked.
+- **Boring dependencies.** Pure Rust, rustls, and a small, auditable toolset.
+- **Terminal-first ergonomics.** Keyboard and touch input, narrow-terminal
+  layout, streaming output, and persistent sessions.
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Security model](#security-model)
+- [CLI reference](#cli-reference)
+- [Interactive reference](#interactive-reference)
+- [Development](#development)
+- [License](#license)
 
 ## Features
 
-- ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small, nearly static binary, built for Android/Termux
-- 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
-- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `git`, `update_plan`
-- 🔎 **Regex search** — `grep` is literal by default, pass `"regex": true` for a pattern; honors `ignore_case`, `context`, and has a compiled-size cap
-- 📊 **Local git** — one `git` tool, fixed local allowlist, direct argv, no shell. Read: `status`, `log`, `diff`, `show`, `blame`. Write: `add`, `commit`, `branch`, `checkout`, `stash`. No `push`/`fetch`/`reset` — use `run_command` for those, so the dangerous-command detector still sees them
-- 🧩 **MCP tool servers** — `[mcp_servers.<name>]` spawns any stdio MCP server and exposes its tools as `mcp__<server>__<tool>`; paged listings, per-request timeouts, name-collision rejection, and `/mcp` for status. Third-party tools ask for consent in BUILD/PLAN unless FULL AUTO
-- 🚀 **Parallel tool calls** — independent reads (`read_file`, `grep`, `glob`, `fetch_url`, `web_search`, git reads) in one assistant turn run concurrently; results stay in call order, and every write still runs sequentially behind its approval
-- 🪝 **Post-edit hooks** — `[hooks] post_edit` runs formatters/linters/tests after every file mutation; exit status and output go back to the model
-- 💸 **Token & cost guardrails** — `[limits] max_tokens` / `max_cost_usd`; `/status` shows what's left. Cost is priced per model (input and output separately) from a built-in table, overridable with `[pricing]`; sub-agent spend counts too
-- 🧾 **Structured logs** — optional JSONL trail of tool calls, usage, hook results, budget blocks; never prompts or file contents
-- 🛰️ **Proxy & custom CAs** — `[network] proxy` (http/https/socks5), `ca_bundle`, explicit `insecure`
-- 🚦 **Patient about flaky networks** — up to 5 retries by default on dropped connections and 408/409/429/5xx, jittered exponential backoff honoring `Retry-After`. Waits show in the status line, `Esc` cancels instantly, tune with `[limits] max_retries`
-- ⚙️ **Managed processes** — `start_process` / `poll_process` / `write_process` / `stop_process` for dev servers, watchers, REPLs; 16 per agent, 8 KiB per stream, process-group cleanup
-- 🌐 **Web built in** — `fetch_url` plus `web_search` (DuckDuckGo)
-- 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto`, with confirmation for dangerous commands
-- 🔐 **Per-tool permissions** — `[permission.bash|edit|read|webfetch|mcp]` maps a glob to a rule, last match wins: `"*" = "ask"`, `"git *" = "allow"`, `"rm *" = "deny"`. Unmatched tools fall back to the danger heuristics. A prompt is always a *no*: Enter and EOF deny
-- 🤝 **Sub-agents** — `delegate` fans a task out to specialists (`planner`, `researcher`, `coder`, `reviewer`, `tester`) running concurrently with their own contexts and reduced toolsets — `reviewer` is read-only. `/agents` lists them
-- 🎓 **Skills** — markdown playbooks in `~/.config/laudacode/skills/<name>/SKILL.md` or `.laudacode/skills/<name>/SKILL.md`; `/skills` opens a searchable picker and stages the pick into the composer
-- 📝 **Custom slash commands** — drop a markdown file in `.laudacode/commands/`; `$ARGUMENTS` and `$1`…`$9` expand at call time
-- 🖼️ **Image input** — screenshots and photos for vision models (`-i`, `/image`)
-- 📡 **Streaming responses** with reasoning-model support
-- 🎨 **17 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker, catppuccin, rosepine, ayu, onedark (`/theme`)
-- ✨ **Ambient effects** — petals, rain, snow, matrix rain, lightning, stars, fireflies, bubbles, embers, confetti, comets, aurora, leaves, drizzle, rainbow, pulse (`/effect`, banner only)
-- 🌈 **Syntax highlighting** — code blocks and diffs, per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
-- ⌨️ **Prompt history** — ↑/↓ recall with draft restore, persisted
-- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry` and more, plus `@file`, `#note` and `!<cmd>`
-- ↩️ **Multi-turn undo** — `/undo N` reverts the last N agent turns
-- 💰 **Session cost tracking** — cumulative tokens and estimated USD in `/status`
-- 📱 **Adaptive mobile UI** — banner art collapses to a one-line header on small screens
-- 👆 **Touch-native** — swipe to scroll, tap picker rows, tap the composer to move the caret
-- 🛠️ **Live activity feedback** — footer shows `reasoning` / `streaming` / `running <tool>` plus elapsed time
-- 📄 **AGENTS.md support** — project instructions auto-loaded (`/init` generates one)
-- 👤 **Profiles** — named presets in `[profiles.<name>]`, via `--profile`
-- 💾 **Session persistence** — `--continue`, `--resume <id>`, `/resume`; ids, unique prefixes and names all work
-- 🌿 **Checkpoints & branching** — `/checkpoint [label]`, `/checkpoints`, `/branch <n|id>`
-- 🖥️ **One-shot mode** — `laudacode exec "fix the failing test"`
-- 📦 **JSON output** — `--json` emits machine-readable event lines
+### Agent capabilities
+
+| Feature | Description |
+|---|---|
+| Agentic tool loop | Plans and executes multi-step tasks with model-selected tools. |
+| File operations | `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`. |
+| Search | `grep`, `glob`, regex mode, ignore rules, and context lines. |
+| Shell and processes | `run_command` plus managed dev servers, watchers, and REPLs. |
+| Web access | `fetch_url` and DuckDuckGo-backed `web_search`. |
+| Local Git | Fixed allowlist for status, log, diff, show, blame, add, commit, branch, checkout, and stash. Push/fetch/reset go through the visible shell gate. |
+| Parallel reads | Independent read-only tool calls in one turn run concurrently; results remain in call order. |
+| Sub-agents | `delegate` fans work out to `planner`, `researcher`, `coder`, `reviewer`, and `tester` with isolated contexts and reduced toolsets. |
+| Skills | Markdown playbooks from user or workspace skill directories, loaded through a searchable picker. |
+| Custom commands | Markdown commands in `.laudacode/commands/` with `$ARGUMENTS` and `$1`–`$9` expansion. |
+| Project instructions | `AGENTS.md` is loaded automatically; `/init` generates one. |
+| Image input | Attach screenshots and photos for vision-capable models. |
+
+### Safety and control
+
+| Feature | Description |
+|---|---|
+| Approval modes | `suggest` (PLAN), `auto-edit` (BUILD), and `full-auto` with dangerous-command confirmation. |
+| Per-tool permissions | Glob rules for shell, edits, reads, web fetches, and MCP tools. Last match wins. |
+| Workspace containment | Symlink-aware path checks and atomic writes that refuse to escape the workspace. |
+| Secret-file blocking | `.env*` and similar secret-bearing paths are denied to tools unless explicitly allowed. |
+| Transactional patches | Multi-file patches stage every hunk before writing and roll back on failure. |
+| Multi-turn undo | `/undo N` reverts file changes from the last N agent turns. |
+| Budget guardrails | Token and cost ceilings, per-model pricing, and delegated-spend accounting. |
+| Output isolation | MCP and LSP children receive an allowlisted environment, not API keys or cloud credentials. |
+| Structured logs | Optional JSONL trail for tool calls, usage, hooks, and budget blocks; prompts and file contents are excluded. |
+| Prompt defaults | No answer means deny. Enter and EOF both reject an approval prompt. |
+
+### Integrations and operations
+
+| Feature | Description |
+|---|---|
+| MCP servers | Any stdio MCP server; tools exposed as `mcp__<server>__<tool>`, with paged listings, timeouts, and collision rejection. |
+| Language servers | Any stdio LSP server, with per-extension `languageId` mapping, diagnostics, definitions, references, symbols, and hover. |
+| Post-edit hooks | Formatters, linters, and tests run after mutations; the result is fed back to the model. |
+| Retries and proxies | Jittered backoff honoring `Retry-After`, plus HTTP/SOCKS5 proxies and custom CA bundles. |
+| Session persistence | Continue, resume by id or name, archive, search, rename, and delete sessions. |
+| Checkpoints | Snapshot a conversation and branch from any checkpoint. |
+| Observability | `/status`, `/usage`, `/doctor`, and `/mcp`/`/lsp` diagnostics. |
+| Automation | `exec` mode, `--json`, `--quiet`, profiles, and documented exit codes. |
+
+### Terminal experience
+
+| Feature | Description |
+|---|---|
+| Streaming UI | Token streaming, reasoning-model output, live tool status, and elapsed time. |
+| Syntax highlighting | Code blocks and diffs for Rust, Python, JavaScript/TypeScript, Go, C/C++, Java, shell, TOML, YAML, and JSON. |
+| Themes | 17 built-in color themes, applied consistently across the UI. |
+| Adaptive layout | Banner art collapses to a one-line header on small screens. |
+| Touch support | Swipe to scroll, tap picker rows, and tap the composer to place the caret. |
+| Prompt history | Persistent `↑`/`↓` recall with draft restoration. |
+| Ambient effects | Optional banner-only effects, automatically paused while streaming. |
 
 ## Install
 
-### One-liner (Termux / Linux / macOS)
+### One-line installer
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
 ```
 
-Installs the **latest GitHub release** (auto-detected), builds it on-device and
-puts `laudacode` in `$PREFIX/bin` — no sudo inside Termux. Needs `curl`, `tar`,
-`rust` (Termux: `pkg install curl tar rust`). Pin an older release with
-`LAUDACODE_VERSION=v0.2.0`.
+The installer resolves the latest GitHub release and prefers a checksum-verified
+prebuilt binary for Termux and Linux. If no matching asset exists, it builds
+from source. On Termux it installs into `$PREFIX/bin` without `sudo`; macOS
+builds from source.
 
-### Termux / Android (manual)
+Requirements: `curl` and `tar`. The source fallback also needs Rust. On Termux:
+
+```sh
+pkg install curl tar rust
+```
+
+Pin a release with `LAUDACODE_VERSION=vX.Y.Z`.
+
+### Termux / Android
 
 ```sh
 pkg update && pkg install rust git -y
 git clone https://github.com/Anon4You/Laudacode.git
 cd Laudacode
 cargo build --release
-cp target/release/laudacode $PREFIX/bin/
+cp target/release/laudacode "$PREFIX/bin/"
 ```
 
-> Low-RAM phone? `CARGO_PROFILE_RELEASE_LTO=off cargo build --release`
+On low-memory devices, disable LTO for the build:
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=off cargo build --release
+```
 
 ### Linux / macOS
 
 ```sh
 cargo install --locked --git https://github.com/Anon4You/Laudacode
-# or from a clone:
+```
+
+Or from a clone:
+
+```sh
 cargo install --locked --path .
+```
+
+Verify the installation:
+
+```sh
+laudacode --version
 ```
 
 ## Quick start
 
+Set the three standard variables for any OpenAI-compatible provider:
+
 ```sh
-export OPENAI_API_KEY="sk-or-v1-..."          # any OpenAI-compatible key
+export OPENAI_API_KEY="sk-or-v1-..."
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_MODEL="stealth/ox-alpha"
 
-laudacode                                     # interactive REPL
-```
-
-Or skip env vars and configure from inside the TUI: first run has no wizard,
-just type `/provider`. It opens an interactive menu (**add · use · edit · list**):
-pick **add**, choose a preset (openrouter, openai, groq, deepseek, together,
-cerebras, mistral, xai, fireworks, sambanova, deepinfra, nvidia, upstage,
-minimax, huggingface, githubmodels, ollama, lmstudio…), paste your key, pick a
-model from the live catalog. Nothing is saved until a live test request proves key and model
-work — same rule for the CLI flow.
-
-**Keyless free providers** — `powerbrain` and `aitopia` need no API key and no
-model picker: picking one saves immediately with a built-in default model.
-`aitopia` is the built-in default, so with nothing configured Laudacode works
-out of the box, chat-first.
-
-```sh
-laudacode provider add                        # guided setup (name, url, key, model)
-laudacode provider list
-laudacode provider use tokenrouter
 laudacode
 ```
 
-One-shot tasks:
+Or configure providers interactively:
 
 ```sh
-laudacode exec "explain what this repo does"
+laudacode                 # opens the TUI
+/provider                 # add, use, edit, list, or show providers
+```
+
+`/provider add` offers presets for OpenRouter, OpenAI, Groq, DeepSeek, Together,
+Cerebras, Mistral, xAI, Fireworks, SambaNova, DeepInfra, NVIDIA, Upstage,
+MiniMax, Hugging Face, GitHub Models, Ollama, LM Studio, and custom endpoints.
+A configuration is saved only after a live request proves the key and model
+work.
+
+Keyless presets `powerbrain` and `aitopia` need no API key. `aitopia` is the
+built-in default, so a fresh installation can start immediately.
+
+The CLI flow is also available:
+
+```sh
+laudacode provider add
+laudacode provider list
+laudacode provider use tokenrouter
+```
+
+Run a single task without entering the TUI:
+
+```sh
+laudacode exec "explain what this repository does"
 laudacode exec "add input validation to src/main.rs" --mode full-auto
 ```
 
 ## Configuration
 
-Precedence: **CLI flags > profile (`--profile`) > environment variables > config file**.
+Precedence is:
 
-| Variable          | Meaning                               |
-|-------------------|---------------------------------------|
-| `OPENAI_API_KEY`  | API key                               |
-| `OPENAI_BASE_URL` | e.g. `https://api.groq.com/openai/v1` |
-| `OPENAI_MODEL`    | model name                            |
+```text
+CLI flags > profile (--profile) > environment variables > config file
+```
 
-Config file at `~/.config/laudacode/config.toml`
-(or `.json`; override location with `LAUDACODE_CONFIG`):
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | API key |
+| `OPENAI_BASE_URL` | Provider endpoint, e.g. `https://api.groq.com/openai/v1` |
+| `OPENAI_MODEL` | Model name |
+| `OPENAI_REASONING_EFFORT` | Optional reasoning hint |
+| `LAUDACODE_CONFIG` | Config file path |
+| `LAUDACODE_CONFIG_DIR` | Config directory override |
+| `LAUDACODE_PROVIDER` | Active provider name |
+
+### Config file
+
+The default location is `~/.config/laudacode/config.toml` (JSON is also
+supported). A complete annotated example is available in
+[`config.example.toml`](config.example.toml).
 
 ```toml
 active_provider = "openrouter"
@@ -152,51 +253,44 @@ base_url = "https://openrouter.ai/api/v1"
 api_key  = "sk-or-v1-..."
 model    = "stealth/ox-alpha"
 
-[providers.openrouter.headers]        # optional custom headers
+[providers.openrouter.headers]
 "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"
 "X-Title"      = "Laudacode"
 
-[profiles.fast]                       # optional presets → laudacode --profile fast
+[profiles.fast]
 provider = "groq"
 model    = "llama-3.3-70b-versatile"
 
-[limits]                              # stop runaway loops
+[limits]
 max_tokens   = 500000
 max_cost_usd = 5.0
 
-[pricing."anthropic/claude-sonnet-4"]  # USD per 1M tokens; beats the built-in table
+[pricing."anthropic/claude-sonnet-4"]
 input  = 3.0
 output = 15.0
 
-[hooks]                               # run after every file mutation
+[hooks]
 post_edit = ["cargo fmt", "cargo clippy --quiet -- -D warnings"]
 post_edit_timeout_secs = 30
 
-[logging]                             # JSONL trail, no prompts or file contents
-enabled = true                        # no `file` → stderr
-file  = "~/.local/share/laudacode/session.jsonl"
+[logging]
+enabled = true
+file    = "~/.local/share/laudacode/session.jsonl"
 
-[network]                             # applies to every outgoing request
-proxy     = "http://127.0.0.1:8080"  # http / https / socks5
+[network]
+proxy     = "http://127.0.0.1:8080"
 ca_bundle = "~/.config/laudacode/corp.pem"
-# insecure = true                     # skip TLS verification (risky)
+# insecure = true
 ```
 
-Post-edit hooks get the touched paths in `$LAUDACODE_CHANGED_FILES`
-(space-separated). Each hook's exit status and first output line go back to the
-model, so a failing test run is something it can see and fix. Only
-file-mutating tools trigger them.
+Post-edit hooks receive touched paths in `$LAUDACODE_CHANGED_FILES`
+(newline-separated). Each hook's exit status and first output line are returned
+to the model. Only file-mutating tools trigger hooks.
 
-Provider presets (OpenAI, OpenRouter, Groq, DeepSeek, Cerebras, Mistral, xAI,
-Fireworks, SambaNova, DeepInfra, NVIDIA, Upstage, MiniMax, Hugging Face, Ollama,
-LM Studio) and annotated versions of every block above live in
-[`config.example.toml`](config.example.toml).
+### MCP tool servers
 
-### External tool servers (MCP)
-
-Laudacode can host tools from any [MCP](https://modelcontextprotocol.io)
-server that speaks stdio. Each configured server is spawned at startup and its
-tools are exposed to the model as `mcp__<server>__<tool>`:
+Laudacode hosts tools from any stdio MCP server. Tools are exposed as
+`mcp__<server>__<tool>`:
 
 ```toml
 [mcp_servers.files]
@@ -205,26 +299,24 @@ args         = ["--root", "."]
 timeout_secs = 60
 ```
 
-| Key            | Default | Meaning                                          |
-|----------------|---------|--------------------------------------------------|
-| `command`      | —       | executable to spawn (required)                    |
-| `args`         | `[]`    | arguments                                        |
-| `env`          | `{}`    | extra environment variables                      |
-| `cwd`          | agent's | working directory for the child                   |
-| `enabled`      | `true`  | `false` keeps the config but skips startup        |
-| `timeout_secs` | `60`    | per-request budget; `0` uses the default          |
-| `plan`         | `false` | opt in to using these tools in PLAN mode          |
+| Key | Default | Description |
+|---|---|---|
+| `command` | — | Executable to spawn (required) |
+| `args` | `[]` | Arguments |
+| `env` | `{}` | Additional environment variables |
+| `cwd` | Agent cwd | Child working directory |
+| `enabled` | `true` | Keep configuration but skip startup |
+| `timeout_secs` | `60` | Per-request budget; `0` uses the default |
+| `plan` | `false` | Allow the server's tools in PLAN mode |
 
-A server that fails to start is reported and skipped — the rest of the
-session works normally, and `/mcp` shows what went wrong. Tool names are
-sanitized for the model but the original names are what get called, and two
-servers claiming the same name are rejected rather than silently shadowing
-each other.
+A failed server is reported and skipped; it does not disable the rest of the
+session. `/mcp` shows connection status and errors. Tool names are sanitized for
+the model, while the original names are used on the wire. Two servers claiming
+the same tool name are rejected.
 
-MCP tools are third-party code whose effects Laudacode cannot inspect, so
-they get no danger-based auto-approval: they ask for consent in BUILD and
-PLAN mode, and stay silent only in FULL AUTO. Override per tool with
-permission rules:
+MCP tools are third-party code whose effects cannot be inspected, so they get
+no danger-based auto-approval. They ask for consent in BUILD and PLAN and are
+silent only in FULL AUTO. Rules can override this per tool:
 
 ```toml
 [permission.mcp]
@@ -232,11 +324,9 @@ permission rules:
 "mcp__*"             = "ask"
 ```
 
-### Language servers (LSP)
+### Language servers
 
-Any stdio language server works, so the model gets real compiler-grade
-feedback instead of guessing. Each server claims file extensions and is
-mapped to the LSP `languageId` it expects:
+Any stdio language server can provide compiler-grade diagnostics and navigation:
 
 ```toml
 [lsp_servers.rust]
@@ -248,39 +338,27 @@ command = "clangd"
 filetypes = { c = "c", h = "c" }
 ```
 
-| Key                    | Default | Meaning                                    |
-|------------------------|---------|--------------------------------------------|
-| `command`              | —       | executable to spawn (required)              |
-| `args`                 | `[]`    | arguments                                  |
-| `env`                  | `{}`    | extra environment variables                |
-| `filetypes`            | `{}`    | extension (no dot) → LSP `languageId`      |
-| `enabled`              | `true`  | `false` keeps the config but skips startup  |
-| `root`                 | agent's | workspace root                             |
-| `timeout_secs`         | `90`    | per-request budget                         |
-| `init_timeout_secs`    | `120`   | `initialize` handshake budget              |
-| `diagnostics_secs`     | `5`     | how long to wait for diagnostics to settle |
+| Key | Default | Description |
+|---|---|---|
+| `command` | — | Executable to spawn (required) |
+| `args` | `[]` | Arguments |
+| `env` | `{}` | Additional environment variables |
+| `filetypes` | `{}` | Extension (no dot) to LSP `languageId` |
+| `enabled` | `true` | Keep configuration but skip startup |
+| `root` | Agent cwd | Workspace root |
+| `timeout_secs` | `90` | Per-request budget |
+| `init_timeout_secs` | `120` | `initialize` handshake budget |
+| `diagnostics_secs` | `5` | Time to wait for diagnostics to settle |
 
-Check what is running with `/lsp`. Servers start at launch, so indexes are
-warm before the first question; a server that fails to start is reported and
-skipped without affecting anything else.
+`filetypes` is explicit because LSP `languageId` values are server-specific. Two
+servers claiming the same extension are rejected at load time.
 
-`filetypes` is an explicit mapping because `languageId` is server-specific —
-`pygls` servers reject a wrong id — and two servers claiming the same
-extension is rejected at load time rather than resolved by guesswork.
+Diagnostics are asynchronous. A first empty result does not mean the file is
+clean; if the budget expires mid-analysis, Laudacode reports that analysis is
+still in progress. After an edit, diagnostics are appended to the tool result
+for files whose extension a configured server claims.
 
-Diagnostics are waited on for at most `diagnostics_secs`. Analysis is often
-asynchronous: `rust-analyzer` republishes a file's problems as its index
-settles, so a first batch of zero diagnostics does not mean the file is fine.
-If the budget runs out mid-analysis the result says it is still analysing
-rather than reporting a clean file.
-
-After any edit the server's diagnostics for the touched file are appended to
-the tool result — a real compiler front end instead of an LLM round trip on
-`cargo check`. Only extensions a server claims are checked.
-
-The `lsp` tool exposes the same server to the model on demand for
-diagnostics, definition, references, workspace symbols, and hover, gated by
-your existing read rules:
+The `lsp` tool exposes the same servers on demand:
 
 ```json
 { "action": "diagnostics", "path": "src/main.rs" }
@@ -290,116 +368,203 @@ your existing read rules:
 { "action": "hover", "path": "src/main.rs", "line": 5, "column": 1 }
 ```
 
-Positions are 1-based like `read_file` line numbers, and are converted to the
-protocol's 0-based UTF-16 units internally, so an emoji earlier in the line
-does not shift a column.
+Positions are 1-based. They are converted internally to the protocol's 0-based
+UTF-16 units.
 
-## Approval modes
+## Security model
 
-Default is **BUILD** (`auto-edit`).
+### Approval modes
 
-| `--mode` value             | TUI label | File edits | Shell commands | Dangerous commands |
-|----------------------------|-----------|------------|----------------|--------------------|
-| `suggest` (alias `ask`)    | PLAN      | ask        | ask            | ask                |
-| `auto-edit` *(default)*    | BUILD     | ✅ auto    | ask            | ask                |
-| `full-auto` (alias `yolo`) | FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
+| `--mode` | TUI label | File edits | Shell commands | Dangerous commands |
+|---|---|---|---|---|
+| `suggest` (alias `ask`) | PLAN | Ask | Ask | Ask |
+| `auto-edit` (default) | BUILD | Automatic | Ask | Ask |
+| `full-auto` (alias `yolo`) | FULL AUTO | Automatic | Automatic | Always ask |
 
-Answer `[a]lways` on any prompt to auto-approve the rest of the session. In the
-TUI, switch modes any time with `/approvals` or **Tab**.
+Answer `a` (always) on a prompt to approve the remainder of the session. Switch
+modes at any time with `/approvals` or `Tab`.
+
+### Per-tool permissions
+
+Rules are glob patterns with `allow`, `ask`, or `deny`, evaluated last match
+first:
+
+```toml
+[permission.bash]
+"*"     = "ask"
+"git *" = "allow"
+"rm *"  = "deny"
+
+[permission.edit]
+"src/**" = "allow"
+```
+
+Unmatched tools fall back to danger classification. An approval prompt is always
+a denial until answered; Enter and EOF deny.
+
+### Execution boundaries
+
+- Write paths are checked against the canonical workspace, including symlinked
+  ancestors.
+- Writes use a temporary file and rename; final-component symlinks are refused.
+- Secret-bearing filenames are blocked before tool execution.
+- MCP and LSP children receive a minimal environment allowlist plus their
+  configured overrides.
+- Shell commands are classified before approval. Dangerous commands ask even in
+  FULL AUTO.
+- MCP tools ask for consent outside FULL AUTO and can be restricted with
+  `[permission.mcp]`.
+- Logs and prompt history are created with owner-only permissions on Unix.
 
 ## CLI reference
 
-```
+```text
 laudacode                          # interactive session
 laudacode "quick question"         # one-shot prompt
 laudacode exec "<task>"            # same as above
-laudacode exec "<task>" --json     # emit JSON event lines instead of prose
-laudacode exec "<task>" --quiet    # suppress the banner; results only
+laudacode exec "<task>" --json     # JSON event lines
+laudacode exec "<task>" --quiet    # suppress banner; results only
 laudacode -P groq -m llama-3.3-70b-versatile
-laudacode --profile fast           # activate [profiles.fast] from your config
-laudacode -i screenshot.png "what's wrong with this UI?"
-laudacode --base-url http://localhost:11434/v1 --api-key ollama --model qwen2.5-coder:7b
+laudacode --profile fast
+laudacode -i screenshot.png "what is wrong with this UI?"
+laudacode --base-url http://localhost:11434/v1 \
+  --api-key ollama --model qwen2.5-coder:7b
 laudacode -c                       # continue last session
 laudacode -y                       # shorthand for --mode full-auto
 laudacode provider add|list|use|edit|remove <name>
-laudacode session checkpoints <id>            # list a session's checkpoints
-laudacode session branch <id> <checkpoint>     # fork a new session from one
+laudacode session checkpoints <id>
+laudacode session branch <id> <checkpoint>
 ```
 
-Exit codes: `0` success, `1` any failure (bad args, provider error, budget
-exhausted, tool denial). Use `--json` or `--quiet` when capturing stdout — the
-banner is suppressed automatically under `--json`.
+Exit codes: `0` success; `1` any failure, including bad arguments, provider
+errors, exhausted budget, or denied tools. With `--json`, output is machine
+readable and the banner is suppressed.
 
-## Slash commands
+## Interactive reference
 
-| Command              | Description                                  |
-|----------------------|----------------------------------------------|
-| `/help`              | command overview                             |
-| `/model`             | pick a model from the provider's live list   |
-| `/approvals`         | switch approval mode (plan/build/full-auto)  |
-| `/agents`            | list the sub-agents and their roles           |
-| `/reasoning`         | thinking depth: low · normal · medium · high · max |
-| `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
-| `/theme`             | switch color theme (live preview)            |
-| `/banner`            | roll a different banner logo                 |
-| `/effect`            | ambient effects (petals · rain · lightning…) |
-| `/status`            | provider/model/session + token, cost, budget, hook, log & network state |
-| `/update`            | check GitHub releases and install a newer binary |
-| `/doctor`            | environment diagnostics (no network, no tokens) |
-| `/usage`             | tokens & cost this session                      |
-| `/archive`           | park a session aside (hidden from /resume)      |
-| `/mcp`               | external MCP tool servers · connected, failed, or disabled |
-| `/session …`         | `rename` · `search` · `list` · `delete` sessions |
-| `/checkpoint [label]`| snapshot the conversation as a branch point    |
-| `/checkpoints`       | list this session's checkpoints                |
-| `/branch <n\|id>`    | fork a new session from a checkpoint           |
-| `/skills`            | searchable picker — pick a skill to stage it in the composer |
-| `/lsp`               | language servers · running, failed, or disabled |
-| `/diff`              | git diff of working tree                     |
-| `/review`            | AI review of the current git diff            |
-| `/undo [N]`          | revert file changes from the last N turns    |
-| `/init`              | generate AGENTS.md for this project          |
-| `/compact`           | summarize history to free context window     |
-| `/clear`             | fresh conversation                           |
-| `/retry`             | re-run the previous task                     |
-| `/resume`            | restore a previous session by id             |
-| `/image <path>`      | attach an image to your next message         |
-| `/export`            | save transcript as markdown                  |
-| `/quit`              | exit                                         |
+### Slash commands
 
-A skill is a directory with a `SKILL.md`. The frontmatter is optional; `name`
-defaults to the directory name and `description` falls back to the first body
-line. Both a one-line value and a YAML block scalar are understood:
+| Command | Description |
+|---|---|
+| `/help` | Command overview |
+| `/model` | Pick a model from the provider's live list |
+| `/approvals` | Switch approval mode |
+| `/agents` | List sub-agents and roles |
+| `/reasoning` | Set thinking depth: low, normal, medium, high, max |
+| `/provider` | Manage providers (`add`, `list`, `show`, `use`) |
+| `/theme` | Switch color theme with live preview |
+| `/banner` | Select a different banner logo |
+| `/effect` | Select an ambient effect |
+| `/status` | Provider, model, session, usage, budget, hook, log, and network state |
+| `/update` | Check releases and install a newer binary |
+| `/doctor` | Environment diagnostics without network or token use |
+| `/usage` | Tokens and estimated cost for this session |
+| `/archive` | Hide a session from `/resume` |
+| `/mcp` | MCP server status, failures, and disabled servers |
+| `/lsp` | Language server status, failures, and disabled servers |
+| `/session` | Rename, search, list, or delete sessions |
+| `/checkpoint [label]` | Mark a conversation branch point |
+| `/checkpoints` | List checkpoints |
+| `/branch <n\|id>` | Fork from a checkpoint |
+| `/skills` | Searchable skill picker |
+| `/diff` | Git diff of the working tree |
+| `/review` | AI review of the current git diff |
+| `/undo [N]` | Revert file changes from the last N turns |
+| `/init` | Generate `AGENTS.md` |
+| `/compact` | Summarize history to free context |
+| `/clear` | Start a fresh conversation |
+| `/retry` | Re-run the previous task |
+| `/resume` | Restore a previous session |
+| `/image <path>` | Attach an image to the next message |
+| `/export` | Save the transcript as Markdown |
+| `/quit` | Exit |
+
+### Input prefixes
+
+| Prefix | Effect |
+|---|---|
+| `@file` | Attach a file; contents are inlined into the prompt |
+| `#note` | Save a memory to `AGENTS.md` |
+| `!<command>` | Run a local shell command without the agent |
+
+### Keyboard and touch
+
+- Type `/` for command autocomplete; use `↑`/`↓` and `Tab`/`Enter` to complete.
+- `Ctrl+O` expands recent tool output.
+- `Esc` interrupts the agent.
+- `Ctrl+B` toggles the banner.
+- Swipe or use the wheel to scroll.
+- Tap picker rows to select them, and tap inside the composer to place the caret.
+
+### Skills
+
+A skill is a directory containing `SKILL.md`. Frontmatter is optional: `name`
+defaults to the directory name and `description` to the first body line.
 
 ```markdown
 ---
 name: my-skill
-description: >            # `|` keeps the line breaks, `>` folds them to spaces
-  Shown in the picker and
-  injected into the system prompt.
+description: >
+  Shown in the picker and injected into the system prompt.
 ---
-Full instructions. Only name + description reach the model; it reads this file
-with `read_file` when the skill is relevant.
+Full instructions. Only name and description reach the model; it reads this
+file with `read_file` when the skill is relevant.
 ```
 
-Input prefixes:
+Skills are loaded from `~/.config/laudacode/skills/<name>/SKILL.md` and
+`.laudacode/skills/<name>/SKILL.md`.
 
-| Prefix      | Effect                                        |
-|-------------|-----------------------------------------------|
-| `@file`     | attach a file — its contents are inlined into the prompt |
-| `#note`     | save a memory into AGENTS.md                  |
-| `!<command>`| run a shell command locally (no agent)        |
+## Development
 
-Keys: type `/` for autocomplete, `↑/↓` + `Tab`/`Enter` to complete,
-`Ctrl+O` expands recent tool output, `Esc` interrupts the agent.
+### Build and test
 
-**Touch / mouse** — swipe or wheel to scroll the transcript, **tap a picker row**
-to choose it (models, themes, sessions, providers…), and **tap inside the
-composer** to move the caret to that position. `Ctrl+B` toggles the banner, and
-the hint strip under the composer adapts to narrow windows automatically.
+```sh
+cargo build
+cargo test
+cargo clippy -- -D warnings
+cargo build --release
+```
+
+Network-dependent tests are ignored by default. The release binary is written
+to `target/release/laudacode`.
+
+For a manual live check:
+
+```sh
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export OPENAI_API_KEY="<key>"
+export OPENAI_MODEL="stealth/ox-alpha"
+laudacode exec "list the files in this directory"
+```
+
+### Architecture
+
+| Module | Responsibility |
+|---|---|
+| `src/main.rs` | Entry point, CLI dispatch, profile merging |
+| `src/config.rs` | Config load/save, provider resolution, environment precedence |
+| `src/agent.rs` | Agent loop, approval handling, system prompt, compaction |
+| `src/api.rs` | OpenAI-compatible client, SSE streaming, tool calls, vision |
+| `src/tools.rs` | Tool schemas and execution |
+| `src/permissions.rs` | Allow/ask/deny rule engine |
+| `src/mcp.rs`, `src/lsp.rs` | Stdio MCP and LSP clients |
+| `src/session.rs` | Conversation persistence, resume, archives, checkpoints |
+| `src/repl.rs`, `src/tui.rs` | Interactive interface and rendering |
+| `src/patch.rs`, `src/diff.rs` | Patch application and unified diffs |
+
+See [`AGENTS.md`](AGENTS.md) for detailed implementation invariants.
+
+### Contributing
+
+Issues and pull requests are welcome. Before submitting a change:
+
+1. Run `cargo test`.
+2. Run `cargo clippy -- -D warnings`.
+3. Keep new dependencies out unless they are clearly justified.
+4. Do not include API keys, tokens, or personal configuration in commits.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
-<div align="center"><sub>Built with ⚡ by Anon4You</sub></div>
+<div align="center"><sub>Built by Anon4You</sub></div>

@@ -50,7 +50,7 @@ approval_mode = "auto-edit"
 
 # Commands run after every file-mutating tool call (edit_file, write_file,
 # apply_patch). They receive the touched paths in $LAUDACODE_CHANGED_FILES
-# (space-separated) and their exit status plus first output line is reported
+# (newline-separated) and their exit status plus first output line is reported
 # back to the model, so a failing formatter or test run gets fixed instead of
 # ignored. Keep them fast — a 30s timeout applies to each.
 # [hooks]
