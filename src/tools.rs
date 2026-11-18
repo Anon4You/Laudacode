@@ -715,13 +715,24 @@ impl Action {
 
     pub fn danger(&self, cwd: &Path) -> Danger {
         match self {
-            Action::ListDir { .. }
-            | Action::ReadFile { .. }
-            | Action::ViewImage { .. }
-            | Action::FetchUrl { .. }
+            // Reads outside the workspace can expose anything the user can
+            // read, so they are not "safe" just because they do not write.
+            Action::ListDir { path } | Action::ReadFile { path, .. } | Action::ViewImage { path } => {
+                if contained_in_workspace(cwd, path) {
+                    Danger::Safe
+                } else {
+                    Danger::High
+                }
+            }
+            Action::Grep { path, .. } | Action::Glob { path, .. } => {
+                if contained_in_workspace(cwd, path.as_deref().unwrap_or(".")) {
+                    Danger::Safe
+                } else {
+                    Danger::High
+                }
+            }
+            Action::FetchUrl { .. }
             | Action::WebSearch { .. }
-            | Action::Grep { .. }
-            | Action::Glob { .. }
             | Action::PollProcess { .. }
             | Action::UpdatePlan { .. }
             | Action::Lsp { .. } => Danger::Safe,
@@ -776,7 +787,10 @@ impl Action {
                                 .map(|t| contained_in_workspace_path(cwd, &t))
                                 .unwrap_or(false)
                         };
-                        let all_inside = hunks.iter().all(|h| inside(h.classify_path()));
+                        let all_inside = hunks
+                            .iter()
+                            .flat_map(|h| h.paths())
+                            .all(inside);
                         if all_inside {
                             Danger::Moderate
                         } else {
@@ -863,12 +877,12 @@ impl Action {
                 // Plan mode already blocks non-read-only actions; this extra
                 // guard keeps outside-workspace hunks from sneaking through
                 // when the caller skipped danger classification.
-                for h in &hunks {
-                    let target = resolve_in(cwd, h.classify_path().to_string_lossy().as_ref())?;
+                for p in hunks.iter().flat_map(|h| h.paths()) {
+                    let target = resolve_in(cwd, p.to_string_lossy().as_ref())?;
                     if !contained_in_workspace_path(cwd, &target) {
                         bail!(
                             "patch touches '{}' which is outside the workspace — refused",
-                            h.classify_path().display()
+                            p.display()
                         );
                     }
                 }
@@ -1067,6 +1081,7 @@ fn run_grep(
 ) -> Result<String> {
     const MAX_HITS: usize = 200;
     const MAX_OUTPUT_LINES: usize = 400;
+    const MAX_FILES_SCANNED: usize = 5000;
     // Compiled matcher, or `None` for the literal fast path.
     let compiled = if regex {
         Some(
@@ -1087,11 +1102,19 @@ fn run_grep(
     // (relative path, 1-based line no, line text) for each hit.
     let mut hits: Vec<(String, usize, String)> = Vec::new();
     let mut files_searched = 0usize;
+    let mut visited = 0usize;
+    let mut scan_capped = false;
     let mut stop = false;
     walk_files(root, &mut |p| {
         if stop || hits.len() >= MAX_HITS {
             stop = true;
             return false; // halt the whole walk
+        }
+        visited += 1;
+        if visited > MAX_FILES_SCANNED {
+            scan_capped = true;
+            stop = true;
+            return false;
         }
         let Ok(raw) = std::fs::read(p) else {
             return true;
@@ -1126,8 +1149,13 @@ fn run_grep(
             } else {
                 ""
             };
+        let cap = if scan_capped {
+            format!(", stopped after {MAX_FILES_SCANNED} files")
+        } else {
+            String::new()
+        };
         return Ok(format!(
-            "no matches for '{pattern}' ({files_searched} files searched){hint}"
+            "no matches for '{pattern}' ({files_searched} files searched{cap}){hint}"
         ));
     }
 
@@ -1197,17 +1225,28 @@ fn run_grep(
     if truncated_hits {
         footer.push_str(&format!(" [results truncated at {MAX_HITS}]"));
     }
+    if scan_capped {
+        footer.push_str(&format!(" [scan stopped after {MAX_FILES_SCANNED} files]"));
+    }
     out.push_str(&footer);
     Ok(out)
 }
 
 /// Glob-style file search supporting `*`, `**`, and `?` via simple matching.
 fn run_glob(root: &Path, pattern: &str) -> Result<String> {
+    const MAX_HITS: usize = 300;
+    const MAX_FILES_SCANNED: usize = 5000;
     let mut hits: Vec<String> = Vec::new();
-    let mut stop = false;
+    let mut visited = 0usize;
+    let mut capped = false;
     walk_files(root, &mut |p| {
-        if stop || hits.len() >= 300 {
-            stop = true;
+        if hits.len() >= MAX_HITS {
+            capped = true;
+            return false;
+        }
+        visited += 1;
+        if visited > MAX_FILES_SCANNED {
+            capped = true;
             return false;
         }
         let rel = p.strip_prefix(root).unwrap_or(p);
@@ -1217,9 +1256,17 @@ fn run_glob(root: &Path, pattern: &str) -> Result<String> {
         true
     });
     if hits.is_empty() {
-        return Ok(format!("no files match '{pattern}'"));
+        return Ok(format!(
+            "no files match '{pattern}'{}",
+            if capped { " (scan capped)" } else { "" }
+        ));
     }
-    Ok(format!("{}\n({} files)", hits.join("\n"), hits.len()))
+    Ok(format!(
+        "{}\n({} files{})",
+        hits.join("\n"),
+        hits.len(),
+        if capped { ", truncated" } else { "" }
+    ))
 }
 
 /// Minimal glob: `**` crosses directories, `*` within one segment, `?` one char.
@@ -1431,6 +1478,14 @@ async fn capture_child(
     let status = match res {
         Ok(s) => s.context("waiting for command")?,
         Err(_) => {
+            // The direct child is only the shell; kill its process group so a
+            // timed-out pipeline does not leave grandchildren running.
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
             let _ = child.kill().await;
             bail!("{what} timed out after {}s", timeout.as_secs())
         }
@@ -1457,10 +1512,21 @@ async fn capture_child(
     Ok(report)
 }
 
+/// Revisions are operands, not options: `git diff --output=...` writes a file,
+/// so a leading `-` must never reach git as model input.
+fn validate_git_rev(rev: &str) -> Result<()> {
+    anyhow::ensure!(
+        !rev.starts_with('-'),
+        "git revision may not start with '-'"
+    );
+    Ok(())
+}
+
 /// Run a git subcommand against `cwd`. Arguments are passed as a real argv
 /// (never a shell string), so model-supplied paths/revs cannot inject extra
-/// commands. `path` is a repo-relative pathspec, `rev` a revision or range,
-/// and `limit` caps log output.
+/// shell commands; revisions are additionally checked for option injection.
+/// `path` is a repo-relative pathspec, `rev` a revision or range, and `limit`
+/// caps log output.
 ///
 /// Local only: the subcommand allowlist (`GIT_READ` + `GIT_WRITE`) has no
 /// remote operation, so nothing here can reach a network remote.
@@ -1476,6 +1542,9 @@ async fn run_git(
         GIT_READ.contains(&subcommand) || GIT_WRITE.contains(&subcommand),
         "unsupported git subcommand '{subcommand}'"
     );
+    if let Some(r) = rev {
+        validate_git_rev(r)?;
+    }
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg(subcommand).current_dir(cwd);
     match subcommand {
@@ -2013,40 +2082,51 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 /// Recursive directory listing used by both list_dir and the initial context.
+/// The 300-entry budget is global, not per directory: a wide tree would
+/// otherwise multiply 300^depth and flood the system prompt.
 pub fn build_tree(root: &Path, depth: usize, max_depth: usize) -> String {
-    if depth > max_depth {
-        return String::new();
-    }
+    let mut budget = 300usize;
     let mut lines = Vec::new();
+    build_tree_into(root, depth, max_depth, &mut budget, &mut lines);
+    if budget == 0 {
+        lines.push("... (tree truncated)".to_string());
+    }
+    lines.join("\n")
+}
+
+fn build_tree_into(
+    root: &Path,
+    depth: usize,
+    max_depth: usize,
+    budget: &mut usize,
+    lines: &mut Vec<String>,
+) {
+    if depth > max_depth || *budget == 0 {
+        return;
+    }
     let mut entries: Vec<_> = match std::fs::read_dir(root) {
         Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
-        Err(_) => return String::new(),
+        Err(_) => return,
     };
     entries.sort_by_key(|e| e.file_name());
-    let mut shown = 0usize;
     for entry in entries {
+        if *budget == 0 {
+            return;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') && name != ".env.example" {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let indent = "  ".repeat(depth);
+        *budget -= 1;
         if is_dir {
             lines.push(format!("{indent}{name}/"));
-            let sub = build_tree(&entry.path(), depth + 1, max_depth);
-            if !sub.is_empty() {
-                lines.push(sub);
-            }
+            build_tree_into(&entry.path(), depth + 1, max_depth, budget, lines);
         } else {
             lines.push(format!("{indent}{name}"));
         }
-        shown += 1;
-        if shown >= 300 {
-            lines.push(format!("{indent}..."));
-            break;
-        }
     }
-    lines.join("\n")
 }
 
 pub fn project_overview(cwd: &Path) -> String {
@@ -2390,12 +2470,11 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
 }
 
 /// Recursively visit files under `root`, skipping junk dirs and dotfiles.
-/// The visitor returns `false` to abort the entire walk (callers use this to
-/// stop early once result caps are reached instead of grinding through huge
-/// trees like node_modules).
-pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) {
+/// Returns `false` when the visitor asked to abort, and propagates that
+/// through parent directories instead of finishing their walk.
+pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
     let Ok(rd) = std::fs::read_dir(root) else {
-        return;
+        return true;
     };
     let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
@@ -2411,16 +2490,106 @@ pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) {
         let is_dir = matches!(entry.file_type(), Ok(ref t) if t.is_dir());
         let is_file = matches!(entry.file_type(), Ok(ref t) if t.is_file());
         if is_dir {
-            walk_files(&path, f);
+            if !walk_files(&path, f) {
+                return false;
+            }
         } else if is_file && !f(&path) {
-            return;
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_tree_budget_is_global_not_per_directory() {
+        let dir = std::env::temp_dir().join(format!("lc-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in 0..20 {
+            let sub = dir.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..40 {
+                std::fs::write(sub.join(format!("f{f}.txt")), "x").unwrap();
+            }
+        }
+        let tree = build_tree(&dir, 0, 2);
+        assert!(
+            tree.lines().count() <= 301,
+            "tree was not globally capped: {} lines",
+            tree.lines().count()
+        );
+        assert!(tree.contains("(tree truncated)"), "{tree}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn walk_abort_stops_the_remaining_siblings() {
+        let dir = std::env::temp_dir().join(format!("lc-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+        let mut seen = 0usize;
+        let completed = walk_files(&dir, &mut |_| {
+            seen += 1;
+            false
+        });
+        assert!(!completed);
+        assert_eq!(seen, 1, "the walk kept going after an abort");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        let dir = std::env::temp_dir().join(format!("lc-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(async {
+                let child = spawn_shell(
+                    &dir,
+                    &format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()),
+                    &[],
+                )?;
+                capture_child(
+                    child,
+                    None,
+                    std::time::Duration::from_millis(500),
+                    "cancelled",
+                    "test",
+                )
+                .await
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("grandchild wrote its pid")
+            .trim()
+            .to_string();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // A killed orphan may linger as a zombie until reaped; "running" is
+        // the failure. /proc is absent on some platforms, so skip then.
+        if !stat.is_empty() {
+            let state = stat.rsplit(')').next().and_then(|s| s.trim().chars().next());
+            assert!(
+                matches!(state, Some('Z') | Some('X')),
+                "grandchild {pid} survived the timeout: {stat}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn glob_star_within_segment() {
@@ -2815,6 +2984,36 @@ mod tests {
             patch: "*** Begin Patch\n*** Update File: src/x.rs\n@@\n-a\n+b\n*** End Patch".into(),
         };
         assert_eq!(inside_patch.danger(&cwd), Danger::Moderate);
+        // A move must classify by its source as well as its destination.
+        let move_escape = Action::ApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: /etc/hosts\n*** Move to: stolen.txt\n@@\n-a\n+b\n*** End Patch".into(),
+        };
+        assert_eq!(move_escape.danger(&cwd), Danger::High);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn apply_patch_move_cannot_escape_workspace() {
+        let base = std::env::temp_dir().join(format!("lc-patch-{}", std::process::id()));
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/x.rs"), "x\n").unwrap();
+        let outside = base.join("asset.txt");
+        std::fs::write(&outside, "keep\n").unwrap();
+        let action = Action::ApplyPatch {
+            patch: format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: stolen.txt\n@@\n-keep\n+GONE\n*** End Patch",
+                outside.display()
+            ),
+        };
+        assert_eq!(action.danger(&cwd), Danger::High);
+        let err = block_on(action.perform_with_diff(&cwd, None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("outside the workspace"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep\n");
+        assert!(!cwd.join("stolen.txt").exists());
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -3060,6 +3259,24 @@ mod tests {
         let out = git_out(&dir, "worktree", None, None, None);
         assert!(out.contains("worktree"), "{out}");
         assert!(out.contains(dir.to_string_lossy().as_ref()), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_rejects_option_like_revisions() {
+        let dir = git_fixture("revopt");
+        for (sub, rev) in [
+            ("diff", "--output=./pwned"),
+            ("log", "--output=./pwned"),
+            ("branch", "-D"),
+        ] {
+            let err = block_on(run_git(&dir, sub, None, Some(rev), None, None)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("may not start with '-'"),
+                "{sub}: {err:#}"
+            );
+        }
+        assert!(!dir.join("pwned").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

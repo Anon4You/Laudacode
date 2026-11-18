@@ -21,8 +21,57 @@ pub enum Rule {
     Deny,
 }
 
-/// Map of glob pattern -> rule for one tool. Order matters: later wins.
-pub type PatternMap = std::collections::BTreeMap<String, Rule>;
+/// Ordered map of glob pattern -> rule for one tool. Order matters: later
+/// wins, so this is a `Vec` rather than a `BTreeMap` (whose sort order is
+/// alphabetical and would silently reverse the documented contract).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternMap(pub Vec<(String, Rule)>);
+
+impl PatternMap {
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Rule)> {
+        self.0.iter().map(|(pat, rule)| (pat.as_str(), rule))
+    }
+}
+
+impl<const N: usize> From<[(String, Rule); N]> for PatternMap {
+    fn from(entries: [(String, Rule); N]) -> Self {
+        Self(entries.into_iter().collect())
+    }
+}
+
+impl Serialize for PatternMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (pat, rule) in &self.0 {
+            map.serialize_entry(pat, rule)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PatternMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = PatternMap;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a table of permission patterns to rules")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<PatternMap, A::Error> {
+                let mut entries = Vec::new();
+                while let Some((pat, rule)) = map.next_entry::<String, Rule>()? {
+                    entries.push((pat, rule));
+                }
+                Ok(PatternMap(entries))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
 
 /// Full permission configuration. `None` maps fall back to the danger
 /// heuristics; present maps override them.
@@ -54,6 +103,12 @@ impl Permissions {
     /// - webfetch: the URL
     /// - mcp: the qualified tool name
     pub fn resolve(&self, tool: &str, input: &str) -> Option<Rule> {
+        self.resolve_with_pattern(tool, input).map(|(_, rule)| rule)
+    }
+
+    /// Like [`resolve`](Self::resolve), but also returns the pattern that won.
+    /// Callers need it to tell an explicit allow from a blanket `"*"`.
+    pub fn resolve_with_pattern(&self, tool: &str, input: &str) -> Option<(&str, Rule)> {
         let map = match tool {
             "bash" => self.bash.as_ref()?,
             "edit" => self.edit.as_ref()?,
@@ -63,13 +118,34 @@ impl Permissions {
             _ => return None,
         };
         // Last matching pattern wins (documented contract).
-        let mut matched: Option<Rule> = None;
-        for (pat, rule) in map {
+        let mut matched: Option<(&str, Rule)> = None;
+        for (pat, rule) in map.iter() {
             if glob_match(pat, input) {
-                matched = Some(*rule);
+                matched = Some((pat, *rule));
             }
         }
         matched
+    }
+
+    /// The first path that looks like a secret and is not allowed by a
+    /// non-blanket read rule. A bare `"*" = "allow"` must not expose `.env`;
+    /// `".env" = "allow"` or `"*.env" = "allow"` does.
+    pub fn secret_blocked<'a>(&self, paths: &'a [String]) -> Option<&'a str> {
+        for p in paths {
+            if Self::secret_guard(p) != Some(Rule::Deny) {
+                continue;
+            }
+            // Per-path, not per-action: an allow for `src/.env` must not also
+            // expose a root `.env` touched by the same patch.
+            let explicitly_allowed = matches!(
+                self.resolve_with_pattern("read", p),
+                Some((pat, Rule::Allow)) if pat != "*" && pat != "**"
+            );
+            if !explicitly_allowed {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// Defaults applied even with an empty `[permission]` section: secret
@@ -154,6 +230,15 @@ mod tests {
     }
 
     #[test]
+    fn later_wildcard_beats_an_earlier_specific_pattern() {
+        // Alphabetical (BTreeMap) order would keep the earlier `z*` deny last.
+        let p = perms("[read]\n\"z*\" = \"deny\"\n\"*\" = \"allow\"\n");
+        assert_eq!(p.resolve("read", "zeta"), Some(Rule::Allow));
+        let round = perms(&toml::to_string(&p).unwrap());
+        assert_eq!(round.resolve("read", "zeta"), Some(Rule::Allow));
+    }
+
+    #[test]
     fn edit_and_read_and_webfetch_maps() {
         let p = perms(
             r#"
@@ -165,8 +250,8 @@ mod tests {
 "*" = "allow"
 
 [webfetch]
-"https://docs.example.com/*" = "allow"
 "*" = "ask"
+"https://docs.example.com/*" = "allow"
 "#,
         );
         assert_eq!(p.resolve("edit", "src/main.rs"), Some(Rule::Allow));
@@ -208,6 +293,17 @@ mod tests {
         );
         assert_eq!(Permissions::secret_guard(".env.example"), None);
         assert_eq!(Permissions::secret_guard("main.rs"), None);
+    }
+
+    #[test]
+    fn secret_allow_is_per_path() {
+        let p = perms("[read]\n\"src/.env\" = \"allow\"");
+        let paths = vec!["src/.env".to_string(), ".env".to_string()];
+        assert_eq!(p.secret_blocked(&paths), Some(".env"));
+        assert_eq!(p.secret_blocked(&["src/.env".to_string()]), None);
+
+        let blanket = perms("[read]\n\"*\" = \"allow\"");
+        assert_eq!(blanket.secret_blocked(&[".env".to_string()]), Some(".env"));
     }
 
     #[test]

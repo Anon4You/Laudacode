@@ -314,11 +314,13 @@ pub struct SubAgentResult {
 
 /// Run one specialist to completion. Events stream through `ui` (already
 /// prefixed by the caller's fork) so the main transcript shows sub-activity.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sub_agent(
     client: &ChatClient,
     model: &str,
     cwd: &std::path::Path,
     mode: ApprovalMode,
+    permissions: &crate::permissions::Permissions,
     spec_name: &str,
     task: &str,
     mut ui: Box<dyn UiSink>,
@@ -336,7 +338,15 @@ pub async fn run_sub_agent(
     // Accumulated across rounds; owned here so it survives an `Err` return.
     let mut usage = (0u64, 0u64);
     let report = match run_loop(
-        client, model, cwd, mode, &spec, messages, &mut ui, &mut usage,
+        client,
+        model,
+        cwd,
+        mode,
+        permissions,
+        &spec,
+        messages,
+        &mut ui,
+        &mut usage,
     )
     .await
     {
@@ -346,12 +356,76 @@ pub async fn run_sub_agent(
     SubAgentResult { report, usage }
 }
 
+/// Apply the orchestrator's permission/secret/role gate to one sub-agent tool.
+/// `Err` means blocked outright; `Ok(false)` means the user declined a prompt.
+fn check_action(
+    action: &crate::tools::Action,
+    spec: &Role,
+    mode: ApprovalMode,
+    permissions: &crate::permissions::Permissions,
+    cwd: &std::path::Path,
+    ui: &mut dyn UiSink,
+) -> Result<bool, String> {
+    use crate::permissions::Rule;
+    use crate::tools::Danger;
+
+    if !action.is_read_only() && (spec.read_only || mode == ApprovalMode::Suggest) {
+        return Err(format!(
+            "Blocked: '{}' would mutate state for the read-only {} role in this mode.",
+            action.describe(),
+            spec.name
+        ));
+    }
+
+    let mut forced_ask = false;
+    let mut rule_allows = false;
+    let inputs = crate::agent::permission_inputs(action, cwd);
+    for (tool, input) in &inputs {
+        match permissions.resolve(tool, input) {
+            Some(Rule::Deny) => {
+                return Err(format!(
+                    "Blocked by permission rule: {tool} '{input}' is denied in config."
+                ))
+            }
+            Some(Rule::Ask) => forced_ask = true,
+            Some(Rule::Allow) => rule_allows = true,
+            None => {}
+        }
+    }
+    let reads: Vec<String> = inputs
+        .iter()
+        .filter(|(tool, _)| *tool == "read")
+        .map(|(_, input)| input.clone())
+        .collect();
+    if let Some(p) = permissions.secret_blocked(&reads) {
+        return Err(format!(
+            "Blocked: '{p}' looks like a secrets file (.env*). \
+             Allow it explicitly in [permission.read] if you really mean it."
+        ));
+    }
+
+    let danger = action.danger(cwd);
+    Ok(if forced_ask {
+        ui.approve(action, danger)
+    } else if rule_allows {
+        // An allow rule never disables the outside-workspace barrier.
+        danger != Danger::High || ui.approve(action, danger)
+    } else {
+        match danger {
+            Danger::Safe => true,
+            Danger::Moderate => !spec.read_only && mode != ApprovalMode::Suggest,
+            Danger::High => ui.approve(action, danger),
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     client: &ChatClient,
     model: &str,
     cwd: &std::path::Path,
     mode: ApprovalMode,
+    permissions: &crate::permissions::Permissions,
     spec: &Role,
     mut messages: Vec<Message>,
     ui: &mut Box<dyn UiSink>,
@@ -408,18 +482,12 @@ async fn run_loop(
                 name: format!("{}/{tool_name}", spec.name),
                 summary: action.describe(),
             });
-            // Same approval policy as the orchestrator: Safe flows through,
-            // Moderate needs a mutating role + non-plan mode, High always
-            // prompts (writes outside the workspace, dangerous commands).
-            let approved = match action.danger(cwd) {
-                crate::tools::Danger::Safe => true,
-                crate::tools::Danger::Moderate => !spec.read_only && mode != ApprovalMode::Suggest,
-                crate::tools::Danger::High => ui.approve(&action, crate::tools::Danger::High),
-            };
-            let result = if !approved {
-                "User DECLINED this action.".to_string()
-            } else {
-                match action.perform_with_diff(cwd, None).await {
+            // Same policy as the orchestrator, including permission rules and
+            // the secrets guard: a delegated specialist must not be a bypass.
+            let result = match check_action(&action, spec, mode, permissions, cwd, ui.as_mut()) {
+                Err(reason) => reason,
+                Ok(false) => "User DECLINED this action.".to_string(),
+                Ok(true) => match action.perform_with_diff(cwd, None).await {
                     Ok((out, files)) => {
                         if !files.is_empty() {
                             ui.on_event(AgentEvent::ToolEdit {
@@ -430,7 +498,7 @@ async fn run_loop(
                         out
                     }
                     Err(e) => format!("Command failed: {e:#}"),
-                }
+                },
             };
             ui.on_event(AgentEvent::ToolDone {
                 name: format!("{}/{tool_name}", spec.name),
@@ -496,6 +564,95 @@ mod tests {
             r#"{"tasks":[{"agent":"planner","task":"1"},{"agent":"planner","task":"2"},{"agent":"planner","task":"3"},{"agent":"planner","task":"4"},{"agent":"planner","task":"5"}]}"#,
         );
         assert!(too_many.is_err());
+    }
+
+    struct NoApprove;
+    impl UiSink for NoApprove {
+        fn on_event(&mut self, _: AgentEvent) {}
+        fn approve(&mut self, _: &crate::tools::Action, _: crate::tools::Danger) -> bool {
+            false
+        }
+        fn fork(&mut self, _: &str) -> Box<dyn UiSink> {
+            Box::new(NoApprove)
+        }
+    }
+
+    #[test]
+    fn sub_agent_gate_cannot_bypass_rules_secrets_or_high() {
+        let dir = std::env::temp_dir().join(format!("lc-subgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let coder = find_role("coder").unwrap();
+        let mut ui = NoApprove;
+        let read_env = crate::tools::Action::ReadFile {
+            path: ".env".into(),
+            offset: None,
+            limit: None,
+        };
+
+        let denied = crate::permissions::Permissions {
+            read: Some(crate::permissions::PatternMap::from([(
+                ".env".to_string(),
+                crate::permissions::Rule::Deny,
+            )])),
+            ..Default::default()
+        };
+        let err =
+            check_action(&read_env, &coder, ApprovalMode::FullAuto, &denied, &dir, &mut ui)
+                .unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+
+        let err = check_action(
+            &read_env,
+            &coder,
+            ApprovalMode::FullAuto,
+            &crate::permissions::Permissions::default(),
+            &dir,
+            &mut ui,
+        )
+        .unwrap_err();
+        assert!(err.contains("secrets file"), "{err}");
+
+        let outside = crate::tools::Action::WriteFile {
+            path: "../escape.txt".into(),
+            content: "x".into(),
+        };
+        let allow_edits = crate::permissions::Permissions {
+            edit: Some(crate::permissions::PatternMap::from([(
+                "*".to_string(),
+                crate::permissions::Rule::Allow,
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_action(
+                &outside,
+                &coder,
+                ApprovalMode::FullAuto,
+                &allow_edits,
+                &dir,
+                &mut ui,
+            ),
+            Ok(false),
+            "an allow rule must not bypass a High outside-workspace write"
+        );
+
+        let plan_write = crate::tools::Action::WriteFile {
+            path: "x".into(),
+            content: "x".into(),
+        };
+        let err = check_action(
+            &plan_write,
+            &coder,
+            ApprovalMode::Suggest,
+            &crate::permissions::Permissions::default(),
+            &dir,
+            &mut ui,
+        )
+        .unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

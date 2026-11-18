@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::api::{ChatClient, Message, StreamEvent, ToolCall, Turn, Usage};
 use crate::tools;
@@ -83,6 +83,10 @@ const MAX_TOOL_ROUNDS: usize = 30;
 /// Fallback context window (tokens) when nothing better is configured. The
 /// real threshold is model-aware — see `budget::compact_threshold`.
 const DEFAULT_CTX_WINDOW: u64 = 128_000;
+/// Undo pre-images live in RAM; bound one file and the whole stack so a
+/// long session cannot grow without limit. Oldest turns are dropped first.
+const MAX_UNDO_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_UNDO_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Agent {
     pub client: ChatClient,
@@ -97,8 +101,9 @@ pub struct Agent {
     pub todos: Vec<tools::TodoItem>,
     /// Per-tool allow/ask/deny rules from config.
     pub permissions: crate::permissions::Permissions,
-    /// File snapshots for /undo: (turn_seq, path, previous content).
-    pub(crate) undo_stack: Vec<(u64, PathBuf, Option<String>)>,
+    /// File snapshots for /undo: (turn_seq, path, previous bytes).
+    pub(crate) undo_stack: Vec<(u64, PathBuf, Option<Vec<u8>>)>,
+    undo_bytes: usize,
     turn_seq: u64,
     last_undone: Option<u64>,
     processes: crate::processes::ProcessManager,
@@ -199,6 +204,7 @@ impl Agent {
             todos: vec![],
             permissions,
             undo_stack: vec![],
+            undo_bytes: 0,
             turn_seq: 0,
             last_undone: None,
             processes: Default::default(),
@@ -289,9 +295,12 @@ impl Agent {
                     self.undo_stack.push((s, path, prev));
                     break;
                 }
+                self.undo_bytes = self
+                    .undo_bytes
+                    .saturating_sub(prev.as_ref().map_or(0, |b| b.len()));
                 match prev {
-                    Some(content) => {
-                        std::fs::write(&path, content.as_bytes())
+                    Some(bytes) => {
+                        std::fs::write(&path, &bytes)
                             .with_context(|| format!("restoring {}", path.display()))?;
                     }
                     None => {
@@ -364,8 +373,9 @@ impl Agent {
                 };
                 hunks
                     .iter()
-                    .filter_map(|h| {
-                        tools::resolve_path_in(&self.cwd, &h.classify_path().to_string_lossy()).ok()
+                    .flat_map(|h| h.paths())
+                    .filter_map(|p| {
+                        tools::resolve_path_in(&self.cwd, &p.to_string_lossy()).ok()
                     })
                     .collect()
             }
@@ -374,7 +384,31 @@ impl Agent {
         // so hooks never fire against a stale set of files.
         self.last_touched = paths.clone();
         for p in paths {
-            let prev = std::fs::read_to_string(&p).ok();
+            let prev = match std::fs::read(&p) {
+                Ok(bytes) => {
+                    if bytes.len() as u64 > MAX_UNDO_FILE_BYTES {
+                        continue;
+                    }
+                    Some(bytes)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                // A pre-existing file we cannot read must not be recorded as
+                // "did not exist": undo would then delete it.
+                Err(_) => continue,
+            };
+            let size = prev.as_ref().map_or(0, |b| b.len());
+            while self.undo_bytes.saturating_add(size) > MAX_UNDO_TOTAL_BYTES {
+                let oldest = self
+                    .undo_stack
+                    .first()
+                    .map(|(_, _, p)| p.as_ref().map_or(0, |b| b.len()));
+                let Some(oldest) = oldest else {
+                    break;
+                };
+                self.undo_stack.remove(0);
+                self.undo_bytes = self.undo_bytes.saturating_sub(oldest);
+            }
+            self.undo_bytes = self.undo_bytes.saturating_add(size);
             self.undo_stack.push((self.turn_seq, p, prev));
         }
     }
@@ -544,6 +578,14 @@ Working rules:
             .client
             .stream_chat(&self.model, &summary_msgs, &[], |_| {}, None)
             .await?;
+        // The summary request is real spend; count it like any other turn.
+        if let Some(u) = turn.usage {
+            self.last_usage = Some(u);
+            self.add_usage(u.billable_prompt(), u.completion_tokens);
+            let cost = self.session_cost();
+            self.logger
+                .usage(&self.model, self.tot_usage.0, self.tot_usage.1, cost);
+        }
         if turn.content.trim().is_empty() {
             anyhow::bail!("model returned empty summary");
         }
@@ -604,14 +646,26 @@ Working rules:
         let mode = self.mode;
         let client = self.client.clone();
         let model = self.model.clone();
+        let permissions = self.permissions.clone();
 
         let futures = tasks.into_iter().map(|(name, task)| {
             let sink = ui.fork(&format!("[{name}]"));
             let client = client.clone();
             let model = model.clone();
             let cwd = cwd.clone();
+            let permissions = permissions.clone();
             async move {
-                crate::agents::run_sub_agent(&client, &model, &cwd, mode, &name, &task, sink).await
+                crate::agents::run_sub_agent(
+                    &client,
+                    &model,
+                    &cwd,
+                    mode,
+                    &permissions,
+                    &name,
+                    &task,
+                    sink,
+                )
+                .await
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -979,14 +1033,18 @@ Working rules:
         };
 
         // Same read-rule gate the file tools use, before the file is touched.
-        for (kind, key) in permission_inputs(&tools::Action::Lsp {
-            op: op.clone(),
-            file: file.clone(),
-            line,
-            column,
-            query: query.clone(),
-        }) {
-            if let Some(r) = self.permissions.resolve(kind, &key) {
+        let inputs = permission_inputs(
+            &tools::Action::Lsp {
+                op: op.clone(),
+                file: file.clone(),
+                line,
+                column,
+                query: query.clone(),
+            },
+            &self.cwd,
+        );
+        for (kind, key) in &inputs {
+            if let Some(r) = self.permissions.resolve(kind, key) {
                 match r {
                     crate::permissions::Rule::Deny => {
                         return format!(
@@ -1003,6 +1061,17 @@ Working rules:
                     crate::permissions::Rule::Allow => {}
                 }
             }
+        }
+        let reads: Vec<String> = inputs
+            .iter()
+            .filter(|(kind, _)| *kind == "read")
+            .map(|(_, key)| key.clone())
+            .collect();
+        if let Some(p) = self.permissions.secret_blocked(&reads) {
+            return format!(
+                "Blocked: '{p}' looks like a secrets file (.env*), so this lsp \
+                 query was not run."
+            );
         }
 
         // Resolve inside the workspace before the server sees the path, so a
@@ -1061,7 +1130,7 @@ Working rules:
             .collect::<Vec<_>>()
             .join(" ⏎ ");
         let preview = preview.chars().take(1200).collect::<String>();
-        self.logger.tool("lsp", ok, &preview);
+        self.logger.tool("lsp", ok);
         ui.on_event(AgentEvent::ToolDone {
             name: "lsp".to_string(),
             ok,
@@ -1227,7 +1296,7 @@ Working rules:
                     .collect::<Vec<_>>()
                     .join(" ⏎ ");
                 let preview = preview.chars().take(1200).collect::<String>();
-                self.logger.tool(name, true, &preview);
+                self.logger.tool(name, true);
                 ui.on_event(AgentEvent::ToolDone {
                     name: name.to_string(),
                     ok: true,
@@ -1237,7 +1306,7 @@ Working rules:
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                self.logger.tool(name, false, &msg);
+                self.logger.tool(name, false);
                 ui.on_event(AgentEvent::ToolDone {
                     name: name.to_string(),
                     ok: false,
@@ -1276,21 +1345,7 @@ Working rules:
         // safe reads, allow auto-approves the matched input.
         let mut forced_ask = false;
         let mut rule_allows = false;
-        let mut inputs = permission_inputs(action);
-        // Check the real target too: an innocently named symlink must not
-        // bypass a read deny rule or the secrets-file guard.
-        if let tools::Action::ViewImage { path } = action {
-            if let Ok(real) = tools::resolve_path_in(&self.cwd, path)
-                .and_then(|p| std::fs::canonicalize(p).map_err(Into::into))
-            {
-                inputs.push(("read", real.to_string_lossy().into_owned()));
-                if let Ok(root) = std::fs::canonicalize(&self.cwd) {
-                    if let Ok(relative) = real.strip_prefix(root) {
-                        inputs.push(("read", relative.to_string_lossy().into_owned()));
-                    }
-                }
-            }
-        }
+        let inputs = permission_inputs(action, &self.cwd);
         for (tool, input) in &inputs {
             match self.permissions.resolve(tool, input) {
                 Some(crate::permissions::Rule::Deny) => {
@@ -1309,16 +1364,12 @@ Working rules:
             }
         }
         // Secret guard: .env-style files are denied unless explicitly allowed.
-        let secret_hit = inputs
+        let reads: Vec<String> = inputs
             .iter()
             .filter(|(t, _)| *t == "read")
-            .find_map(|(_, p)| {
-                (self.permissions.resolve("read", p).is_none()
-                    && crate::permissions::Permissions::secret_guard(p)
-                        == Some(crate::permissions::Rule::Deny))
-                .then_some(p)
-            });
-        if let Some(path_input) = secret_hit {
+            .map(|(_, p)| p.clone())
+            .collect();
+        if let Some(path_input) = self.permissions.secret_blocked(&reads) {
             return Err(format!(
                 "Blocked: '{path_input}' looks like a secrets file (.env*). \
                  Allow it explicitly in [permission.read] if you really mean it."
@@ -1335,12 +1386,12 @@ Working rules:
             serde_json::json!({ "tool": name, "summary": summary }),
         );
 
-        // Approval gate. Permission rules take precedence; otherwise writes
-        // outside the workspace stay High and prompt even in FULL AUTO.
+        // Approval gate. Permission rules take precedence for ordinary work,
+        // but an allow rule never disables the outside-workspace barrier.
         let danger = action.danger(&self.cwd);
         let approved = if forced_ask {
             ui.approve(action, danger)
-        } else if rule_allows {
+        } else if rule_allows && danger != tools::Danger::High {
             true
         } else {
             match danger {
@@ -1472,7 +1523,7 @@ Working rules:
                     .join(" ⏎ ");
                 // Kept generous — Ctrl+O in the TUI expands this in full.
                 let preview = preview.chars().take(1200).collect::<String>();
-                self.logger.tool(name, true, &preview);
+                self.logger.tool(name, true);
                 ui.on_event(AgentEvent::ToolDone {
                     name: name.to_string(),
                     ok: true,
@@ -1482,7 +1533,7 @@ Working rules:
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                self.logger.tool(name, false, &msg);
+                self.logger.tool(name, false);
                 ui.on_event(AgentEvent::ToolDone {
                     name: name.to_string(),
                     ok: false,
@@ -1584,24 +1635,83 @@ Working rules:
     }
 }
 
-/// (tool-key, raw-input) pairs a given action should be permission-checked
-/// against. Tool keys mirror config section names.
-fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
+/// Every spelling of one path a rule may be written against: the typed string,
+/// the normalized path, the real path, and the workspace-relative form. This
+/// stops `./src/x`, absolute paths, `..` and symlinks from dodging a rule.
+fn path_inputs(cwd: &Path, path: &str) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    let Ok(resolved) = tools::resolve_path_in(cwd, path) else {
+        return out;
+    };
+    let real = real_path(&resolved);
+    for p in [&resolved, &real] {
+        let s = p.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if let Ok(root) = std::fs::canonicalize(cwd) {
+        if let Ok(rel) = real.strip_prefix(&root) {
+            let s = rel.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    if let Ok(rel) = resolved.strip_prefix(cwd) {
+        let s = rel.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The real path when it exists, or the real parent joined with the file name
+/// for not-yet-created files. Falls back to the normalized path.
+fn real_path(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(real_parent) = std::fs::canonicalize(parent) {
+            return real_parent.join(name);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// (tool-key, input) pairs a given action should be permission-checked against.
+/// File paths are expanded to all their spellings; tool keys mirror config
+/// section names.
+pub(crate) fn permission_inputs(
+    action: &tools::Action,
+    cwd: &Path,
+) -> Vec<(&'static str, String)> {
     use tools::Action;
+    let read = |p: &str| -> Vec<(&'static str, String)> {
+        path_inputs(cwd, p)
+            .into_iter()
+            .map(|p| ("read", p))
+            .collect()
+    };
     match action {
         Action::ListDir { path } | Action::ReadFile { path, .. } | Action::ViewImage { path } => {
-            vec![("read", path.clone())]
+            read(path)
         }
         // A language server reads a file, so it answers to the read rules.
         // Hooking it to `read` rather than a new namespace means a user who
         // already denies reading `.env` cannot have an LSP hand its contents
         // back through `hover`.
-        Action::Lsp { file: Some(f), .. } => vec![("read", f.clone())],
+        Action::Lsp { file: Some(f), .. } => read(f),
         // A workspace-wide query touches no single file, so there is no
         // meaningful path to key a rule on; fall back to the op name.
         Action::Lsp { op, .. } => vec![("read", op.clone())],
-        Action::Grep { pattern, .. } => vec![("read", pattern.clone())],
-        Action::Glob { pattern, .. } => vec![("read", pattern.clone())],
+        // Key searches on the root they walk, not the search text: that is
+        // the file access a read rule can meaningfully govern.
+        Action::Grep { path, .. } | Action::Glob { path, .. } => {
+            read(path.as_deref().unwrap_or("."))
+        }
         Action::Git {
             subcommand,
             path,
@@ -1622,20 +1732,25 @@ fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
             );
             let mut out = vec![("bash", input)];
             if let Some(p) = path {
-                out.push(("read", p.clone()));
+                out.extend(read(p));
             }
             out
         }
         Action::FetchUrl { url } => vec![("webfetch", url.clone())],
         Action::WebSearch { query, .. } => vec![("webfetch", query.clone())],
-        Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
-            vec![("edit", path.clone())]
-        }
+        Action::WriteFile { path, .. } | Action::EditFile { path, .. } => path_inputs(cwd, path)
+            .into_iter()
+            .map(|p| ("edit", p))
+            .collect(),
         Action::ApplyPatch { patch } => {
             let mut out = Vec::new();
             if let Ok(hunks) = crate::patch::parse_patch(patch) {
-                for h in hunks {
-                    out.push(("edit", h.classify_path().to_string_lossy().into_owned()));
+                for p in hunks.iter().flat_map(|h| h.paths()) {
+                    out.extend(
+                        path_inputs(cwd, &p.to_string_lossy())
+                            .into_iter()
+                            .map(|p| ("edit", p)),
+                    );
                 }
             }
             out
@@ -2017,6 +2132,42 @@ mod tests {
     }
 
     #[test]
+    fn allow_rule_does_not_bypass_outside_workspace_prompt() {
+        let dir = std::env::temp_dir().join(format!("lc-batch-h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::Config::default();
+        let mut agent = test_agent(&cfg);
+        agent.cwd = dir.clone();
+        agent.permissions.edit = Some(crate::permissions::PatternMap::from([(
+            "*".to_string(),
+            crate::permissions::Rule::Allow,
+        )]));
+        let mut ui = RecordingUi::new(false);
+        let mut imgs = Vec::new();
+        let mut recent = Vec::new();
+        let calls = vec![call(
+            "1",
+            "write_file",
+            r#"{"path":"../escape.txt","content":"x"}"#,
+        )];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(agent.run_tool_batch(calls, &mut ui, &mut imgs, None, &mut recent))
+            .unwrap();
+        let got = tool_results(&agent);
+        assert!(got[0].1.contains("DECLINED"), "{}", got[0].1);
+        assert!(
+            ui.events.iter().any(|e| e.starts_with("ask:")),
+            "outside write must prompt despite the allow rule: {:?}",
+            ui.events
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn doom_loop_guard_still_fires_inside_a_batch() {
         let dir = std::env::temp_dir().join(format!("lc-batch-d-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2154,7 +2305,7 @@ mod tests {
         // Deny wins over everything, including FULL AUTO.
         agent.mode = ApprovalMode::FullAuto;
         agent.permissions = crate::permissions::Permissions {
-            mcp: Some(BTreeMap::from([(
+            mcp: Some(crate::permissions::PatternMap::from([(
                 "mcp__files__*".to_string(),
                 crate::permissions::Rule::Deny,
             )])),
@@ -2166,7 +2317,7 @@ mod tests {
         // An explicit ask rule still prompts under FULL AUTO, which is the
         // only way a user can re-tighten a global mode.
         agent.permissions = crate::permissions::Permissions {
-            mcp: Some(BTreeMap::from([(
+            mcp: Some(crate::permissions::PatternMap::from([(
                 "mcp__files__*".to_string(),
                 crate::permissions::Rule::Ask,
             )])),
@@ -2503,6 +2654,41 @@ mod tests {
 
         // Second undo of the same turn is refused.
         assert!(agent.undo_turns(1).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undo_restores_a_binary_preimage_instead_of_deleting_it() {
+        use crate::api::ChatClient;
+        let dir = std::env::temp_dir().join(format!("lc-undob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("blob.bin");
+        let original = vec![0u8, 159, 146, 150, 255];
+        std::fs::write(&blob, &original).unwrap();
+
+        let client = ChatClient::new(
+            "http://localhost:0/v1",
+            "",
+            &Default::default(),
+            None,
+            "openai",
+        )
+        .expect("client");
+        let mut agent = Agent::new(
+            client,
+            String::new(),
+            dir.clone(),
+            ApprovalMode::FullAuto,
+            crate::permissions::Permissions::default(),
+        );
+        agent.turn_seq += 1;
+        assert!(agent.perform_action_sync(&tools::Action::WriteFile {
+            path: "blob.bin".into(),
+            content: "text".into(),
+        }));
+        agent.undo_turns(1).unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), original);
         std::fs::remove_dir_all(&dir).ok();
     }
 

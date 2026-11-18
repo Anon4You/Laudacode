@@ -461,16 +461,12 @@ impl Lsp {
     /// anything outside the workspace, matching the other file tools. Reusing
     /// the same symlink-aware check keeps one containment story, not two.
     pub fn resolve(&self, file: &str) -> Result<PathBuf> {
-        let p = Path::new(file);
-        if p.is_absolute() {
-            return Ok(p.to_path_buf());
-        }
         anyhow::ensure!(
             crate::tools::contained_in_workspace(&self.cwd, file),
             "'{file}' is outside the workspace {}",
             self.cwd.display()
         );
-        Ok(self.cwd.join(p))
+        crate::tools::resolve_path_in(&self.cwd, file)
     }
 
     // -- lifecycle ---------------------------------------------------------
