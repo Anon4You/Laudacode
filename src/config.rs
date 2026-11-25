@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentModel {
+    pub provider: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Provider {
     #[serde(default)]
@@ -180,6 +186,9 @@ pub struct Network {
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_provider: Option<String>,
+    /// Most recently selected provider/model pairs, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_models: Vec<RecentModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +408,20 @@ impl Config {
             let _ = fs::remove_file(&tmp);
         }
         result
+    }
+
+    /// Record a model choice, keeping only the newest unique pairs.
+    pub fn remember_recent(&mut self, provider: &str, model: &str) {
+        self.recent_models
+            .retain(|r| r.provider != provider || r.model != model);
+        self.recent_models.insert(
+            0,
+            RecentModel {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+        );
+        self.recent_models.truncate(8);
     }
 
     /// Resolve which provider to actually use.
@@ -970,6 +993,33 @@ mod tests {
         let a = cfg.resolve_active(Some("p"), None, None, None).unwrap();
         std::env::remove_var("OPENAI_REASONING_EFFORT");
         assert_eq!(a.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn recent_models_are_unique_newest_first_and_survive_toml() {
+        let mut cfg = Config::default();
+        for i in 0..10 {
+            cfg.remember_recent("openrouter", &format!("model-{i}"));
+        }
+        assert_eq!(cfg.recent_models.len(), 8);
+        assert_eq!(cfg.recent_models[0].model, "model-9");
+
+        cfg.remember_recent("openrouter", "model-7");
+        assert_eq!(cfg.recent_models.len(), 8);
+        assert_eq!(cfg.recent_models[0].model, "model-7");
+        assert_eq!(
+            cfg.recent_models
+                .iter()
+                .filter(|r| r.model == "model-7")
+                .count(),
+            1,
+            "re-selecting a model must move it, not duplicate it"
+        );
+
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("[[recent_models]]"));
+        let back: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(back.recent_models, cfg.recent_models);
     }
 
     #[test]

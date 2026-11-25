@@ -11,10 +11,10 @@ use std::sync::Arc;
 use crate::agent::{Agent, AgentEvent, ApprovalMode, UiSink};
 use crate::api::{ChatClient, Message};
 use crate::budget;
-use crate::config::{sanitize_name, ActiveProvider, Config, Provider};
+use crate::config::{sanitize_name, ActiveProvider, Config, Provider, RecentModel};
 use crate::session::Session;
 use crate::tools::{self, Action};
-use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
+use crate::tui::{self as tuiapp, Action as KeyAction, Entry, SidebarMode, Tui};
 
 // ---------------------------------------------------------------------------
 // Plain terminal UI sink (used by `exec` mode)
@@ -396,6 +396,11 @@ pub enum WorkerCmd {
     Clear,
     ListModels,
     SetModel(String),
+    /// Switch provider and model atomically (a pick from the grouped list).
+    SwitchModel {
+        provider: String,
+        model: String,
+    },
     /// Set or clear the reasoning-effort hint (None = model default).
     SetReasoning(Option<String>),
     UseProvider(String),
@@ -844,29 +849,128 @@ fn worker_main(
             }
             WorkerCmd::ListModels => {
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
-                match rt.block_on(app.agent.client.list_models()) {
-                    Ok(models) => {
-                        let current = app.agent.model.clone();
-                        let items = with_manual_model_entry(models)
-                            .into_iter()
-                            .map(|m| {
-                                let r = crate::tui::PickerRow::new(&m, "");
-                                if m == current {
-                                    r.badge("active")
-                                } else {
-                                    r
-                                }
-                            })
-                            .collect();
-                        let _ = ev_tx.send(WorkerEvent::Pick {
-                            title: "model".into(),
-                            items,
-                        });
+                let current = app.agent.model.clone();
+                let active_name = app.active.name.clone();
+
+                // Built-in keyless providers are always one pick away, even
+                // when they were never written to the config file.
+                let mut free: Vec<(String, Vec<String>)> = Vec::new();
+                for name in ["aitopia", "powerbrain"] {
+                    let Some(p) = crate::config::builtin_provider(name) else {
+                        continue;
+                    };
+                    let mut models = match ChatClient::new(
+                        &p.base_url,
+                        &p.api_key,
+                        &p.headers,
+                        None,
+                        &p.kind,
+                    ) {
+                        Ok(mut client) => {
+                            client.set_max_retries(1);
+                            rt.block_on(client.list_models()).unwrap_or_default()
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    if active_name == name && !models.iter().any(|m| m == &current) {
+                        models.insert(0, current.clone());
                     }
-                    Err(e) => {
-                        let _ = ev_tx.send(WorkerEvent::Error(format!("listing models: {e:#}")));
+                    if !models.is_empty() {
+                        free.push((name.into(), models));
                     }
                 }
+
+                // Configured providers, active first. Built-in free providers
+                // already own the "Free" section above.
+                let mut providers: Vec<(String, Provider)> = app
+                    .config
+                    .providers
+                    .iter()
+                    .filter(|(name, p)| {
+                        !(matches!(name.as_str(), "aitopia" | "powerbrain")
+                            && is_free_kind(&p.kind))
+                            && !p.base_url.trim().is_empty()
+                    })
+                    .map(|(name, p)| (name.clone(), p.clone()))
+                    .collect();
+                if let Some((_, p)) = providers.iter_mut().find(|(name, _)| name == &active_name) {
+                    // Active-provider env/CLI overrides win over the stored
+                    // entry, matching what chat requests actually use.
+                    *p = Provider {
+                        base_url: app.active.base_url.clone(),
+                        api_key: app.active.api_key.clone(),
+                        kind: app.active.kind.clone(),
+                        model: current.clone(),
+                        headers: app.active.headers.clone(),
+                        reasoning_effort: app.active.reasoning_effort.clone(),
+                    };
+                }
+                if let Some(i) = providers.iter().position(|(name, _)| name == &active_name) {
+                    let active = providers.remove(i);
+                    providers.insert(0, active);
+                }
+
+                let jobs = providers.into_iter().map(|(name, p)| async move {
+                    let fallback = p.model.clone();
+                    let result = match ChatClient::new(
+                        &p.base_url,
+                        &p.api_key,
+                        &p.headers,
+                        None,
+                        &p.kind,
+                    ) {
+                        Ok(mut client) => {
+                            // One retry is enough for a catalog peek; the
+                            // picker must not wait out six backoffs per
+                            // provider, nor hang on one stalled endpoint.
+                            client.set_max_retries(1);
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(6),
+                                client.list_models(),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow::anyhow!("catalog request timed out")),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    };
+                    (name, fallback, result)
+                });
+                let fetched = rt.block_on(futures_util::future::join_all(jobs));
+                let groups: Vec<(String, Vec<String>, bool)> = fetched
+                    .into_iter()
+                    .map(|(name, fallback, result)| match result {
+                        Ok(mut models) => {
+                            models.truncate(200);
+                            if !fallback.is_empty() && !models.iter().any(|m| m == &fallback) {
+                                models.insert(0, fallback);
+                            }
+                            (name, models, true)
+                        }
+                        Err(_) => {
+                            let models = if fallback.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![fallback]
+                            };
+                            (name, models, false)
+                        }
+                    })
+                    .collect();
+
+                let items = model_picker_rows(
+                    &active_name,
+                    &current,
+                    &app.config.recent_models,
+                    &free,
+                    &groups,
+                );
+                let _ = ev_tx.send(WorkerEvent::Pick {
+                    title: "models".into(),
+                    items,
+                });
                 let _ = ev_tx.send(WorkerEvent::Busy(false));
             }
             WorkerCmd::SetModel(model) => {
@@ -877,6 +981,7 @@ fn worker_main(
                 // halves of "what I was using" disagreeing across restarts.
                 // Mirrors SetReasoning below, deliberately.
                 let name = app.active.name.clone();
+                app.config.remember_recent(&name, &model);
                 let remembered = match app.config.providers.get_mut(&name) {
                     Some(p) => {
                         p.model = model.clone();
@@ -897,6 +1002,29 @@ fn worker_main(
 so it will not be remembered",
                         app.active.name
                     )));
+                }
+            }
+            WorkerCmd::SwitchModel { provider, model } => {
+                match switch_to_with_model(
+                    &mut app.config,
+                    &mut app.agent,
+                    &provider,
+                    Some(&model),
+                    &app.cwd,
+                ) {
+                    Ok(active) => {
+                        app.active = active;
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "switched to '{provider}' — model {model}"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
                 }
             }
             WorkerCmd::SetReasoning(effort) => {
@@ -2320,7 +2448,10 @@ impl App {
                 }
                 KeyAction::OpenSlash(sel) => {
                     // Picker selections arrive as "title:value".
-                    if let Some(model) = sel.strip_prefix("model:") {
+                    if let Some(model) = sel
+                        .strip_prefix("models:")
+                        .or_else(|| sel.strip_prefix("model:"))
+                    {
                         if model == MANUAL_MODEL_ITEM {
                             // Hidden/new model not in the catalog — type it.
                             tui.open_input_modal(tuiapp::InputModal::new(
@@ -2329,7 +2460,14 @@ impl App {
                                 false,
                             ));
                             tui.set_status("enter model id");
+                        } else if let Some((provider, model)) = model.split_once('\t') {
+                            tui.set_status("switching model");
+                            let _ = ui_cmd.send(WorkerCmd::SwitchModel {
+                                provider: provider.to_string(),
+                                model: model.to_string(),
+                            });
                         } else {
+                            // Backwards-compatible path for a flat model row.
                             tui.set_status("switching model");
                             let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
                         }
@@ -3418,7 +3556,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 )));
             }
         },
-        "model" => {
+        "model" | "models" => {
             tui.set_status("fetching models");
             let _ = cmd.send(WorkerCmd::ListModels);
         }
@@ -3555,6 +3693,37 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
         "status" => {
             tui.set_status("gathering status");
             let _ = cmd.send(WorkerCmd::Status);
+        }
+        "sidebar" => {
+            let action = arg.first().map(|s| s.to_ascii_lowercase());
+            match action.as_deref() {
+                Some("show") => {
+                    tui.set_sidebar_mode(SidebarMode::Shown);
+                    tui.push(Entry::Info("sidebar: shown".into()));
+                }
+                Some("hide") => {
+                    tui.set_sidebar_mode(SidebarMode::Hidden);
+                    tui.push(Entry::Info("sidebar: hidden".into()));
+                }
+                Some("auto") => {
+                    tui.set_sidebar_mode(SidebarMode::Auto);
+                    tui.push(Entry::Info(
+                        "sidebar: auto (visible when the terminal has room)".into(),
+                    ));
+                }
+                None => {
+                    tui.toggle_sidebar();
+                    let state = if tui.sidebar_mode() == SidebarMode::Hidden {
+                        "hidden"
+                    } else {
+                        "shown"
+                    };
+                    tui.push(Entry::Info(format!("sidebar: {state}")));
+                }
+                Some(other) => tui.push(Entry::Error(format!(
+                    "unknown /sidebar subcommand '{other}' — use show · hide · auto"
+                ))),
+            }
         }
         "doctor" => {
             let _ = cmd.send(WorkerCmd::Doctor);
@@ -4176,6 +4345,92 @@ fn with_manual_model_entry(mut models: Vec<String>) -> Vec<String> {
     models
 }
 
+fn model_picker_row(
+    provider: &str,
+    model: &str,
+    active_provider: &str,
+    active_model: &str,
+    badge: &str,
+) -> crate::tui::PickerRow {
+    let mut row = crate::tui::PickerRow::new(model, provider)
+        .wire(format!("{provider}\t{model}"));
+    if provider == active_provider && model == active_model {
+        row = row.badge("active");
+    } else if !badge.is_empty() {
+        row = row.badge(badge);
+    }
+    row
+}
+
+/// Build the grouped model picker: recent choices first, then the two
+/// built-in free providers, then every configured provider. Headers are
+/// non-selectable; the wire value hides the provider/model split from the UI.
+fn model_picker_rows(
+    active_provider: &str,
+    active_model: &str,
+    recents: &[RecentModel],
+    free: &[(String, Vec<String>)],
+    providers: &[(String, Vec<String>, bool)],
+) -> Vec<crate::tui::PickerRow> {
+    use crate::tui::PickerRow;
+
+    let known = |provider: &str| {
+        free.iter().any(|(name, _)| name == provider)
+            || providers.iter().any(|(name, _, _)| name == provider)
+    };
+    let mut rows = Vec::new();
+
+    let recents: Vec<&RecentModel> = recents.iter().filter(|r| known(&r.provider)).collect();
+    if !recents.is_empty() {
+        rows.push(PickerRow::header("Recent"));
+        for r in recents {
+            rows.push(model_picker_row(
+                &r.provider,
+                &r.model,
+                active_provider,
+                active_model,
+                "recent",
+            ));
+        }
+    }
+
+    if !free.is_empty() {
+        rows.push(PickerRow::header("Free"));
+        for (name, models) in free {
+            for model in models.iter().take(200) {
+                rows.push(model_picker_row(
+                    name,
+                    model,
+                    active_provider,
+                    active_model,
+                    "free",
+                ));
+            }
+        }
+    }
+
+    for (name, models, catalog_ok) in providers {
+        rows.push(PickerRow::header(if *catalog_ok {
+            name.clone()
+        } else {
+            format!("{name} — catalog unavailable")
+        }));
+        for model in models.iter().take(200) {
+            rows.push(model_picker_row(
+                name,
+                model,
+                active_provider,
+                active_model,
+                "",
+            ));
+        }
+    }
+
+    rows.push(PickerRow::header("Manual"));
+    rows.push(PickerRow::new(MANUAL_MODEL_ITEM, ""));
+    rows
+}
+
 /// Rebuild the live client for an already-resolved provider. The reasoning
 /// dialect (OpenRouter extension vs OpenAI param vs Google Gemini) is
 /// detected from the endpoint itself — never hardcoded per provider name.
@@ -4222,15 +4477,37 @@ fn switch_to(
     cfg: &mut Config,
     agent: &mut Agent,
     name: &str,
+    cwd: &PathBuf,
+) -> Result<ActiveProvider> {
+    switch_to_with_model(cfg, agent, name, None, cwd)
+}
+
+fn switch_to_with_model(
+    cfg: &mut Config,
+    agent: &mut Agent,
+    name: &str,
+    model: Option<&str>,
     _cwd: &PathBuf,
 ) -> Result<ActiveProvider> {
     if !cfg.providers.contains_key(name) {
-        bail!("provider '{name}' not found");
+        if let Some(p) = crate::config::builtin_provider(name) {
+            cfg.providers.insert(name.to_string(), p);
+        } else {
+            bail!("provider '{name}' not found");
+        }
+    }
+    if let Some(model) = model {
+        let model = model.trim();
+        anyhow::ensure!(!model.is_empty(), "model name required");
+        if let Some(p) = cfg.providers.get_mut(name) {
+            p.model = model.to_string();
+        }
     }
     let active = cfg.resolve_active(Some(name), None, None, None)?;
     agent.client = rebuild_client(&active)?;
     agent.model = active.model.clone();
     cfg.active_provider = Some(name.to_string());
+    cfg.remember_recent(name, &active.model);
     cfg.save()?;
     Ok(active)
 }
@@ -4653,6 +4930,7 @@ mod tests {
             "quit",
             "provider",
             "model",
+            "models",
             "reasoning",
             "retry",
             "resume",
@@ -4664,6 +4942,7 @@ mod tests {
             "export",
             "init",
             "status",
+            "sidebar",
             "diff",
             "review",
             "theme",
@@ -5212,6 +5491,95 @@ mod tests {
         assert_eq!(title, "help");
         assert!(rows.iter().any(|r| r.label == "/skills"), "help must list /skills");
         assert!(rows.iter().any(|r| r.label == "/update"), "help must list /update");
+    }
+
+    #[test]
+    fn models_command_requests_the_grouped_catalog() {
+        let mut tui = Tui::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(handle_slash(&mut tui, &tx, "/models"));
+        assert!(matches!(rx.try_recv().unwrap(), WorkerCmd::ListModels));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_picker_orders_recent_free_then_providers() {
+        let recents = vec![
+            RecentModel {
+                provider: "openrouter".into(),
+                model: "old-model".into(),
+            },
+            RecentModel {
+                provider: "removed".into(),
+                model: "stale".into(),
+            },
+        ];
+        let free = vec![
+            ("aitopia".to_string(), vec!["AITOPIA".to_string()]),
+            ("powerbrain".to_string(), vec!["gpt-5".to_string()]),
+        ];
+        let providers = vec![
+            (
+                "openrouter".to_string(),
+                vec!["new-model".to_string(), "old-model".to_string()],
+                true,
+            ),
+            (
+                "groq".to_string(),
+                vec!["llama-3.3".to_string()],
+                false,
+            ),
+        ];
+        let rows =
+            model_picker_rows("openrouter", "new-model", &recents, &free, &providers);
+
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.header)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                "Recent",
+                "Free",
+                "openrouter",
+                "groq — catalog unavailable",
+                "Manual"
+            ]
+        );
+        assert_eq!(rows[1].label, "old-model");
+        assert_eq!(rows[1].to_wire(), "openrouter\told-model");
+        assert!(
+            !rows.iter().any(|r| r.label == "stale"),
+            "recents from removed providers must be dropped"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.label == "AITOPIA" && r.badge == "free"));
+        assert!(rows
+            .iter()
+            .any(|r| r.label == "new-model" && r.badge == "active"));
+        assert!(rows
+            .iter()
+            .any(|r| r.label == "llama-3.3" && r.badge != "active"));
+    }
+
+    #[test]
+    fn sidebar_command_sets_and_toggles_visibility() {
+        let mut tui = Tui::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(handle_slash(&mut tui, &tx, "/sidebar hide"));
+        assert_eq!(tui.sidebar_mode(), SidebarMode::Hidden);
+        assert!(handle_slash(&mut tui, &tx, "/sidebar show"));
+        assert_eq!(tui.sidebar_mode(), SidebarMode::Shown);
+        assert!(handle_slash(&mut tui, &tx, "/sidebar auto"));
+        assert_eq!(tui.sidebar_mode(), SidebarMode::Auto);
+        assert!(handle_slash(&mut tui, &tx, "/sidebar"));
+        assert_eq!(tui.sidebar_mode(), SidebarMode::Shown);
+        assert!(handle_slash(&mut tui, &tx, "/sidebar sideways"));
+        assert!(matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("/sidebar")));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

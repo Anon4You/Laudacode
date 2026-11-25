@@ -687,6 +687,10 @@ pub struct PickerRow {
     /// Short status chip, e.g. "active". Empty when there is
     /// nothing worth saying.
     pub badge: String,
+    /// A section heading: shown in the list, never selectable.
+    pub header: bool,
+    /// Optional routing value when the visible detail should not be parsed.
+    pub wire: Option<String>,
 }
 
 impl PickerRow {
@@ -695,11 +699,28 @@ impl PickerRow {
             label: label.into(),
             detail: detail.into(),
             badge: String::new(),
+            header: false,
+            wire: None,
+        }
+    }
+
+    pub fn header(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: String::new(),
+            badge: String::new(),
+            header: true,
+            wire: None,
         }
     }
 
     pub fn badge(mut self, b: impl Into<String>) -> Self {
         self.badge = b.into();
+        self
+    }
+
+    pub fn wire(mut self, value: impl Into<String>) -> Self {
+        self.wire = Some(value.into());
         self
     }
 
@@ -716,6 +737,9 @@ impl PickerRow {
     /// What a selection hands back to the caller. Unchanged from the old
     /// flat-string rows, so every existing `split(" · ")` parse still works.
     pub fn to_wire(&self) -> String {
+        if let Some(wire) = &self.wire {
+            return wire.clone();
+        }
         if self.detail.is_empty() {
             self.label.clone()
         } else {
@@ -842,9 +866,48 @@ impl Picker {
         self.items
             .iter()
             .enumerate()
-            .filter(|(_, r)| f.is_empty() || r.haystack().contains(&f))
+            .filter(|(_, r)| {
+                if f.is_empty() {
+                    true
+                } else {
+                    !r.header && r.haystack().contains(&f)
+                }
+            })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn first_selectable(&self) -> usize {
+        self.filtered()
+            .into_iter()
+            .find(|i| !self.items[*i].header)
+            .unwrap_or(0)
+    }
+
+    fn selected_row(&self, idxs: &[usize]) -> Option<&PickerRow> {
+        let pos = idxs.iter().position(|i| *i == self.selected)?;
+        idxs.get(pos)
+            .map(|i| &self.items[*i])
+            .filter(|r| !r.header)
+    }
+
+    fn move_selection(&mut self, up: bool) {
+        let idxs = self.filtered();
+        if idxs.is_empty() {
+            return;
+        }
+        let pos = idxs.iter().position(|i| *i == self.selected).unwrap_or(0);
+        for step in 1..=idxs.len() {
+            let next = if up {
+                (pos + idxs.len() - step) % idxs.len()
+            } else {
+                (pos + step) % idxs.len()
+            };
+            if !self.items[idxs[next]].header {
+                self.selected = idxs[next];
+                return;
+            }
+        }
     }
 }
 
@@ -901,6 +964,10 @@ pub struct Tui {
     last_ctrl_c: Option<Instant>,
     /// Brand banner pinned above the transcript (Ctrl+B toggles).
     show_banner: bool,
+    /// Sidebar visibility preference (`/sidebar`).
+    sidebar: SidebarMode,
+    /// Last full terminal size — bare `/sidebar` toggles from the current state.
+    last_screen: (u16, u16),
     /// Logo currently in the banner. Picked once per display and re-rolled on
     /// toggle — never per frame, or it would flicker.
     logo: &'static Art,
@@ -1013,6 +1080,16 @@ impl Dash {
     }
 }
 
+/// Sidebar visibility preference. `Auto` preserves the responsive default;
+/// the explicit modes are session-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarMode {
+    #[default]
+    Auto,
+    Shown,
+    Hidden,
+}
+
 /// First 13 chars of a session id for tight displays.
 pub fn shorten_session_id(id: &str) -> String {
     shorten_id(id)
@@ -1032,7 +1109,8 @@ fn shorten_id(id: &str) -> String {
 /// here — that hand-maintained table is exactly how `/agents` went missing once.
 pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
-    ("/model", "pick a model from the live list"),
+    ("/model", "pick a model from any provider (alias of /models)"),
+    ("/models", "pick a model from any provider · recent & free first"),
     (
         "/reasoning",
         "thinking depth: normal · low · medium · high · max (auto-detected)",
@@ -1051,6 +1129,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/branch", "branch a new session from a checkpoint"),
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
+    ("/sidebar", "show · hide · auto side dashboard"),
     ("/usage", "tokens & cost this session"),
     ("/archive", "park a session aside"),
     ("/doctor", "environment diagnostics"),
@@ -1127,6 +1206,8 @@ impl Tui {
             overlay_scroll: 0,
             last_ctrl_c: None,
             show_banner: true,
+            sidebar: SidebarMode::Auto,
+            last_screen: (80, 24),
             logo: pick_logo(80),
             cache_width: 0,
             last_width: 80,
@@ -1471,6 +1552,27 @@ impl Tui {
         self.show_banner
     }
 
+    pub fn sidebar_mode(&self) -> SidebarMode {
+        self.sidebar
+    }
+
+    pub fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.sidebar = mode;
+    }
+
+    pub fn sidebar_visible(&self) -> bool {
+        Self::dash_width(self.last_screen.0, self.last_screen.1, self.sidebar).is_some()
+    }
+
+    /// Bare `/sidebar`: hide what is currently visible, otherwise force it on.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar = if self.sidebar_visible() {
+            SidebarMode::Hidden
+        } else {
+            SidebarMode::Shown
+        };
+    }
+
     // -----------------------------------------------------------------------
     // @-file mention popup
     // -----------------------------------------------------------------------
@@ -1699,12 +1801,14 @@ impl Tui {
     /// Pickers that carry real status (active provider, signed in, current
     /// model) pass explicit rows so they can show a badge.
     pub fn open_picker_rows(&mut self, title: impl Into<String>, items: Vec<PickerRow>) {
-        self.picker = Some(Picker {
+        let mut picker = Picker {
             title: title.into(),
             items,
             selected: 0,
             filter: String::new(),
-        });
+        };
+        picker.selected = picker.first_selectable();
+        self.picker = Some(picker);
     }
 
     pub fn open_approval(&mut self, detail: String) {
@@ -2035,15 +2139,18 @@ impl Tui {
         }
     }
 
-    /// Dashboard panel size gate (None = hidden): shown on terminals that
-    /// are at least 88 columns wide AND 39 rows tall — covers both portrait
-    /// desktop splits and Termux landscape (~39×147). Anything narrower or
-    /// shorter keeps the single-column layout untouched.
-    pub fn dash_width(total_w: u16, total_h: u16) -> Option<u16> {
-        if total_w >= 88 && total_h >= 39 {
-            Some(Self::DASH_WIDTH)
-        } else {
-            None
+    /// Sidebar width for the current preference. `Auto` keeps the original
+    /// size gate; `Shown` forces a side-by-side panel even on small terminals,
+    /// splitting the width roughly in half; `Hidden` never reserves space.
+    pub fn dash_width(total_w: u16, total_h: u16, mode: SidebarMode) -> Option<u16> {
+        match mode {
+            SidebarMode::Hidden => None,
+            SidebarMode::Auto if total_w >= 88 && total_h >= 39 => Some(Self::DASH_WIDTH),
+            SidebarMode::Auto => None,
+            SidebarMode::Shown if total_w > 0 => {
+                Some(Self::DASH_WIDTH.min(total_w / 2).max(1))
+            }
+            SidebarMode::Shown => None,
         }
     }
 
@@ -2151,6 +2258,7 @@ impl Tui {
     }
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
+        self.last_screen = (area.width, area.height);
         // Every frame rebuilds the tap map, so stale hitboxes can never fire.
         self.tap_targets.clear();
         self.last_slash_popup = None;
@@ -2177,9 +2285,10 @@ impl Tui {
             return;
         }
 
-        // Terminals ≥88×50 get a persistent side dashboard; smaller sizes
-        // keep the classic single-column layout pixel-for-pixel.
-        let (area, dash_area) = match Self::dash_width(area.width, area.height) {
+        // Terminals ≥88×39 get a persistent side dashboard; smaller sizes
+        // keep the classic single-column layout pixel-for-pixel unless the
+        // user explicitly forces it on with /sidebar show.
+        let (area, dash_area) = match Self::dash_width(area.width, area.height, self.sidebar) {
             Some(dw) => {
                 let cols =
                     Layout::horizontal([Constraint::Min(40), Constraint::Length(dw)]).split(area);
@@ -2197,8 +2306,13 @@ impl Tui {
         let header_rows = Self::header_height(area.width, area.height, self.show_banner);
         let has_header = header_rows > 0;
         // When no side dashboard fits (narrow window), show a compact summary
-        // bar above the composer so identity/tokens/plan stay glanceable.
-        let compact_h = Self::compact_summary_h(area.width, area.height, dash_area.is_none());
+        // bar above the composer so identity/tokens/plan stay glanceable. An
+        // explicit hide suppresses it too — hide means no status chrome.
+        let compact_h = Self::compact_summary_h(
+            area.width,
+            area.height,
+            dash_area.is_none() && self.sidebar != SidebarMode::Hidden,
+        );
         let has_compact = compact_h > 0;
 
         let mut constraints = Vec::with_capacity(7);
@@ -3310,6 +3424,14 @@ impl Tui {
             .take(max)
             .map(|i| {
                 let row = &p.items[*i];
+                if row.header {
+                    return ListItem::new(Line::from(Span::styled(
+                        format!("  {}", row.label),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
                 let selected = *i == p.selected;
                 let label_style = if selected {
                     sel_style
@@ -3875,6 +3997,9 @@ impl Tui {
                 p.title.clone().to_lowercase(),
             )
         };
+        if tapped.0.header {
+            return None;
+        }
         self.picker = None;
         Some(Action::OpenSlash(format!(
             "{}:{}",
@@ -3921,25 +4046,12 @@ impl Tui {
                 None => return Action::None,
             };
             let idxs = p.filtered();
-            let pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
             match key.code {
                 KeyCode::Esc => {
                     self.picker = None;
                 }
-                KeyCode::Up => {
-                    if pos > 0 {
-                        p.selected = idxs[pos - 1];
-                    } else if let Some(last) = idxs.last() {
-                        p.selected = *last;
-                    }
-                }
-                KeyCode::Down => {
-                    if pos + 1 < idxs.len() {
-                        p.selected = idxs[pos + 1];
-                    } else if let Some(first) = idxs.first() {
-                        p.selected = *first;
-                    }
-                }
+                KeyCode::Up => p.move_selection(true),
+                KeyCode::Down => p.move_selection(false),
                 KeyCode::Backspace => {
                     p.filter.pop();
                 }
@@ -3956,8 +4068,7 @@ impl Tui {
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(i) = idxs.get(pos) {
-                        let chosen = p.items[*i].clone();
+                    if let Some(chosen) = p.selected_row(&idxs).cloned() {
                         let title = p.title.clone().to_lowercase();
                         self.picker = None;
                         action = Action::OpenSlash(format!("{title}:{}", chosen.to_wire()));
@@ -4343,18 +4454,81 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_appears_only_on_wide_terminals() {
+    fn dashboard_appears_only_on_wide_terminals_by_default() {
         // Needs BOTH ≥88 columns and ≥39 rows (Termux landscape is ~39 tall).
-        assert_eq!(Tui::dash_width(87, 50), None);
-        assert_eq!(Tui::dash_width(88, 50), Some(40));
-        assert_eq!(Tui::dash_width(147, 39), Some(40), "Termux landscape");
-        assert_eq!(Tui::dash_width(88, 38), None, "too short — no dashboard");
+        assert_eq!(Tui::dash_width(87, 50, SidebarMode::Auto), None);
+        assert_eq!(Tui::dash_width(88, 50, SidebarMode::Auto), Some(40));
         assert_eq!(
-            Tui::dash_width(100, 30),
+            Tui::dash_width(147, 39, SidebarMode::Auto),
+            Some(40),
+            "Termux landscape"
+        );
+        assert_eq!(
+            Tui::dash_width(88, 38, SidebarMode::Auto),
+            None,
+            "too short — no dashboard"
+        );
+        assert_eq!(
+            Tui::dash_width(100, 30, SidebarMode::Auto),
             None,
             "short terminal keeps old layout"
         );
-        assert_eq!(Tui::dash_width(220, 60), Some(40));
+        assert_eq!(Tui::dash_width(220, 60, SidebarMode::Auto), Some(40));
+    }
+
+    #[test]
+    fn forced_sidebar_ignores_size_but_leaves_transcript_width() {
+        assert_eq!(Tui::dash_width(147, 30, SidebarMode::Shown), Some(40));
+        assert_eq!(Tui::dash_width(80, 10, SidebarMode::Shown), Some(40));
+        assert_eq!(Tui::dash_width(60, 10, SidebarMode::Shown), Some(30));
+        assert_eq!(Tui::dash_width(40, 20, SidebarMode::Shown), Some(20));
+        assert_eq!(Tui::dash_width(20, 10, SidebarMode::Shown), Some(10));
+        assert_eq!(Tui::dash_width(0, 20, SidebarMode::Shown), None);
+        assert_eq!(Tui::dash_width(100, 50, SidebarMode::Hidden), None);
+    }
+
+    #[test]
+    fn sidebar_toggle_uses_current_visibility() {
+        let mut t = Tui::new();
+        t.last_screen = (100, 40);
+        assert!(t.sidebar_visible());
+        t.toggle_sidebar();
+        assert_eq!(t.sidebar_mode(), SidebarMode::Hidden);
+        t.toggle_sidebar();
+        assert_eq!(t.sidebar_mode(), SidebarMode::Shown);
+        t.last_screen = (40, 20);
+        assert!(t.sidebar_visible());
+    }
+
+    #[test]
+    fn forced_sidebar_renders_on_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut t = Tui::new();
+        t.set_sidebar_mode(SidebarMode::Shown);
+        t.dash
+            .set_session("abc-123", "model-x", "openrouter", "/tmp/proj", 3);
+        for (w, h) in [(40, 20), (20, 10), (12, 6)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| t.draw(f)).unwrap();
+            if (w, h) != (40, 20) {
+                continue;
+            }
+            let buf = terminal.backend().buffer().clone();
+            let mut rendered = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        rendered.push_str(cell.symbol());
+                    }
+                }
+            }
+            assert!(
+                rendered.contains("laudacode"),
+                "forced sidebar must render on a narrow terminal"
+            );
+        }
     }
 
     #[test]
@@ -4456,6 +4630,57 @@ mod tests {
         t.on_mouse(mouse(MouseEventKind::ScrollRight, 0, 0));
         t.on_mouse(mouse(MouseEventKind::ScrollLeft, 0, 0));
         assert_eq!(t.scroll, 10, "horizontal scroll must do nothing");
+    }
+
+    #[test]
+    fn picker_headers_are_skipped_and_hidden_wire_values_are_used() {
+        let mut t = Tui::new();
+        t.open_picker_rows(
+            "models",
+            vec![
+                PickerRow::header("Recent"),
+                PickerRow::new("old-model", "openrouter").wire("openrouter\told-model"),
+                PickerRow::header("Free"),
+                PickerRow::new("AITOPIA", "aitopia").wire("aitopia\tAITOPIA"),
+            ],
+        );
+        assert_eq!(
+            t.picker.as_ref().unwrap().selected,
+            1,
+            "the first selectable row must be chosen, not the header"
+        );
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            t.picker.as_ref().unwrap().selected,
+            3,
+            "Down must skip the Free header"
+        );
+        t.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            t.picker.as_ref().unwrap().selected,
+            1,
+            "wrapping must skip headers too"
+        );
+        match t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            Action::OpenSlash(sel) => assert_eq!(sel, "models:openrouter\told-model"),
+            other => panic!("expected picker selection, got {other:?}"),
+        }
+
+        // Typing a filter hides headings and leaves only matching choices.
+        t.open_picker_rows(
+            "models",
+            vec![
+                PickerRow::header("Recent"),
+                PickerRow::new("old-model", "openrouter"),
+                PickerRow::header("Free"),
+                PickerRow::new("AITOPIA", "aitopia"),
+            ],
+        );
+        t.on_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        let p = t.picker.as_ref().unwrap();
+        let filtered = p.filtered();
+        assert!(!filtered.is_empty());
+        assert!(filtered.iter().all(|i| !p.items[*i].header));
     }
 
     #[test]
@@ -4907,7 +5132,11 @@ mod tests {
             .iter()
             .position(|(c, _)| *c == "/model")
             .expect("/model is listed");
-        assert_eq!(t.slash_matches(), vec![model]);
+        let models = SLASH_COMMANDS
+            .iter()
+            .position(|(c, _)| *c == "/models")
+            .expect("/models is listed");
+        assert_eq!(t.slash_matches(), vec![model, models]);
         t.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(t.input, "/model ");
         // Popup closed after completion (trailing space).

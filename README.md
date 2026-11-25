@@ -116,6 +116,7 @@ llama.cpp, vLLM, and any other OpenAI-compatible endpoint.
 | Syntax highlighting | Code blocks and diffs for Rust, Python, JavaScript/TypeScript, Go, C/C++, Java, shell, TOML, YAML, and JSON. |
 | Themes | 17 built-in color themes, applied consistently across the UI. |
 | Adaptive layout | Banner art collapses to a one-line header on small screens. |
+| Sidebar control | `/sidebar show`, `hide`, or `auto`; `show` forces the dashboard even on narrow terminals. |
 | Touch support | Swipe to scroll, tap picker rows, and tap the composer to place the caret. |
 | Prompt history | Persistent `↑`/`↓` recall with draft restoration. |
 | Ambient effects | Optional banner-only effects, automatically paused while streaming. |
@@ -447,7 +448,8 @@ readable and the banner is suppressed.
 | Command | Description |
 |---|---|
 | `/help` | Command overview |
-| `/model` | Pick a model from the provider's live list |
+| `/models` | Pick a model from any configured provider; recent and free choices first |
+| `/model` | Alias of `/models` |
 | `/approvals` | Switch approval mode |
 | `/agents` | List sub-agents and roles |
 | `/reasoning` | Set thinking depth: low, normal, medium, high, max |
@@ -456,6 +458,7 @@ readable and the banner is suppressed.
 | `/banner` | Select a different banner logo |
 | `/effect` | Select an ambient effect |
 | `/status` | Provider, model, session, usage, budget, hook, log, and network state |
+| `/sidebar` | Show, hide, or auto-fit the session sidebar; `show` forces it even on narrow terminals |
 | `/update` | Check releases and install a newer binary |
 | `/doctor` | Environment diagnostics without network or token use |
 | `/usage` | Tokens and estimated cost for this session |
